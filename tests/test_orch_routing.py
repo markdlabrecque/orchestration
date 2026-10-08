@@ -1091,6 +1091,85 @@ class SubagentStopHookTests(PlatformTestCase):
                     self.assertEqual(self.runs()[1], pending)
                 self.assert_no_unrecorded()
 
+    def test_effort_without_a_usable_model_stays_unresolved(self):
+        cases = [("absent", None), ("empty", ""), ("null", None),
+                 ("nonstring", 12), ("sentinel", "<synthetic>")]
+        for label, model in cases:
+            with self.subTest(model=label):
+                dispatched = self.dispatch()
+                record = assistant(model, "high")
+                if label == "absent":
+                    del record["message"]["model"]
+                identity = "unresolved-" + label
+                self.hook_ok("Stop", self.sid, self.wt)
+                before = self.show("T-1")
+                count = len(self.diagnostics("model_unresolved"))
+                started = time.monotonic()
+                result = self.stop("orchestration:test-writer",
+                                   self.transcript([record]), agent_id=identity)
+                elapsed = time.monotonic() - started
+                self.assertEqual(result.returncode, 0)
+                self.assertGreaterEqual(elapsed, 1.8)
+                self.assertLess(elapsed, 6.0, "2-second wait plus scheduling tolerance")
+                row = self.runs()[-1]
+                self.assertEqual(row, dict(dispatched, agent_id=identity))
+                for key in ("model_resolved", "effort_resolved", "resolved_at", "match"):
+                    self.assertIsNone(row[key], key)
+                unresolved = self.diagnostics("model_unresolved")
+                self.assertEqual(len(unresolved), count + 1)
+                self.assertEqual(unresolved[-1]["detail"],
+                                 "role=test-writer agent_id=" + identity)
+                after = self.show("T-1")
+                self.assertEqual(after["activity"], "working")
+                self.assertNotEqual(after["last_seen_at"], before["last_seen_at"])
+                self.assertEqual(after["phase"], before["phase"])
+                self.assertEqual(after["model_mismatches"], 0)
+                self.assertEqual(self.diagnostics("model_mismatch"), [])
+                self.assert_no_unrecorded()
+
+    def test_truthy_json_agent_ids_keep_python_stringification_and_identity(self):
+        cases = [(17, "17"), (True, "True"),
+                 (["agent", 2], "['agent', 2]"),
+                 ({"agent": 2}, "{'agent': 2}")]
+        for identity, expected in cases:
+            with self.subTest(identity=identity):
+                dispatched = self.dispatch()
+                self.hook_ok("Stop", self.sid, self.wt)
+                before = self.show("T-1")
+                started = time.monotonic()
+                result = self.observe(agent_id=identity, model=None)
+                elapsed = time.monotonic() - started
+                self.assertEqual(result.returncode, 0)
+                self.assertGreaterEqual(elapsed, 1.8)
+                self.assertLess(elapsed, 6.0, "2-second wait plus scheduling tolerance")
+                after = self.show("T-1")
+                self.assertEqual(after["activity"], "working")
+                self.assertNotEqual(after["last_seen_at"], before["last_seen_at"])
+                original = self.runs()[-1]
+                self.assertEqual(original, dict(dispatched, agent_id=expected))
+                self.assertEqual(self.diagnostics("model_unresolved")[-1]["detail"],
+                                 "role=test-writer agent_id=" + expected)
+                pending = self.dispatch()
+                self.observe(agent_id=identity)
+                completed = self.runs()[-2]
+                self.assertEqual(completed["seq"], original["seq"])
+                self.assertEqual(completed["agent_id"], expected)
+                self.assertEqual((completed["model_resolved"], completed["effort_resolved"],
+                                  completed["match"]), ("claude-sonnet-5-5", "low", 1))
+                self.assertTrue(completed["resolved_at"])
+                self.assertEqual(self.runs()[-1], pending)
+                rows = self.runs()
+                events = self.events("T-1")
+                self.observe(agent_id=identity)
+                self.assertEqual(self.runs(), rows)
+                self.assertEqual(self.events("T-1"), events)
+                self.assertEqual(self.show("T-1")["activity"], "working")
+                self.assertEqual(self.diagnostics("model_mismatch"), [])
+                self.assert_no_unrecorded()
+                # Consume this case's pending row with a distinct ordinary id.
+                self.observe(agent_id="next-" + expected)
+                self.assertEqual(self.runs()[-1]["agent_id"], "next-" + expected)
+
     def test_fills_the_run_from_the_transcript(self):
         self.ok("run", "T-1", "--role", "implementor", "--model", "sonnet", "--effort", "low")
         path = self.transcript([USER_LINE, assistant("claude-haiku-5-5", "high"),
