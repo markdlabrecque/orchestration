@@ -12,14 +12,16 @@ import shlex
 import subprocess
 import sys
 import time
+import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from test_orch import ORCH, OrchTestCase, list_in  # noqa: E402
 from test_orch_platforms import PLUGIN, PlatformTestCase  # noqa: E402
-from test_orch_adapters import SELFTEST_STEPS, SESSION_CLAUDE_SRC, AdapterTestCase  # noqa: E402
+from test_orch_adapters import SELFTEST_STEPS, SESSION_CLAUDE_SRC, AdapterTestCase, load_orch_module  # noqa: E402
 
 ROLE_DEFAULTS = {"filer": "light", "investigation": "light", "test-writer": "standard",
                  "implementor": "standard", "reviewer": "light", "verifier": "light",
@@ -431,6 +433,275 @@ def assistant(model, effort=None):
 
 
 USER_LINE = {"type": "user", "isSidechain": True, "message": {"content": "task"}}
+
+
+class TranscriptReadTests(unittest.TestCase):
+    """Measure returned bytes at the file boundary, not elapsed runtime."""
+
+    def setUp(self):
+        self.mod = load_orch_module()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "agent.jsonl")
+        self.reads = []
+        real_open = open
+        reads = self.reads
+        path = self.path
+
+        class Meter:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+            def record(self, data, requested):
+                size = len(data if isinstance(data, bytes) else data.encode("utf-8"))
+                reads.append((requested, size))
+                return data
+
+            def read(self, size=-1):
+                return self.record(self.stream.read(size), size)
+
+            def readline(self, size=-1):
+                return self.record(self.stream.readline(size), size)
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                data = self.readline()
+                if not data:
+                    raise StopIteration
+                return data
+
+        def measured_open(filename, *args, **kwargs):
+            stream = real_open(filename, *args, **kwargs)
+            return Meter(stream) if os.fspath(filename) == path else stream
+
+        patcher = mock.patch.object(self.mod, "open", measured_open, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_bytes(self, data):
+        with open(self.path, "wb") as stream:
+            stream.write(data)
+
+    def line(self, obj):
+        return json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n"
+
+    def prefix(self):
+        return self.line(USER_LINE) * 20000
+
+    def assert_bytes(self, bound):
+        measured = sum(size for _, size in self.reads)
+        self.assertLessEqual(measured, bound,
+                             "transcript bytes=%d permitted=%d requests=%r" %
+                             (measured, bound, self.reads[:4]))
+
+    def report(self, action=None):
+        ticks = [0]
+        sleeps = []
+
+        def sleep(delay):
+            self.assertEqual(delay, 0.2)
+            sleeps.append(delay)
+            ticks[0] += 1
+            if action:
+                action(ticks[0])
+
+        with mock.patch.object(self.mod.time, "time", side_effect=lambda: ticks[0] / 5), \
+                mock.patch.object(self.mod.time, "sleep", side_effect=sleep):
+            result = self.mod.subagent_report({
+                "agent_type": "orchestration:test-writer", "agent_id": "A",
+                "agent_transcript_path": self.path})
+        return result, sleeps
+
+    def test_small_newest_qualifying_model_owns_effort(self):
+        for effort in (None, "", False, 7, "high"):
+            with self.subTest(effort=effort):
+                newest = assistant("new")
+                newest["effort"] = effort
+                newest["message"]["effort"] = "nested-must-not-win"
+                entries = [assistant("old", "low"), newest, assistant("<synthetic>", "low"),
+                           USER_LINE, [], assistant("")]
+                self.write_bytes(b"".join(self.line(e) for e in entries) + b"broken\n")
+                self.assertEqual(self.mod.transcript_model(self.path),
+                                 ("new", "high" if effort == "high" else None))
+
+    def test_nonstring_model_is_not_qualifying(self):
+        self.write_bytes(self.line(assistant("old", "low")) + self.line(assistant(12)))
+        self.assertEqual(self.mod.transcript_model(self.path), ("old", "low"))
+
+    def test_missing_and_unreadable(self):
+        self.assertEqual(self.mod.transcript_model(self.path), (None, None))
+        os.mkdir(self.path)
+        self.assertEqual(self.mod.transcript_model(self.path), (None, None))
+
+    def test_eof_local_model_does_not_read_large_prefix(self):
+        self.write_bytes(self.prefix() + self.line(assistant("new", "high")))
+        self.assertEqual(self.mod.transcript_model(self.path), ("new", "high"))
+        # No prescribed chunk constant: allow up to 128 KiB for an EOF-local record.
+        self.assert_bytes(128 * 1024)
+        self.assertTrue(all(0 < requested <= 128 * 1024 for requested, size in self.reads
+                            if size), "reads must request bounded binary chunks")
+
+    def test_older_model_beyond_first_chunk(self):
+        data = self.line(assistant("old", "low")) + self.prefix()
+        self.write_bytes(data)
+        self.assertEqual(self.mod.transcript_model(self.path), ("old", "low"))
+        self.assert_bytes(len(data))
+
+    def test_long_multibyte_record_without_newline(self):
+        obj = assistant("model-é", "high")
+        obj["message"]["content"] = "é🙂" * 100000
+        self.write_bytes(self.line(assistant("old")) + self.line(obj).rstrip(b"\n"))
+        self.assertEqual(self.mod.transcript_model(self.path), ("model-é", "high"))
+
+    def test_invalid_utf8_replacement(self):
+        self.write_bytes(b'{"type":"assistant","message":{"model":"m\xff"},"effort":"low"}')
+        self.assertEqual(self.mod.transcript_model(self.path), ("m\ufffd", "low"))
+
+    def test_unchanged_retries_read_prefix_once_per_call(self):
+        data = self.prefix()
+        self.write_bytes(data)
+        for _ in range(2):
+            self.reads.clear()
+            result, sleeps = self.report()
+            self.assertEqual(result, ("test-writer", "A", None, None, None))
+            self.assertEqual(len(sleeps), 10)
+            self.assert_bytes(len(data))
+
+    def test_append_reads_only_new_bytes_and_preserves_metadata(self):
+        data = self.prefix()
+        added = self.line(assistant("late", "high"))
+        self.write_bytes(data)
+        with open(self.path[:-6] + ".meta.json", "w") as stream:
+            json.dump({"model": "sonnet"}, stream)
+
+        def append(tick):
+            if tick == 3:
+                with open(self.path, "ab") as stream:
+                    stream.write(added)
+
+        result, sleeps = self.report(append)
+        self.assertEqual(result, ("test-writer", "A", "late", "high", "sonnet"))
+        self.assertEqual(len(sleeps), 3)
+        self.assert_bytes(len(data) + len(added))
+
+    def test_partial_multibyte_line_completed_on_append(self):
+        record = self.line(assistant("late-é", "low")).rstrip(b"\n")
+        split = record.index("é".encode("utf-8")) + 1
+        initial = self.prefix() + record[:split]
+        self.write_bytes(initial)
+
+        def append(tick):
+            if tick == 2:
+                with open(self.path, "ab") as stream:
+                    stream.write(record[split:])
+
+        result, sleeps = self.report(append)
+        self.assertEqual(result[2:4], ("late-é", "low"))
+        self.assertEqual(len(sleeps), 2)
+        self.assert_bytes(len(initial) + len(record[split:]))
+
+    def test_same_size_inode_replacement_reads_both_files_exactly(self):
+        initial = self.line(assistant("<synthetic>", "high")) + self.prefix()
+        replacement = self.line(assistant("replacement", "high")) + self.prefix()
+        self.assertEqual(len(initial), len(replacement))
+        self.write_bytes(initial)
+        stat = os.stat(self.path)
+        identity = (stat.st_dev, stat.st_ino)
+        chunk = self.mod.TRANSCRIPT_CHUNK_BYTES
+        scan_reads = (len(initial) + chunk - 1) // chunk
+
+        def change(tick):
+            self.assertEqual(sum(size for _, size in self.reads), len(initial))
+            self.assertEqual(len(self.reads), scan_reads)
+            if tick == 2:
+                other = self.path + ".replacement"
+                with open(other, "wb") as stream:
+                    stream.write(replacement)
+                os.replace(other, self.path)
+                stat = os.stat(self.path)
+                self.assertEqual(stat.st_size, len(initial))
+                self.assertNotEqual((stat.st_dev, stat.st_ino), identity)
+
+        result, sleeps = self.report(change)
+        self.assertEqual(result, ("test-writer", "A", "replacement", "high", None))
+        self.assertEqual(len(sleeps), 2)
+        self.assertEqual(sum(size for _, size in self.reads),
+                         len(initial) + len(replacement))
+        self.assertEqual(len(self.reads), 2 * scan_reads)
+        self.assertEqual(self.reads[:scan_reads], self.reads[scan_reads:])
+
+    def test_long_partial_utf8_completion_and_newest_appended_effort(self):
+        for effort in (None, "high"):
+            with self.subTest(effort=effort):
+                chunk = self.mod.TRANSCRIPT_CHUNK_BYTES
+                incomplete = assistant("completed", "low")
+                incomplete["message"]["content"] = "x" * (6 * chunk) + "é🙂"
+                record = self.line(incomplete)
+                split = record.index("é".encode("utf-8")) + 1
+                self.assertGreater(split, 6 * chunk)
+                initial = self.prefix() + record[:split]
+                middle = assistant("middle", "low")
+                middle["message"]["content"] = "y" * (2 * chunk)
+                newest = assistant("newest", effort)
+                newest["message"]["effort"] = "nested-must-not-win"
+                added = (record[split:] + self.line(middle) +
+                         self.line(newest).rstrip(b"\n"))
+                self.write_bytes(initial)
+                self.reads.clear()
+                scan_reads = (len(initial) + chunk - 1) // chunk
+
+                def append(tick):
+                    self.assertEqual(sum(size for _, size in self.reads), len(initial))
+                    self.assertEqual(len(self.reads), scan_reads)
+                    if tick == 2:
+                        with open(self.path, "ab") as stream:
+                            stream.write(added)
+
+                result, sleeps = self.report(append)
+                self.assertEqual(result, ("test-writer", "A", "newest", effort, None))
+                self.assertEqual(len(sleeps), 2)
+                self.assertEqual(sum(size for _, size in self.reads[:scan_reads]),
+                                 len(initial))
+                appended_reads = self.reads[scan_reads:]
+                self.assertEqual(sum(size for _, size in appended_reads), len(added))
+                self.assertEqual(len(appended_reads), (len(added) + chunk - 1) // chunk)
+                self.assertEqual(sum(size for _, size in self.reads),
+                                 len(initial) + len(added))
+
+    def test_shrink_and_inode_replacement_reset_reader(self):
+        for replacement in (False, True):
+            with self.subTest(replacement=replacement):
+                initial = self.prefix()
+                added = self.line(assistant("reset", "high"))
+                self.write_bytes(initial)
+                self.reads.clear()
+
+                def change(tick):
+                    if tick == 2:
+                        if replacement:
+                            other = self.path + ".replacement"
+                            with open(other, "wb") as stream:
+                                stream.write(added + self.prefix())
+                            os.replace(other, self.path)
+                        else:
+                            self.write_bytes(added)
+
+                result, sleeps = self.report(change)
+                self.assertEqual(result[2:4], ("reset", "high"))
+                self.assertEqual(len(sleeps), 2)
+                self.assert_bytes(len(initial) + os.path.getsize(self.path))
 
 
 class SubagentStopHookTests(PlatformTestCase):
