@@ -3545,26 +3545,93 @@ def hook_skip(event, sid, row, pid):
 TRANSCRIPT_WAIT_S = 2.0
 
 
-def transcript_model(path):
-    """(model, effort) of the last assistant entry in a subagent transcript:
-    message.model and the top-level `effort`, each None when absent. Synthetic
-    entries (`<synthetic>`) name no model."""
-    model = effort = None
+TRANSCRIPT_CHUNK_BYTES = 64 * 1024
+
+
+def transcript_record(line):
+    """Decode one complete record, keeping model and effort from the same object."""
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                m = dig(obj, "message", "model") if isinstance(obj, dict) \
-                    and obj.get("type") == "assistant" else None
-                if isinstance(m, str) and m and not m.startswith("<"):
-                    e = obj.get("effort")
-                    model, effort = m, (e if isinstance(e, str) and e else None)
-    except OSError:
+        obj = json.loads(line.decode("utf-8", errors="replace"))
+    except ValueError:
         return None, None
-    return model, effort
+    if not isinstance(obj, dict) or obj.get("type") != "assistant":
+        return None, None
+    message = obj.get("message")
+    model = message.get("model") if isinstance(message, dict) else None
+    if not isinstance(model, str) or not model or model.startswith("<"):
+        return None, None
+    effort = obj.get("effort")
+    return model, effort if isinstance(effort, str) and effort else None
+
+
+class TranscriptReader:
+    """Per-call byte offset and unfinished EOF record. No persistent cache."""
+    def __init__(self):
+        self.identity = None
+        self.offset = 0
+        self.partial = b""
+
+    def backwards(self, stream, size):
+        position = size
+        carry = b""
+        tail_saved = False
+        while position:
+            count = min(position, TRANSCRIPT_CHUNK_BYTES)
+            position -= count
+            stream.seek(position)
+            parts = (stream.read(count) + carry).split(b"\n")
+            carry = parts[0]
+            for line in reversed(parts[1:]):
+                if not tail_saved:
+                    self.partial = line
+                    tail_saved = True
+                result = transcript_record(line)
+                if result[0]:
+                    return result
+        if not tail_saved:
+            self.partial = carry
+        return transcript_record(carry)
+
+    def appended(self, stream, size):
+        stream.seek(self.offset)
+        result = (None, None)
+        while self.offset < size:
+            data = stream.read(min(size - self.offset, TRANSCRIPT_CHUNK_BYTES))
+            if not data:
+                break
+            self.offset += len(data)
+            parts = (self.partial + data).split(b"\n")
+            self.partial = parts.pop()
+            for line in parts:
+                observed = transcript_record(line)
+                if observed[0]:
+                    result = observed
+        observed = transcript_record(self.partial)
+        return observed if observed[0] else result
+
+    def read(self, path):
+        try:
+            with open(path, "rb") as stream:
+                stat = os.fstat(stream.fileno())
+                identity = (stat.st_dev, stat.st_ino)
+                if identity != self.identity or stat.st_size < self.offset:
+                    self.identity = identity
+                    self.offset = stat.st_size
+                    self.partial = b""
+                    return self.backwards(stream, stat.st_size)
+                if stat.st_size == self.offset:
+                    return None, None
+                return self.appended(stream, stat.st_size)
+        except OSError:
+            self.identity = None
+            self.offset = 0
+            self.partial = b""
+            return None, None
+
+
+def transcript_model(path):
+    """Newest qualifying assistant model and its own top-level effort."""
+    return TranscriptReader().read(path)
 
 
 def subagent_report(payload):
@@ -3582,8 +3649,9 @@ def subagent_report(payload):
     resolved = effort = meta_model = None
     if isinstance(path, str) and path:
         deadline = time.time() + TRANSCRIPT_WAIT_S
+        reader = TranscriptReader()
         while True:
-            resolved, effort = transcript_model(path)
+            resolved, effort = reader.read(path)
             if resolved or time.time() >= deadline:
                 break
             time.sleep(0.2)
