@@ -11,6 +11,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -449,6 +450,279 @@ class SubagentStopHookTests(PlatformTestCase):
 
     def runs(self):
         return list_in(self.j("runs", "T-1"), "runs")
+
+    def dispatch(self, role="test-writer", model="sonnet", effort="low"):
+        return self.j("run", "T-1", "--role", role, "--model", model,
+                      "--effort", effort)
+
+    def observe(self, agent_id="A", model="claude-sonnet-5-5", effort="low",
+                role="test-writer"):
+        lines = [USER_LINE] if model is None else [assistant(model, effort)]
+        return self.stop("orchestration:" + role, self.transcript(lines),
+                         agent_id=agent_id)
+
+    def diagnostics(self, kind):
+        return [e for e in self.events("T-1") if e["kind"] == kind]
+
+    def assert_no_unrecorded(self):
+        self.assertEqual(self.diagnostics("dispatch_unrecorded"), [])
+        self.assertEqual(self.show("T-1")["unrecorded_dispatches"], 0)
+
+    def test_resume_case_01_repeated_stops_preserve_run_and_activity(self):
+        self.dispatch()
+        self.observe()
+        original = self.runs()
+        for _ in range(2):
+            self.hook_ok("Stop", self.sid, self.wt)
+            self.assertEqual(self.show("T-1")["activity"], "idle")
+            self.observe()
+            self.assertEqual(self.runs(), original)
+            self.assertEqual(self.show("T-1")["activity"], "working")
+        self.assert_no_unrecorded()
+
+    def test_resume_case_02_identity_precedes_pending_dispatch(self):
+        self.dispatch()
+        self.observe()
+        original = self.runs()[0]
+        self.dispatch()
+        pending = self.runs()[1]
+        self.observe()
+        self.assertEqual(self.runs(), [original, pending])
+        self.observe("B")
+        self.assertEqual(self.runs()[0], original)
+        self.assertEqual(self.runs()[1]["agent_id"], "B")
+        self.assertEqual(self.runs()[1]["match"], 1)
+        self.assert_no_unrecorded()
+
+    def test_resume_case_03_oldest_role_not_best_model(self):
+        self.dispatch(role="reviewer", model="haiku")
+        self.dispatch()
+        self.dispatch(model="opus")
+        self.observe("B", model="claude-opus-5-5")
+        rows = self.runs()
+        self.assertEqual([r["agent_id"] for r in rows], [None, "B", None])
+        self.assertEqual(rows[1]["match"], 0)
+        self.assertEqual(len(self.diagnostics("model_mismatch")), 1)
+        self.assert_no_unrecorded()
+
+    def test_resume_case_04_different_agent_same_model_is_unrecorded(self):
+        self.dispatch()
+        self.observe()
+        original = self.runs()
+        self.stop("orchestration:test-writer",
+                  self.transcript([assistant("claude-sonnet-5-5", "low")],
+                                  meta_model="sonnet"), agent_id="B")
+        self.assertEqual(self.runs(), original)
+        events = self.diagnostics("dispatch_unrecorded")
+        self.assertEqual(len(events), 1)
+        for text in ("test-writer", "resolved=claude-sonnet-5-5", "requested=sonnet"):
+            self.assertIn(text, events[0]["detail"])
+        self.assertEqual(self.show("T-1")["unrecorded_dispatches"], 1)
+
+    def test_resume_case_04_identity_is_scoped_to_role(self):
+        self.dispatch(role="reviewer", model="haiku")
+        self.observe(role="reviewer", model="claude-haiku-5-5")
+        self.observe()
+        self.assertEqual(len(self.diagnostics("dispatch_unrecorded")), 1)
+        self.assertEqual(len(self.runs()), 1)
+
+    def test_resume_case_04_identity_is_scoped_to_ticket(self):
+        other_wt = self.git_wt("other")
+        self.spawn_on("T-2", "headless", other_wt)
+        other_sid = self.show("T-2")["session_id"]
+        self.ok("run", "T-2", "--role", "test-writer", "--model", "sonnet",
+                "--effort", "low")
+        self.hook_ok("SubagentStop", other_sid, other_wt, extra={
+            "agent_type": "orchestration:test-writer", "agent_id": "A",
+            "agent_transcript_path": self.transcript([assistant("claude-sonnet-5-5")])})
+        self.observe()
+        self.assertEqual(self.runs(), [])
+        self.assertEqual(len(self.diagnostics("dispatch_unrecorded")), 1)
+        self.assertEqual(self.show("T-2")["unrecorded_dispatches"], 0)
+
+    def test_resume_case_05_unusable_ids_are_not_identity(self):
+        for identity in (None, "", False, 0, "unknown", "absent"):
+            with self.subTest(identity=identity):
+                self.dispatch()
+                path = self.transcript([assistant("claude-sonnet-5-5", "low")])
+                extra = {"agent_type": "orchestration:test-writer",
+                         "agent_transcript_path": path}
+                if identity != "absent":
+                    extra["agent_id"] = identity
+                before = len(self.diagnostics("dispatch_unrecorded"))
+                self.hook_ok("SubagentStop", self.sid, self.wt, extra=extra)
+                original = self.runs()
+                self.assertEqual(original[-1]["agent_id"], "unknown")
+                self.hook_ok("SubagentStop", self.sid, self.wt, extra=extra)
+                self.assertEqual(self.runs(), original)
+                self.assertEqual(len(self.diagnostics("dispatch_unrecorded")), before + 1)
+
+    def check_repeated_mismatch(self, model, effort):
+        self.dispatch()
+        self.observe(model=model, effort=effort)
+        original = self.runs()[0]
+        self.assertEqual(original["match"], 0)
+        diagnostics = self.diagnostics("model_mismatch")
+        self.observe(model=model, effort=effort)
+        self.assertEqual(self.runs(), [original])
+        self.assertEqual(self.diagnostics("model_mismatch"), diagnostics)
+        self.assert_no_unrecorded()
+        self.dispatch()
+        pending = self.runs()[1]
+        self.observe(model=model, effort=effort)
+        self.assertEqual(self.runs(), [original, pending])
+        self.assertEqual(self.diagnostics("model_mismatch"), diagnostics)
+        self.assertEqual(self.show("T-1")["model_mismatches"], 1)
+        self.assert_no_unrecorded()
+
+    def test_resume_case_06_original_model_mismatch_is_not_new_dispatch(self):
+        self.check_repeated_mismatch("claude-haiku-5-5", "low")
+
+    def test_resume_case_06_original_effort_mismatch_is_not_new_dispatch(self):
+        self.check_repeated_mismatch("claude-sonnet-5-5", "high")
+
+    def test_resume_case_07_repeated_unresolved_identity(self):
+        self.dispatch()
+        self.observe(model=None)
+        original = self.runs()[0]
+        unresolved = self.diagnostics("model_unresolved")
+        self.assertEqual(len(unresolved), 1)
+        self.observe(model=None)
+        self.assertEqual(self.runs(), [original])
+        self.assertEqual(self.diagnostics("model_unresolved"), unresolved)
+        self.assert_no_unrecorded()
+        self.dispatch()
+        pending = self.runs()[1]
+        self.observe(model=None)
+        self.assertEqual(self.runs(), [original, pending])
+        self.assertEqual(self.diagnostics("model_unresolved"), unresolved)
+        self.assert_no_unrecorded()
+
+    def check_late_resolution(self, model, effort, match):
+        self.dispatch()
+        self.observe(model=None)
+        original = self.runs()[0]
+        unresolved = self.diagnostics("model_unresolved")
+        self.dispatch()
+        pending = self.runs()[1]
+        self.observe(model=model, effort=effort)
+        rows = self.runs()
+        self.assertEqual(rows[1], pending)
+        completed = rows[0]
+        for key in ("seq", "ticket", "role", "agent_id", "model_requested",
+                    "effort_requested", "requested_at"):
+            self.assertEqual(completed[key], original[key], key)
+        self.assertEqual((completed["model_resolved"], completed["effort_resolved"],
+                          completed["match"]), (model, effort, match))
+        self.assertTrue(completed["resolved_at"])
+        self.assertEqual(self.diagnostics("model_unresolved"), unresolved)
+        mismatches = self.diagnostics("model_mismatch")
+        self.assertEqual(len(mismatches), 1 - match)
+        if not match:
+            self.assertIn(model, mismatches[0]["detail"])
+            if effort == "high":
+                self.assertIn("effort requested=low resolved=high", mismatches[0]["detail"])
+        self.assertEqual(self.show("T-1")["model_mismatches"], 1 - match)
+        self.assert_no_unrecorded()
+
+    def test_resume_case_08_late_matching_evidence(self):
+        self.check_late_resolution("claude-sonnet-5-5", "low", 1)
+
+    def test_resume_case_09_late_wrong_model(self):
+        self.check_late_resolution("claude-haiku-5-5", "low", 0)
+
+    def test_resume_case_09_late_wrong_effort(self):
+        self.check_late_resolution("claude-sonnet-5-5", "high", 0)
+
+    def test_resume_case_10_compatible_missing_effort_only(self):
+        self.dispatch()
+        self.observe(effort=None)
+        original = self.runs()[0]
+        self.dispatch()
+        pending = self.runs()[1]
+        self.observe(effort=None)
+        self.assertEqual(self.runs(), [original, pending])
+        self.observe(effort="low")
+        expected = dict(original, effort_resolved="low")
+        self.assertEqual(self.runs(), [expected, pending])
+        self.assertEqual(self.diagnostics("model_mismatch"), [])
+        self.assert_no_unrecorded()
+
+    def test_resume_case_10_compatible_fill_without_pending(self):
+        self.dispatch()
+        self.observe(effort=None)
+        original = self.runs()[0]
+        self.observe(effort="low")
+        self.assertEqual(self.runs(), [dict(original, effort_resolved="low")])
+        self.assertEqual(self.diagnostics("model_mismatch"), [])
+        self.assert_no_unrecorded()
+
+    def test_resume_case_10_no_requested_effort_is_permissive(self):
+        self.dispatch()
+        # Legacy rows may have no requested effort; current run CLI requires it.
+        self.db_exec("UPDATE runs SET effort_requested=NULL WHERE ticket=?", ("T-1",))
+        self.observe(effort=None)
+        original = self.runs()[0]
+        self.dispatch()
+        pending = self.runs()[1]
+        self.observe(effort="high")
+        self.assertEqual(self.runs(), [dict(original, effort_resolved="high"), pending])
+        self.assertEqual(self.diagnostics("model_mismatch"), [])
+        self.assert_no_unrecorded()
+
+    def check_contradiction(self, initial_effort, model, effort):
+        self.dispatch()
+        self.observe(effort=initial_effort)
+        original = self.runs()[0]
+        self.dispatch()
+        pending = self.runs()[1]
+        self.observe(model=model, effort=effort)
+        self.assertEqual(self.runs(), [original, pending])
+        events = self.diagnostics("model_mismatch")
+        self.assertEqual(len(events), 1)
+        detail = events[0]["detail"]
+        # The prose/field names are not prescribed; both observations and
+        # the exact run and agent must be identifiable in the diagnostic.
+        for text in (str(original["seq"]), "A", "claude-sonnet-5-5", model,
+                     initial_effort or "low", effort):
+            self.assertIn(text, detail)
+        self.assertEqual(self.show("T-1")["model_mismatches"], 0)
+        self.assert_no_unrecorded()
+
+    def test_resume_case_11_contradictory_model_preserves_evidence(self):
+        self.check_contradiction("low", "claude-opus-5-5", "low")
+
+    def test_resume_case_11_contradictory_effort_preserves_evidence(self):
+        self.check_contradiction("low", "claude-sonnet-5-5", "high")
+
+    def test_resume_case_11_missing_effort_cannot_fill_contradiction(self):
+        self.check_contradiction(None, "claude-sonnet-5-5", "high")
+
+    def test_resume_case_12_bounded_wait_updates_activity_without_blocking(self):
+        self.dispatch()
+        phase = self.show("T-1")["phase"]
+        for repeat in (False, True):
+            with self.subTest(repeat=repeat):
+                if repeat:
+                    self.dispatch()
+                    pending = self.runs()[1]
+                self.hook_ok("Stop", self.sid, self.wt)
+                before = self.show("T-1")
+                started = time.monotonic()
+                self.observe(model=None)
+                elapsed = time.monotonic() - started
+                self.assertGreaterEqual(elapsed, 1.8)
+                self.assertLess(elapsed, 6.0, "2-second wait plus scheduling tolerance")
+                after = self.show("T-1")
+                self.assertEqual(after["activity"], "working")
+                self.assertNotEqual(after["last_seen_at"], before["last_seen_at"])
+                self.assertEqual(after["phase"], phase)
+                self.assertNotEqual(after["status"], "blocked")
+                self.assertIsNone(self.runs()[0]["model_resolved"])
+                self.assertEqual(len(self.diagnostics("model_unresolved")), 1)
+                if repeat:
+                    self.assertEqual(self.runs()[1], pending)
+                self.assert_no_unrecorded()
 
     def test_fills_the_run_from_the_transcript(self):
         self.ok("run", "T-1", "--role", "implementor", "--model", "sonnet", "--effort", "low")

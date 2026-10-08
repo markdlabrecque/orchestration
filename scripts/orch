@@ -3553,9 +3553,36 @@ def subagent_report(payload):
 
 
 def record_subagent(db, tid, phase, ts, role, agent_id, resolved, effort, meta_model):
-    """Pair a finished stage agent with the oldest unfilled run of its role."""
-    run = db.execute("SELECT * FROM runs WHERE ticket=? AND role=? AND agent_id IS NULL"
-                     " ORDER BY seq LIMIT 1", (tid, role)).fetchone()
+    """Attach evidence to a known agent before using the oldest pending run."""
+    run = None
+    if agent_id and agent_id != "unknown":
+        run = db.execute("SELECT * FROM runs WHERE ticket=? AND role=? AND agent_id=?"
+                         " ORDER BY seq LIMIT 1", (tid, role, agent_id)).fetchone()
+    if run is not None:
+        if resolved is None:
+            return
+        if run["model_resolved"] is not None:
+            model_changed = resolved != run["model_resolved"]
+            effort_changed = effort is not None and (
+                (run["effort_resolved"] is not None
+                 and effort != run["effort_resolved"])
+                or (run["effort_resolved"] is None
+                    and run["effort_requested"] not in (None, effort)))
+            if model_changed or effort_changed:
+                log_event(db, tid, "model_mismatch", phase, phase,
+                          "role=%s run=%s agent_id=%s retained model=%s effort=%s"
+                          " observed model=%s effort=%s requested model=%s effort=%s"
+                          % (role, run["seq"], agent_id, run["model_resolved"],
+                             run["effort_resolved"] or "-", resolved, effort or "-",
+                             run["model_requested"], run["effort_requested"] or "-"))
+            elif run["effort_resolved"] is None and effort is not None:
+                db.execute("UPDATE runs SET effort_resolved=? WHERE seq=?",
+                           (effort, run["seq"]))
+            return
+        # Late first model evidence uses the normal resolution check below.
+    else:
+        run = db.execute("SELECT * FROM runs WHERE ticket=? AND role=? AND agent_id IS NULL"
+                         " ORDER BY seq LIMIT 1", (tid, role)).fetchone()
     if run is None:
         log_event(db, tid, "dispatch_unrecorded", phase, phase,
                   "role=%s resolved=%s requested=%s" % (role, resolved or "-",
