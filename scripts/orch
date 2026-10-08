@@ -122,8 +122,8 @@ CLAUDE_MODELS = {"light": "haiku", "standard": "sonnet", "heavy": "opus",
                  "frontier": "fable"}
 CODEX_MODELS = {"light": "gpt-6-luna", "standard": "gpt-6.1-sol", "heavy": "gpt-6-astra",
                 "frontier": "gpt-6-astra"}
-PI_MODELS = {"light": "openai-codex/gpt-6-luna", "standard": "openai-codex/gpt-6.1-sol",
-             "heavy": "openai-codex/gpt-6-astra", "frontier": "openai-codex/gpt-6-astra"}
+PI_MODELS = {"light": "openai/gpt-6-luna", "standard": "openai/gpt-6.1-sol",
+             "heavy": "openai/gpt-6-astra", "frontier": "openai/gpt-6-astra"}
 # Pi thinking level per effort rung (pi/extension.ts PI_THINKING).
 PI_THINKING = {"low": "low", "high": "high"}
 # Old `pi_models` keys (Claude model names), read as the tiers they named.

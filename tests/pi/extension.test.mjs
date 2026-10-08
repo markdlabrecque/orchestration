@@ -71,10 +71,10 @@ const byName = (agents) => Object.fromEntries(agents.map((a) => [a.name.replace(
 test("piModels maps the routing tiers, with the old Claude names as aliases", () => {
   withXdg(null, () => {
     const m = ext.piModels();
-    assert.equal(m.light, "openai-codex/gpt-6-luna");
-    assert.equal(m.standard, "openai-codex/gpt-6.1-sol");
-    assert.equal(m.heavy, "openai-codex/gpt-6-astra");
-    assert.equal(m.frontier, "openai-codex/gpt-6-astra");
+    assert.deepEqual({ light: m.light, standard: m.standard, heavy: m.heavy, frontier: m.frontier }, {
+      light: "openai/gpt-6-luna", standard: "openai/gpt-6.1-sol",
+      heavy: "openai/gpt-6-astra", frontier: "openai/gpt-6-astra",
+    });
     assert.equal(m.haiku, m.light);
     assert.equal(m.sonnet, m.standard);
     assert.equal(m.opus, m.heavy);
@@ -86,7 +86,9 @@ test("the machine config's pi_models overrides the tier map, by tier or by old n
     const m = ext.piModels();
     assert.equal(m.light, "venice/small");
     assert.equal(m.standard, "venice/mid");
-    assert.equal(m.heavy, "openai-codex/gpt-6-astra");
+    assert.deepEqual({ heavy: m.heavy, frontier: m.frontier }, {
+      heavy: "openai/gpt-6-astra", frontier: "openai/gpt-6-astra",
+    });
   });
   // opus sets heavy and frontier (both run on one model); a tier key wins.
   withXdg({ platform: "headless", pi_models: { opus: "venice/big", frontier: "venice/top" } }, () => {
@@ -94,6 +96,18 @@ test("the machine config's pi_models overrides the tier map, by tier or by old n
     assert.equal(m.heavy, "venice/big");
     assert.equal(m.frontier, "venice/top");
     assert.equal(m.opus, "venice/big");
+  });
+});
+
+test("explicit pi_models preserves provider and model overrides for all tiers", () => {
+  const models = { light: "openai-codex/custom-light", standard: "venice/custom-mid",
+    heavy: "openai-codex/custom-heavy", frontier: "venice/custom-top" };
+  withXdg({ pi_models: models }, () => {
+    const m = ext.piModels();
+    for (const [tier, model] of Object.entries(models)) assert.equal(m[tier], model);
+    assert.equal(m.haiku, models.light);
+    assert.equal(m.sonnet, models.standard);
+    assert.equal(m.opus, models.heavy);
   });
 });
 

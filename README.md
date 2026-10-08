@@ -86,7 +86,7 @@ Run `scripts/install-local` from this checkout. Its first line says which versio
 | Harness | What the script does | Start it |
 |---|---|---|
 | Claude Code | Adds this checkout as the `orchestration` marketplace and installs `orchestration@orchestration` | `/orchestration` |
-| Pi | `pi install <checkout>` (needs the `subagents` extension for stage agents). Stage agents run on `openai-codex` models by routing tier; set `pi_models` in `~/.config/orchestration/config.json` to use other providers | `/skill:orchestration` |
+| Pi | `pi install <checkout>` (needs the `subagents` extension for stage agents). Stage agents run on `openai` models by routing tier; set `pi_models` in `~/.config/orchestration/config.json` to use other providers | `/skill:orchestration` |
 | Codex | Adds this checkout as the `orchestration` marketplace, installs `orchestration@orchestration`, then runs `scripts/codex-agents`. Ticket sessions enable hooks themselves (`--enable hooks`) | `$orchestration:orchestration` |
 
 Every stage dispatch is routed to a model tier and an effort rung: `orch route` picks it, `orch run` records it, and on Claude the `SubagentStop` hook checks the model the subagent really ran on.

@@ -26,8 +26,8 @@ ROLE_DEFAULTS = {"filer": "light", "investigation": "light", "test-writer": "sta
 CLAUDE = {"light": "haiku", "standard": "sonnet", "heavy": "opus", "frontier": "fable"}
 CODEX = {"light": "gpt-6-luna", "standard": "gpt-6.1-sol", "heavy": "gpt-6-astra",
          "frontier": "gpt-6-astra"}
-PI = {"light": "openai-codex/gpt-6-luna", "standard": "openai-codex/gpt-6.1-sol",
-      "heavy": "openai-codex/gpt-6-astra", "frontier": "openai-codex/gpt-6-astra"}
+PI = {"light": "openai/gpt-6-luna", "standard": "openai/gpt-6.1-sol",
+      "heavy": "openai/gpt-6-astra", "frontier": "openai/gpt-6-astra"}
 
 
 class RoutingTestCase(OrchTestCase):
@@ -207,6 +207,36 @@ class RouteTests(RoutingTestCase):
         self.assertRegex(p.stdout, r"(?m)^effort: high$")
         self.assertRegex(p.stdout, r"(?m)^thinking: high$")
 
+    def assert_pi_tier_models(self, models):
+        self.add("t1")
+        self.set_harness("t1", "pi")
+        for role, extra, tier in [("reviewer", (), "light"),
+                                  ("test-writer", (), "standard"),
+                                  ("test-writer", ("--ambiguous",), "heavy")]:
+            with self.subTest(tier=tier):
+                r = self.route("t1", role, *extra)
+                self.assertEqual((r["tier"], r["model"], r["effort"], r["thinking"]),
+                                 (tier, models[tier], "low", "low"))
+        self.to_review("t2")
+        self.log_run("t2", "implementor", "opus", effort="high")
+        self.ok("phase", "t2", "fix")
+        self.set_harness("t2", "pi")
+        r = self.route("t2", "implementor")
+        self.assertEqual((r["tier"], r["model"], r["effort"], r["thinking"]),
+                         ("frontier", models["frontier"], "low", "low"))
+
+    def test_pi_defaults_use_openai_for_every_tier(self):
+        self.assert_pi_tier_models(PI)
+
+    def test_pi_explicit_models_override_every_tier(self):
+        models = {"light": "openai-codex/custom-light", "standard": "venice/custom-mid",
+                  "heavy": "openai-codex/custom-heavy", "frontier": "venice/custom-top"}
+        cfg_dir = os.path.join(self.env["XDG_CONFIG_HOME"], "orchestration")
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "config.json"), "w") as f:
+            json.dump({"pi_models": models}, f)
+        self.assert_pi_tier_models(models)
+
     def test_pi_models_override(self):
         cfg_dir = os.path.join(self.env["XDG_CONFIG_HOME"], "orchestration")
         os.makedirs(cfg_dir, exist_ok=True)
@@ -218,8 +248,14 @@ class RouteTests(RoutingTestCase):
         self.assertEqual(self.route("t1", "reviewer")["model"], "venice/small")
         r = self.route("t1", "test-writer")
         self.assertEqual((r["model"], r["thinking"]), ("venice/mid", "low"))
-        self.assertEqual(self.route("t1", "test-writer", "--ambiguous")["model"],
-                         PI["heavy"])
+        with self.subTest(fallback="heavy"):
+            self.assertEqual(self.route("t1", "test-writer", "--ambiguous")["model"],
+                             PI["heavy"])
+        self.to_review("t2")
+        self.log_run("t2", "implementor", "opus", effort="high")
+        self.ok("phase", "t2", "fix")
+        self.set_harness("t2", "pi")
+        self.assertEqual(self.route("t2", "implementor")["model"], PI["frontier"])
 
 
 class RunTests(RoutingTestCase):
