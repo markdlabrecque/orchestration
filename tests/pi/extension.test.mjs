@@ -97,6 +97,10 @@ test("the machine config's pi_models overrides the tier map, by tier or by old n
   });
 });
 
+test("PI_THINKING maps each effort rung to a thinking level", () => {
+  assert.deepEqual(ext.PI_THINKING, { low: "low", high: "high" });
+});
+
 test("the factory registers the agent provider for the subagents extension", () => {
   delete globalThis[ext.AGENT_PROVIDERS];
   ext.default(fakePi(), recorder().hook);

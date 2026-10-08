@@ -105,10 +105,14 @@ NEW_COLUMNS = (
     # review -> fix and verify -> fix transitions (ci -> fix is not a bounce).
     ("bounces", "INTEGER NOT NULL DEFAULT 0"),
 )
+# Columns added to `runs` after the first release (effort rungs).
+NEW_RUN_COLUMNS = ("effort_requested", "effort_resolved")
 # Model routing (orch-cli.md "Model routing"). Tiers in order; each role's
-# default tier; per-harness dispatch values. Codex: (model, reasoning effort),
-# Pi: (model, thinking); heavy and frontier share a model there.
+# default tier; per-harness dispatch values (heavy and frontier share a model
+# on Codex and Pi). Two effort rungs per tier; a rung is tier * 2 + effort.
 TIERS = ("light", "standard", "heavy", "frontier")
+EFFORTS = ("low", "high")
+TOP_RUNG = len(TIERS) * len(EFFORTS) - 1
 ROLE_TIERS = {"filer": "light", "investigation": "light", "test-writer": "standard",
               "implementor": "standard", "reviewer": "light", "verifier": "light",
               "reporter": "light"}
@@ -116,12 +120,12 @@ ROLE_TIERS = {"filer": "light", "investigation": "light", "test-writer": "standa
 AGENT_ROLES = ("test-writer", "implementor", "reviewer", "verifier", "reporter")
 CLAUDE_MODELS = {"light": "haiku", "standard": "sonnet", "heavy": "opus",
                  "frontier": "fable"}
-CODEX_MODELS = {"light": ("gpt-6-luna", "low"), "standard": ("gpt-6.1-sol", "medium"),
-                "heavy": ("gpt-6-astra", "high"), "frontier": ("gpt-6-astra", "xhigh")}
-PI_MODELS = {"light": ("openai-codex/gpt-6-luna", "low"),
-             "standard": ("openai-codex/gpt-6.1-sol", "medium"),
-             "heavy": ("openai-codex/gpt-6-astra", "high"),
-             "frontier": ("openai-codex/gpt-6-astra", "xhigh")}
+CODEX_MODELS = {"light": "gpt-6-luna", "standard": "gpt-6.1-sol", "heavy": "gpt-6-astra",
+                "frontier": "gpt-6-astra"}
+PI_MODELS = {"light": "openai-codex/gpt-6-luna", "standard": "openai-codex/gpt-6.1-sol",
+             "heavy": "openai-codex/gpt-6-astra", "frontier": "openai-codex/gpt-6-astra"}
+# Pi thinking level per effort rung (pi/extension.ts PI_THINKING).
+PI_THINKING = {"low": "low", "high": "high"}
 # Old `pi_models` keys (Claude model names), read as the tiers they named.
 PI_MODEL_ALIASES = {"haiku": ("light",), "sonnet": ("standard",),
                     "opus": ("heavy", "frontier")}  # opus: both run on one model
@@ -193,7 +197,9 @@ CREATE TABLE IF NOT EXISTS runs (
     model_resolved TEXT,
     agent_id TEXT,
     resolved_at TEXT,
-    match INTEGER
+    match INTEGER,
+    effort_requested TEXT,
+    effort_resolved TEXT
 );
 """
 
@@ -439,6 +445,10 @@ def connect(sdir, timeout=30):
     for name, decl in NEW_COLUMNS:
         if name not in cols:
             db.execute("ALTER TABLE tickets ADD COLUMN %s %s" % (name, decl))
+    run_cols = {r[1] for r in db.execute("PRAGMA table_info(runs)")}
+    for name in NEW_RUN_COLUMNS:
+        if name not in run_cols:
+            db.execute("ALTER TABLE runs ADD COLUMN %s TEXT" % name)
     return db
 
 
@@ -2195,7 +2205,7 @@ def cmd_phase(args, db, sdir):
     bounce = new == "fix" and cur in ("review", "verify")
     if bounce:
         last = last_run(db, args.ticket, "implementor")
-        if last and last["tier"] == TIERS[-1]:
+        if last and rung_of(last) >= TOP_RUNG:
             raise Refusal(EXIT_GATE, frontier_bounce_msg(args.ticket))
     rounds = row["review_rounds"] + (1 if new == "review" else 0)
     db.execute("UPDATE tickets SET phase=?, review_rounds=?, bounces=bounces+? WHERE id=?",
@@ -2387,17 +2397,27 @@ def last_run(db, tid, role):
                       " LIMIT 1", (tid, role)).fetchone()
 
 
+def rung(tier, effort):
+    return TIERS.index(tier) * len(EFFORTS) + EFFORTS.index(effort)
+
+
+def rung_of(run):
+    """The rung a recorded run ran at (a run from before efforts: low)."""
+    return rung(run["tier"], run["effort_requested"] or EFFORTS[0])
+
+
 def fmt_runs(runs):
-    lines = ["SEQ\tROLE\tTIER\tREQUESTED\tRESOLVED\tMATCH\tBOUNCES\tAGENT\tREQUESTED_AT"]
+    lines = ["SEQ\tROLE\tTIER\tREQUESTED\tEFFORT\tRESOLVED\tEFFORT_RESOLVED\tMATCH\tBOUNCES"
+             "\tAGENT\tREQUESTED_AT"]
     for r in runs:
         lines.append("\t".join(str("-" if v is None else v) for v in (
-            r["seq"], r["role"], r["tier"], r["model_requested"], r["model_resolved"],
-            r["match"], r["bounce_count"], r["agent_id"], r["requested_at"])))
+            r["seq"], r["role"], r["tier"], r["model_requested"], r["effort_requested"],
+            r["model_resolved"], r["effort_resolved"], r["match"], r["bounce_count"], r["agent_id"], r["requested_at"])))
     return "\n".join(lines)
 
 
 def frontier_bounce_msg(tid):
-    return ("the implementor of %s already ran at frontier; there is no higher tier to"
+    return ("the implementor of %s already ran at frontier/high; there is no higher rung to"
             " escalate to: block the ticket for a human (`orch block %s --reason"
             " \"bounced after a frontier implementor\"`)" % (tid, tid))
 
@@ -2414,7 +2434,7 @@ def machine_config():
 
 
 def pi_models():
-    """tier -> (model, thinking): PI_MODELS with the machine config's
+    """tier -> model: PI_MODELS with the machine config's
     `pi_models` override, keyed by tier or by an old alias (a tier key wins;
     `opus` sets heavy and frontier, which share a model).
     The same map as pi/extension.ts piModels()."""
@@ -2426,52 +2446,57 @@ def pi_models():
         keyed += [(k, v) for k, v in own.items() if k in TIERS]
         for tier, model in keyed:
             if isinstance(model, str) and model:
-                out[tier] = (model, PI_MODELS[tier][1])
+                out[tier] = model
     return out
 
 
-def dispatch(harness, role, tier):
-    """The dispatch value of `tier` on `harness` as a dict (route's JSON minus
-    floors)."""
+def dispatch(harness, role, tier, effort):
+    """The dispatch value of `tier` at `effort` on `harness` as a dict (route's
+    JSON minus floors)."""
+    d = {"tier": tier, "effort": effort}
     if harness == "codex":
-        model, effort = CODEX_MODELS[tier]
-        d = {"tier": tier, "model": model, "effort": effort}
+        d["model"] = CODEX_MODELS[tier]
         if role in AGENT_ROLES:
-            d["agent"] = "%s-%s" % (role, tier)
-        return d
-    if harness == "pi":
-        model, thinking = pi_models()[tier]
-        return {"tier": tier, "model": model, "thinking": thinking}
-    return {"tier": tier, "model": CLAUDE_MODELS[tier]}
+            d["agent"] = "%s-%s-%s" % (role, tier, effort)
+    elif harness == "pi":
+        d["model"] = pi_models()[tier]
+        d["thinking"] = PI_THINKING[effort]
+    else:
+        d["model"] = CLAUDE_MODELS[tier]
+    return d
 
 
 def tier_of(harness, role, value):
-    """(tier, the value to record) for a --model value: a tier name, the
-    harness's dispatch value, or on Codex a per-tier agent name. A model two
-    tiers share (Codex/Pi heavy and frontier) is the lower tier. None when
-    unknown."""
+    """(tier, the value to record, the effort a Codex agent name implies or
+    None) for a --model value: a tier name, the harness's dispatch value, or on
+    Codex a per-rung agent name. A model two tiers share (Codex/Pi heavy and
+    frontier) is the lower tier. None when unknown."""
     if value in TIERS:
-        return value, dispatch(harness, role, value)["model"]
+        return value, dispatch(harness, role, value, EFFORTS[0])["model"], None
     if harness == "codex":
         for tier in TIERS:
-            if value in (CODEX_MODELS[tier][0], "%s-%s" % (role, tier)):
-                return tier, value
+            for effort in EFFORTS:
+                if value == "%s-%s-%s" % (role, tier, effort):
+                    return tier, value, effort
+            if value == CODEX_MODELS[tier]:
+                return tier, value, None
     elif harness == "pi":
         models = pi_models()
         for tier in TIERS:
-            if value == models[tier][0]:
-                return tier, value
+            if value == models[tier]:
+                return tier, value, None
     else:
         for tier in TIERS:
             if value == CLAUDE_MODELS[tier]:
-                return tier, value
-    return None, value
+                return tier, value, None
+    return None, value, None
 
 
 def route_tier(db, row, role, files=None, lines=None, ambiguous=False):
-    """(tier, reasons): the role's default tier, bumped by --ambiguous and a
-    large change, then raised to the floors the ticket's runs set. Refuses
-    an implementor that would need a tier above frontier."""
+    """(tier, effort, reasons): the role's default tier at effort low, tier
+    bumped by --ambiguous and a large change, then raised to the rung floors
+    the ticket's runs set. Refuses an implementor that would need a rung above
+    frontier/high."""
     if role not in ROLE_TIERS:
         raise Refusal(EXIT_USAGE, "unknown role %r: one of %s"
                       % (role, ", ".join(sorted(ROLE_TIERS))))
@@ -2484,28 +2509,30 @@ def route_tier(db, row, role, files=None, lines=None, ambiguous=False):
         level += 1
         reasons.append("large change (> %d files or > %d lines): one tier up"
                        % (BIG_FILES, BIG_LINES))
-    level = min(level, top)
+    level = min(level, top) * len(EFFORTS)
     floors = []
     impl = last_run(db, tid, "implementor")
     if role == "implementor" and impl is not None and row["bounces"] > impl["bounce_count"]:
-        prev = TIERS.index(impl["tier"])
-        if prev >= top:
+        if rung_of(impl) >= TOP_RUNG:
             raise Refusal(EXIT_GATE, frontier_bounce_msg(tid))
-        floors.append((prev + 1, "after a bounce: one tier above the last implementor"
-                       " (%s)" % impl["tier"]))
+        floors.append((rung_of(impl) + 1, "after a bounce: one rung above the last"
+                       " implementor (%s/%s)" % (impl["tier"],
+                                                 impl["effort_requested"] or EFFORTS[0])))
     if role == "reviewer" and impl is not None:
-        floors.append((TIERS.index(impl["tier"]) - 1, "reviewer: at most one tier below"
-                       " the last implementor (%s)" % impl["tier"]))
+        floors.append(((TIERS.index(impl["tier"]) - 1) * len(EFFORTS),
+                       "reviewer: at most one tier below the last implementor (%s)"
+                       % impl["tier"]))
     tiers = [TIERS.index(r["tier"]) for r in db.execute(
         "SELECT tier FROM runs WHERE ticket=?", (tid,)) if r["tier"] in TIERS]
     if tiers:
-        floors.append((max(tiers) - 1, "no de-escalation: at most one tier below the"
-                       " highest on the ticket (%s)" % TIERS[max(tiers)]))
+        floors.append(((max(tiers) - 1) * len(EFFORTS),
+                       "no de-escalation: at most one tier below the highest on the"
+                       " ticket (%s)" % TIERS[max(tiers)]))
     for floor, why in floors:
-        if min(floor, top) > level:
+        if min(floor, TOP_RUNG) > level:
             reasons.append(why)
-    level = min(max([level] + [f for f, _ in floors]), top)
-    return TIERS[level], reasons
+    level = min(max([level] + [f for f, _ in floors]), TOP_RUNG)
+    return TIERS[level // len(EFFORTS)], EFFORTS[level % len(EFFORTS)], reasons
 
 
 def size_args(args):
@@ -2514,8 +2541,8 @@ def size_args(args):
 
 def cmd_route(args, db, sdir):
     row = get_ticket(db, args.ticket)
-    tier, reasons = route_tier(db, row, args.role, **size_args(args))
-    d = dispatch(row_harness(row), args.role, tier)
+    tier, effort, reasons = route_tier(db, row, args.role, **size_args(args))
+    d = dispatch(row_harness(row), args.role, tier, effort)
     d["floors"] = reasons
     text = [d["model"], "tier: %s" % tier]
     text += ["%s: %s" % (k, d[k]) for k in ("effort", "thinking", "agent") if k in d]
@@ -2528,22 +2555,30 @@ def cmd_run(args, db, sdir):
     harness = row_harness(row)
     if args.role not in ROLE_TIERS:
         route_tier(db, row, args.role)  # raises the usage error
-    tier, value = tier_of(harness, args.role, args.model)
+    tier, value, implied = tier_of(harness, args.role, args.model)
+    if implied and implied != args.effort:
+        raise Refusal(EXIT_USAGE, "%s names effort %s but --effort is %s"
+                      % (args.model, implied, args.effort))
     if tier is None:
         raise Refusal(EXIT_USAGE, "unknown model %r for harness %s: use a tier (%s) or"
                       " the value `orch route` prints" % (args.model, harness,
                                                           ", ".join(TIERS)))
-    need, reasons = route_tier(db, row, args.role, **size_args(args))
-    if TIERS.index(tier) < TIERS.index(need):
-        raise Refusal(EXIT_GATE, "%s is %s, below the %s floor for %s on %s%s" % (
-            args.model, tier, need, args.role, args.ticket,
+    if args.effort is None:
+        raise Refusal(EXIT_USAGE, "run needs --effort (%s)" % "|".join(EFFORTS))
+    need, need_effort, reasons = route_tier(db, row, args.role, **size_args(args))
+    if rung(tier, args.effort) < rung(need, need_effort):
+        raise Refusal(EXIT_GATE, "%s/%s is %s/%s, below the %s/%s floor for %s on %s%s" % (
+            args.model, args.effort, tier, args.effort, need, need_effort,
+            args.role, args.ticket,
             (": " + "; ".join(reasons)) if reasons else " (the role's default)"))
     seq = db.execute(
         "INSERT INTO runs (ticket, role, model_requested, tier, bounce_count,"
-        " requested_at) VALUES (?,?,?,?,?,?)",
-        (args.ticket, args.role, value, tier, row["bounces"], now())).lastrowid
+        " requested_at, effort_requested) VALUES (?,?,?,?,?,?,?)",
+        (args.ticket, args.role, value, tier, row["bounces"], now(),
+         args.effort)).lastrowid
     log_event(db, args.ticket, "run", row["phase"], row["phase"],
-              "role=%s model=%s tier=%s" % (args.role, value, tier))
+              "role=%s model=%s tier=%s effort=%s" % (args.role, value, tier,
+                                                     args.effort))
     r = dict(db.execute("SELECT * FROM runs WHERE seq=?", (seq,)).fetchone())
     emit(args, r, str(seq))
 
@@ -2599,8 +2634,8 @@ def cmd_watch(args):
 SMOKE_MODELS = ("haiku", "fable")
 SMOKE_TIMEOUT_S = 180
 SMOKE_PROMPT = ('Use the Agent tool once, with subagent_type "general-purpose" and'
-                ' model "%s", on this task: "Reply with one line naming your model;'
-                ' use no tools." Then stop. Do nothing else.')
+                ' model "%s" and effort "%s", on this task: "Reply with one line naming your'
+                ' model; use no tools." Then stop. Do nothing else.')
 
 
 def claude_projects_dir():
@@ -2608,10 +2643,11 @@ def claude_projects_dir():
                         or os.path.expanduser("~/.claude"), "projects")
 
 
-def smoke_routing(models, cfg):
+def smoke_routing(models, cfg, effort="high"):
     """For each Claude model alias, a headless session dispatches a subagent
-    with it; the subagent's transcript (not its self-report) gives the model
-    it ran on. Returns [{"requested", "resolved", "ok", "note"}]."""
+    with it and `effort`; the subagent's transcript (not its self-report) gives
+    the model and effort it ran at. Returns [{"requested", "effort_requested",
+    "resolved", "effort_resolved", "ok", "note"}]."""
     root = project_root()
     key = re.sub(r"[^A-Za-z0-9]", "-", root)
     env = {k: v for k, v in os.environ.items() if k not in LAUNCH_ENV_DROP}
@@ -2626,7 +2662,7 @@ def smoke_routing(models, cfg):
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                     text=True, start_new_session=True)
             try:
-                proc.communicate(SMOKE_PROMPT % value, timeout=SMOKE_TIMEOUT_S)
+                proc.communicate(SMOKE_PROMPT % (value, effort), timeout=SMOKE_TIMEOUT_S)
                 if proc.returncode:
                     note = "claude exited %d" % proc.returncode
             except subprocess.TimeoutExpired:
@@ -2636,23 +2672,29 @@ def smoke_routing(models, cfg):
                 proc.wait()
         except OSError as e:
             note = "cannot start %s: %s" % (argv[0], e)
-        resolved = None
+        resolved = resolved_effort = None
         paths = glob.glob(os.path.join(claude_projects_dir(), key, sid, "subagents",
                                        "agent-*.jsonl"))
         for path in sorted(paths, key=os.path.getmtime):
-            resolved = transcript_model(path) or resolved
+            m, e = transcript_model(path)
+            if m:
+                resolved, resolved_effort = m, e
         if not resolved and not note:
             note = "no subagent transcript with a model"
-        results.append({"requested": value, "resolved": resolved,
-                        "ok": bool(resolved) and resolved.startswith("claude-%s-" % value),
+        results.append({"requested": value, "effort_requested": effort,
+                        "resolved": resolved, "effort_resolved": resolved_effort,
+                        "ok": bool(resolved) and resolved.startswith("claude-%s-" % value)
+                        and resolved_effort == effort,
                         "note": note})
     return results
 
 
 def fmt_smoke(results):
-    lines = ["%-10s %-24s %s" % ("REQUESTED", "RESOLVED", "RESULT")]
+    lines = ["%-14s %-28s %s" % ("REQUESTED", "RESOLVED", "RESULT")]
     for r in results:
-        lines.append("%-10s %-24s %s" % (r["requested"], r["resolved"] or "-",
+        lines.append("%-14s %-28s %s" % ("%s/%s" % (r["requested"], r["effort_requested"]),
+                                         ("%s/%s" % (r["resolved"], r["effort_resolved"] or "-"))
+                                         if r["resolved"] else "-",
                                          ("pass" if r["ok"] else "FAIL")
                                          + ((" (%s)" % r["note"]) if r["note"] else "")))
     return lines
@@ -2670,7 +2712,7 @@ def cmd_smoke_routing(args):
             raise Refusal(EXIT_USAGE, "unknown model %r: one of %s or a tier" % (
                 value, ", ".join(CLAUDE_MODELS.values())))
         models.append(alias)
-    results = smoke_routing(models, load_config(state_dir()))
+    results = smoke_routing(models, load_config(state_dir()), args.effort)
     emit(args, {"results": results, "ok": all(r["ok"] for r in results)},
          "\n".join(fmt_smoke(results)))
     failed = [r["requested"] for r in results if not r["ok"]]
@@ -3457,9 +3499,10 @@ TRANSCRIPT_WAIT_S = 2.0
 
 
 def transcript_model(path):
-    """message.model of the last assistant entry in a subagent transcript, or
-    None. Synthetic entries (`<synthetic>`) name no model."""
-    model = None
+    """(model, effort) of the last assistant entry in a subagent transcript:
+    message.model and the top-level `effort`, each None when absent. Synthetic
+    entries (`<synthetic>`) name no model."""
+    model = effort = None
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -3470,14 +3513,16 @@ def transcript_model(path):
                 m = dig(obj, "message", "model") if isinstance(obj, dict) \
                     and obj.get("type") == "assistant" else None
                 if isinstance(m, str) and m and not m.startswith("<"):
-                    model = m
+                    e = obj.get("effort")
+                    model, effort = m, (e if isinstance(e, str) and e else None)
     except OSError:
-        return None
-    return model
+        return None, None
+    return model, effort
 
 
 def subagent_report(payload):
-    """(role, agent_id, resolved model, the call's model from meta.json) for a
+    """(role, agent_id, resolved model, resolved effort, the call's model from
+    meta.json) for a
     SubagentStop of a stage agent (`orchestration:<role>`), else None. The
     transcript is written asynchronously: wait up to TRANSCRIPT_WAIT_S."""
     kind = payload.get("agent_type")
@@ -3487,11 +3532,11 @@ def subagent_report(payload):
     agent_id = payload.get("agent_id")
     agent_id = str(agent_id) if agent_id else "unknown"
     path = payload.get("agent_transcript_path")
-    resolved = meta_model = None
+    resolved = effort = meta_model = None
     if isinstance(path, str) and path:
         deadline = time.time() + TRANSCRIPT_WAIT_S
         while True:
-            resolved = transcript_model(path)
+            resolved, effort = transcript_model(path)
             if resolved or time.time() >= deadline:
                 break
             time.sleep(0.2)
@@ -3502,10 +3547,10 @@ def subagent_report(payload):
                 meta_model = meta["model"]
         except (OSError, ValueError):
             pass
-    return role, agent_id, resolved, meta_model
+    return role, agent_id, resolved, effort, meta_model
 
 
-def record_subagent(db, tid, phase, ts, role, agent_id, resolved, meta_model):
+def record_subagent(db, tid, phase, ts, role, agent_id, resolved, effort, meta_model):
     """Pair a finished stage agent with the oldest unfilled run of its role."""
     run = db.execute("SELECT * FROM runs WHERE ticket=? AND role=? AND agent_id IS NULL"
                      " ORDER BY seq LIMIT 1", (tid, role)).fetchone()
@@ -3519,13 +3564,18 @@ def record_subagent(db, tid, phase, ts, role, agent_id, resolved, meta_model):
         log_event(db, tid, "model_unresolved", phase, phase,
                   "role=%s agent_id=%s" % (role, agent_id))
         return
-    match = resolved.startswith("claude-%s-" % run["model_requested"])
-    db.execute("UPDATE runs SET agent_id=?, model_resolved=?, resolved_at=?, match=?"
-               " WHERE seq=?", (agent_id, resolved, ts, int(match), run["seq"]))
-    if not match:
-        log_event(db, tid, "model_mismatch", phase, phase,
-                  "role=%s requested=%s resolved=%s" % (role, run["model_requested"],
-                                                        resolved))
+    model_ok = resolved.startswith("claude-%s-" % run["model_requested"])
+    # A transcript without an effort (older CLIs) is not a mismatch.
+    effort_ok = effort is None or run["effort_requested"] in (None, effort)
+    db.execute("UPDATE runs SET agent_id=?, model_resolved=?, effort_resolved=?,"
+               " resolved_at=?, match=? WHERE seq=?",
+               (agent_id, resolved, effort, ts, int(model_ok and effort_ok), run["seq"]))
+    if not (model_ok and effort_ok):
+        detail = "role=%s requested=%s resolved=%s" % (role, run["model_requested"],
+                                                       resolved)
+        if not effort_ok:
+            detail += " effort requested=%s resolved=%s" % (run["effort_requested"], effort)
+        log_event(db, tid, "model_mismatch", phase, phase, detail)
 
 
 HOOK_KEY_COLUMNS = ("phase", "worktree", "retired_at", "session_id", "pid",
@@ -3712,12 +3762,14 @@ def build_parser():
         sp.add_argument("--role", required=True)
         if fn is cmd_run:
             sp.add_argument("--model", required=True)
+            sp.add_argument("--effort", choices=EFFORTS)  # required: cmd_run checks
         sp.add_argument("--files", type=int)
         sp.add_argument("--lines", type=int)
         sp.add_argument("--ambiguous", action="store_true")
     add("runs", cmd_runs, "ticket")
     sp = add("smoke-routing", cmd_smoke_routing)
     sp.add_argument("--model", action="append", dest="models")
+    sp.add_argument("--effort", choices=EFFORTS, default="high")
     sp = add("watch", cmd_watch)
     sp.add_argument("--interval", type=float, default=5.0)
     sp.add_argument("--once", action="store_true")

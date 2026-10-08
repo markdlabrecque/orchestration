@@ -24,12 +24,10 @@ ROLE_DEFAULTS = {"filer": "light", "investigation": "light", "test-writer": "sta
                  "implementor": "standard", "reviewer": "light", "verifier": "light",
                  "reporter": "light"}
 CLAUDE = {"light": "haiku", "standard": "sonnet", "heavy": "opus", "frontier": "fable"}
-CODEX = {"light": ("gpt-6-luna", "low"), "standard": ("gpt-6.1-sol", "medium"),
-         "heavy": ("gpt-6-astra", "high"), "frontier": ("gpt-6-astra", "xhigh")}
-PI = {"light": ("openai-codex/gpt-6-luna", "low"),
-      "standard": ("openai-codex/gpt-6.1-sol", "medium"),
-      "heavy": ("openai-codex/gpt-6-astra", "high"),
-      "frontier": ("openai-codex/gpt-6-astra", "xhigh")}
+CODEX = {"light": "gpt-6-luna", "standard": "gpt-6.1-sol", "heavy": "gpt-6-astra",
+         "frontier": "gpt-6-astra"}
+PI = {"light": "openai-codex/gpt-6-luna", "standard": "openai-codex/gpt-6.1-sol",
+      "heavy": "openai-codex/gpt-6-astra", "frontier": "openai-codex/gpt-6-astra"}
 
 
 class RoutingTestCase(OrchTestCase):
@@ -40,8 +38,9 @@ class RoutingTestCase(OrchTestCase):
     def route(self, ticket, role, *extra):
         return self.j("route", ticket, "--role", role, *extra)
 
-    def log_run(self, ticket, role, model, *extra):
-        return self.j("run", ticket, "--role", role, "--model", model, *extra)
+    def log_run(self, ticket, role, model, *extra, effort="low"):
+        return self.j("run", ticket, "--role", role, "--model", model,
+                      "--effort", effort, *extra)
 
     def runs(self, ticket):
         return list_in(self.j("runs", ticket), "runs")
@@ -59,12 +58,15 @@ class RouteTests(RoutingTestCase):
         self.add("t1")
         for role, tier in ROLE_DEFAULTS.items():
             r = self.route("t1", role)
-            self.assertEqual((r["tier"], r["model"]), (tier, CLAUDE[tier]), role)
+            self.assertEqual((r["tier"], r["model"], r["effort"]),
+                             (tier, CLAUDE[tier], "low"), role)
 
-    def test_text_output_is_the_model(self):
+    def test_text_output_is_the_model_then_tier_and_effort(self):
         self.add("t1")
         p = self.ok("route", "t1", "--role", "implementor")
-        self.assertRegex(p.stdout, r"(?m)\bsonnet\s*$")
+        self.assertRegex(p.stdout.splitlines()[0], r"\bsonnet\s*$")
+        self.assertRegex(p.stdout, r"(?m)^tier: standard$")
+        self.assertRegex(p.stdout, r"(?m)^effort: low$")
 
     def test_unknown_role_is_a_usage_error(self):
         self.add("t1")
@@ -73,12 +75,14 @@ class RouteTests(RoutingTestCase):
 
     def test_ambiguous_goes_one_tier_up(self):
         self.add("t1")
-        self.assertEqual(self.route("t1", "implementor", "--ambiguous")["tier"], "heavy")
+        r = self.route("t1", "implementor", "--ambiguous")
+        self.assertEqual((r["tier"], r["effort"]), ("heavy", "low"))
         self.assertEqual(self.route("t1", "reporter", "--ambiguous")["tier"], "standard")
 
     def test_large_change_bumps_reviewer_and_investigation_only(self):
         self.add("t1")
-        self.assertEqual(self.route("t1", "reviewer", "--files", "6")["tier"], "standard")
+        r = self.route("t1", "reviewer", "--files", "6")
+        self.assertEqual((r["tier"], r["effort"]), ("standard", "low"))
         self.assertEqual(self.route("t1", "investigation", "--lines", "301")["tier"],
                          "standard")
         # At the thresholds: no bump.
@@ -93,7 +97,7 @@ class RouteTests(RoutingTestCase):
         self.add("t1")
         self.log_run("t1", "implementor", "opus")
         r = self.route("t1", "reviewer")
-        self.assertEqual((r["tier"], r["model"]), ("standard", "sonnet"))
+        self.assertEqual((r["tier"], r["model"], r["effort"]), ("standard", "sonnet", "low"))
         self.assertTrue(r["floors"], "the floor applied must be named")
 
     def test_no_role_drops_below_the_highest_recorded_tier_minus_one(self):
@@ -102,19 +106,33 @@ class RouteTests(RoutingTestCase):
         for role in ("verifier", "reporter", "filer"):
             self.assertEqual(self.route("t1", role)["tier"], "heavy", role)
 
-    def test_implementor_after_a_bounce_runs_one_tier_higher(self):
+    def test_a_bounce_climbs_one_rung_effort_first_then_tier(self):
         self.to_review("t1")
         self.log_run("t1", "implementor", "sonnet")
         self.ok("phase", "t1", "fix")
         r = self.route("t1", "implementor")
-        self.assertEqual((r["tier"], r["model"]), ("heavy", "opus"))
+        self.assertEqual((r["tier"], r["model"], r["effort"]), ("standard", "sonnet", "high"))
+        self.assertTrue(any("one rung above" in w and "standard/low" in w
+                            for w in r["floors"]), r["floors"])
+        self.log_run("t1", "implementor", "sonnet", effort="high")
+        # The review cap (2 rounds) would refuse a second bounce; reset it.
+        self.db_exec("UPDATE tickets SET review_rounds=0 WHERE id=?", ("t1",))
+        self.phases("t1", "review", "fix")
+        r = self.route("t1", "implementor")
+        self.assertEqual((r["tier"], r["model"], r["effort"]), ("heavy", "opus", "low"))
 
-    def test_tiers_cap_at_frontier(self):
+    def test_frontier_low_bounces_to_frontier_high_and_tiers_cap_there(self):
         self.to_review("t1")
-        self.log_run("t1", "implementor", "opus")
+        self.log_run("t1", "implementor", "opus", effort="high")
         self.ok("phase", "t1", "fix")
         r = self.route("t1", "implementor", "--ambiguous")
-        self.assertEqual((r["tier"], r["model"]), ("frontier", "fable"))
+        self.assertEqual((r["tier"], r["model"], r["effort"]), ("frontier", "fable", "low"))
+        self.log_run("t1", "implementor", "fable")
+        # The review cap (2 rounds) would refuse a second bounce; reset it.
+        self.db_exec("UPDATE tickets SET review_rounds=0 WHERE id=?", ("t1",))
+        self.phases("t1", "review", "fix")
+        r = self.route("t1", "implementor")
+        self.assertEqual((r["tier"], r["model"], r["effort"]), ("frontier", "fable", "high"))
 
     def test_codex_values(self):
         self.add("t1")
@@ -124,29 +142,46 @@ class RouteTests(RoutingTestCase):
         for role, extra, tier in cases:
             r = self.route("t1", role, *extra)
             self.assertEqual((r["tier"], r["model"], r["effort"], r["agent"]),
-                             (tier,) + CODEX[tier] + ("%s-%s" % (role, tier),), role)
+                             (tier, CODEX[tier], "low", "%s-%s-low" % (role, tier)), role)
             self.assertNotIn("thinking", r)
         p = self.ok("route", "t1", "--role", "implementor")
-        self.assertIn("agent: implementor-standard", p.stdout)
+        self.assertRegex(p.stdout, r"(?m)^effort: low$")
+        self.assertIn("agent: implementor-standard-low", p.stdout)
 
-    def test_codex_frontier(self):
+    def test_codex_agent_follows_the_bounce_rung(self):
         self.to_review("t1")
-        self.log_run("t1", "implementor", "opus")
+        self.log_run("t1", "implementor", "sonnet")
         self.ok("phase", "t1", "fix")
         self.set_harness("t1", "codex")
         r = self.route("t1", "implementor")
         self.assertEqual((r["tier"], r["model"], r["effort"], r["agent"]),
-                         ("frontier", "gpt-6-astra", "xhigh", "implementor-frontier"))
+                         ("standard", "gpt-6.1-sol", "high", "implementor-standard-high"))
+        self.to_review("t2")
+        self.log_run("t2", "implementor", "opus", effort="high")
+        self.ok("phase", "t2", "fix")
+        self.set_harness("t2", "codex")
+        r = self.route("t2", "implementor")
+        self.assertEqual((r["tier"], r["model"], r["effort"], r["agent"]),
+                         ("frontier", "gpt-6-astra", "low", "implementor-frontier-low"))
 
-    def test_pi_values(self):
+    def test_pi_thinking_is_the_effort(self):
         self.add("t1")
         self.set_harness("t1", "pi")
         for role, extra, tier in [("reviewer", (), "light"), ("test-writer", (), "standard"),
                                   ("test-writer", ("--ambiguous",), "heavy")]:
             r = self.route("t1", role, *extra)
-            self.assertEqual((r["tier"], r["model"], r["thinking"]), (tier,) + PI[tier], role)
-            self.assertNotIn("effort", r)
+            self.assertEqual((r["tier"], r["model"], r["effort"], r["thinking"]),
+                             (tier, PI[tier], "low", "low"), role)
             self.assertNotIn("agent", r)
+        self.to_review("t2")
+        self.log_run("t2", "implementor", "sonnet")
+        self.ok("phase", "t2", "fix")
+        self.set_harness("t2", "pi")
+        r = self.route("t2", "implementor")
+        self.assertEqual((r["effort"], r["thinking"]), ("high", "high"))
+        p = self.ok("route", "t2", "--role", "implementor")
+        self.assertRegex(p.stdout, r"(?m)^effort: high$")
+        self.assertRegex(p.stdout, r"(?m)^thinking: high$")
 
     def test_pi_models_override(self):
         cfg_dir = os.path.join(self.env["XDG_CONFIG_HOME"], "orchestration")
@@ -158,9 +193,9 @@ class RouteTests(RoutingTestCase):
         self.set_harness("t1", "pi")
         self.assertEqual(self.route("t1", "reviewer")["model"], "venice/small")
         r = self.route("t1", "test-writer")
-        self.assertEqual((r["model"], r["thinking"]), ("venice/mid", "medium"))
+        self.assertEqual((r["model"], r["thinking"]), ("venice/mid", "low"))
         self.assertEqual(self.route("t1", "test-writer", "--ambiguous")["model"],
-                         PI["heavy"][0])
+                         PI["heavy"])
 
 
 class RunTests(RoutingTestCase):
@@ -168,34 +203,59 @@ class RunTests(RoutingTestCase):
         self.add("t1")
         row = self.log_run("t1", "implementor", "sonnet")
         self.assertEqual((row["ticket"], row["role"], row["model_requested"], row["tier"],
-                          row["bounce_count"]), ("t1", "implementor", "sonnet", "standard", 0))
+                          row["bounce_count"], row["effort_requested"]),
+                         ("t1", "implementor", "sonnet", "standard", 0, "low"))
         self.assertTrue(row["requested_at"])
-        for k in ("model_resolved", "agent_id", "resolved_at", "match"):
+        for k in ("model_resolved", "effort_resolved", "agent_id", "resolved_at", "match"):
             self.assertIsNone(row[k], k)
         self.assertEqual([r["seq"] for r in self.runs("t1")], [row["seq"]])
         self.assertIn("run", [e["kind"] for e in self.events("t1")])
-        p = self.ok("run", "t1", "--role", "reporter", "--model", "haiku")
+        p = self.ok("run", "t1", "--role", "reporter", "--model", "haiku", "--effort", "low")
         self.assertEqual(p.stdout.strip(), str(self.runs("t1")[-1]["seq"]))
 
     def test_run_records_the_bounce_count_at_dispatch(self):
         self.to_review("t1")
         self.log_run("t1", "implementor", "sonnet")
         self.ok("phase", "t1", "fix")
-        row = self.log_run("t1", "implementor", "opus")
-        self.assertEqual((row["tier"], row["bounce_count"]), ("heavy", 1))
+        row = self.log_run("t1", "implementor", "sonnet", effort="high")
+        self.assertEqual((row["tier"], row["bounce_count"], row["effort_requested"]),
+                         ("standard", 1, "high"))
         self.assertEqual([r["role"] for r in self.runs("t1")], ["implementor", "implementor"])
 
     def test_run_below_the_floor_is_refused(self):
         self.add("t1")
         p = self.refused(3, "run", "t1", "--role", "reviewer", "--model", "haiku",
-                         "--files", "6")
+                         "--effort", "low", "--files", "6")
         self.assertNotIn("Traceback", p.stderr)
         self.to_review("t2")
         self.log_run("t2", "implementor", "sonnet")
         self.ok("phase", "t2", "fix")
-        self.refused(3, "run", "t2", "--role", "implementor", "--model", "sonnet")
+        # Same tier, rung below the bounce floor (sonnet/high): refused, and the
+        # message names both rungs.
+        p = self.refused(3, "run", "t2", "--role", "implementor", "--model", "sonnet",
+                         "--effort", "low")
+        self.assertIn("standard/low", p.stderr)
+        self.assertIn("standard/high", p.stderr)
         self.assertEqual(self.runs("t1"), [])
         self.assertEqual(len(self.runs("t2")), 1)
+        self.log_run("t2", "implementor", "sonnet", effort="high")
+        self.assertEqual(len(self.runs("t2")), 2)
+
+    def test_run_requires_a_valid_effort(self):
+        self.add("t1")
+        self.refused(2, "run", "t1", "--role", "implementor", "--model", "sonnet")
+        for bad in ("medium", "xhigh", ""):
+            self.refused(2, "run", "t1", "--role", "implementor", "--model", "sonnet",
+                         "--effort", bad)
+        self.assertEqual(self.runs("t1"), [])
+
+    def test_run_accepts_a_codex_agent_name_when_the_effort_agrees(self):
+        self.add("t1")
+        self.set_harness("t1", "codex")
+        row = self.log_run("t1", "implementor", "implementor-heavy-high", effort="high")
+        self.assertEqual((row["tier"], row["effort_requested"]), ("heavy", "high"))
+        self.refused(2, "run", "t1", "--role", "implementor", "--model",
+                     "implementor-heavy-high", "--effort", "low")
 
     def test_run_with_an_unknown_model_is_a_usage_error(self):
         self.add("t1")
@@ -212,6 +272,16 @@ class RunTests(RoutingTestCase):
                          (0, 0, 0))
         self.assertIn("test-writer", self.ok("show", "t1").stdout)
 
+    def test_runs_and_show_carry_the_effort(self):
+        self.add("t1")
+        row = self.log_run("t1", "test-writer", "sonnet", effort="high")
+        self.assertEqual((row["effort_requested"], row["effort_resolved"]), ("high", None))
+        self.assertEqual(self.show("t1")["runs"][0]["effort_requested"], "high")
+        for args in (("runs", "t1"), ("show", "t1")):
+            out = self.ok(*args).stdout
+            self.assertRegex(out, r"\bEFFORT\b", args)
+            self.assertIn("EFFORT_RESOLVED", out, args)
+
 
 class BounceTests(RoutingTestCase):
     def test_review_and_verify_fix_count_as_bounces_ci_fix_does_not(self):
@@ -225,9 +295,9 @@ class BounceTests(RoutingTestCase):
         self.ok("phase", "t3", "fix")
         self.assertEqual(self.show("t3")["bounces"], 0)
 
-    def test_fix_after_a_frontier_implementor_is_refused_with_block_advice(self):
+    def test_fix_is_refused_only_after_frontier_high_with_block_advice(self):
         self.to_review("t1")
-        self.log_run("t1", "implementor", "fable")
+        self.log_run("t1", "implementor", "fable", effort="high")
         p = self.refused(3, "phase", "t1", "fix")
         self.assertIn("block", p.stderr)
         t = self.show("t1")
@@ -236,19 +306,25 @@ class BounceTests(RoutingTestCase):
         # grow: a route while still in review is not a bounce, only the
         # no-de-escalation floor (one below frontier) applies.
         self.assertEqual(self.route("t1", "implementor")["tier"], "heavy")
+        # frontier/low still has a rung left: not refused.
+        self.to_review("t2")
+        self.log_run("t2", "implementor", "fable")
+        self.ok("phase", "t2", "fix")
+        self.assertEqual(self.show("t2")["bounces"], 1)
 
     def test_route_tier_is_accepted_by_run_where_tiers_share_a_model(self):
         # Pi: heavy and frontier print the same model, so the pipeline passes
         # route's tier to run, not its model.
         self.to_review("t1")
-        self.log_run("t1", "implementor", "opus")
+        self.log_run("t1", "implementor", "opus", effort="high")
         self.ok("phase", "t1", "fix")
         self.set_harness("t1", "pi")
         r = self.route("t1", "implementor")
-        self.assertEqual((r["tier"], r["model"]), ("frontier", PI["frontier"][0]))
-        self.refused(3, "run", "t1", "--role", "implementor", "--model", r["model"])
-        row = self.log_run("t1", "implementor", r["tier"])
-        self.assertEqual((row["tier"], row["model_requested"]), ("frontier", PI["frontier"][0]))
+        self.assertEqual((r["tier"], r["model"]), ("frontier", PI["frontier"]))
+        self.refused(3, "run", "t1", "--role", "implementor", "--model", r["model"],
+                     "--effort", r["effort"])
+        row = self.log_run("t1", "implementor", r["tier"], effort=r["effort"])
+        self.assertEqual((row["tier"], row["model_requested"]), ("frontier", PI["frontier"]))
         # Codex: a role without a per-tier agent has only the shared model.
         # No floor lifts a filer to frontier (the highest run minus one is
         # heavy), so the frontier dispatch is recorded by tier name.
@@ -267,9 +343,12 @@ class BounceTests(RoutingTestCase):
 # ---------------------------------------------------------------------------
 
 
-def assistant(model):
-    return {"type": "assistant", "isSidechain": True, "agentId": "a1", "sessionId": "x",
-            "message": {"model": model, "content": [{"type": "text", "text": "hi"}]}}
+def assistant(model, effort=None):
+    e = {"type": "assistant", "isSidechain": True, "agentId": "a1", "sessionId": "x",
+         "message": {"model": model, "content": [{"type": "text", "text": "hi"}]}}
+    if effort:
+        e["effort"] = effort
+    return e
 
 
 USER_LINE = {"type": "user", "isSidechain": True, "message": {"content": "task"}}
@@ -312,27 +391,27 @@ class SubagentStopHookTests(PlatformTestCase):
         return list_in(self.j("runs", "T-1"), "runs")
 
     def test_fills_the_run_from_the_transcript(self):
-        self.ok("run", "T-1", "--role", "implementor", "--model", "sonnet")
-        path = self.transcript([USER_LINE, assistant("claude-haiku-5-5"),
-                                assistant("claude-sonnet-5-5"), USER_LINE])
+        self.ok("run", "T-1", "--role", "implementor", "--model", "sonnet", "--effort", "low")
+        path = self.transcript([USER_LINE, assistant("claude-haiku-5-5", "high"),
+                                assistant("claude-sonnet-5-5", "low"), USER_LINE])
         self.stop("orchestration:implementor", path, agent_id="ag-7")
         r = self.runs()[0]
-        self.assertEqual((r["agent_id"], r["model_resolved"], r["match"]),
-                         ("ag-7", "claude-sonnet-5-5", 1))
+        self.assertEqual((r["agent_id"], r["model_resolved"], r["effort_resolved"],
+                          r["match"]), ("ag-7", "claude-sonnet-5-5", "low", 1))
         self.assertTrue(r["resolved_at"])
         self.assertEqual(self.show("T-1")["activity"], "working")
 
     def test_pairs_with_the_oldest_unfilled_row_of_the_role(self):
-        self.ok("run", "T-1", "--role", "reviewer", "--model", "haiku")
-        self.ok("run", "T-1", "--role", "implementor", "--model", "sonnet")
-        self.ok("run", "T-1", "--role", "implementor", "--model", "opus")
+        self.ok("run", "T-1", "--role", "reviewer", "--model", "haiku", "--effort", "low")
+        self.ok("run", "T-1", "--role", "implementor", "--model", "sonnet", "--effort", "low")
+        self.ok("run", "T-1", "--role", "implementor", "--model", "opus", "--effort", "low")
         self.stop("orchestration:implementor",
                   self.transcript([assistant("claude-sonnet-5-5")]), agent_id="ag-1")
         rows = self.runs()
         self.assertEqual([r["agent_id"] for r in rows], [None, "ag-1", None])
 
     def test_mismatch_is_recorded_and_reported(self):
-        self.ok("run", "T-1", "--role", "implementor", "--model", "sonnet")
+        self.ok("run", "T-1", "--role", "implementor", "--model", "sonnet", "--effort", "low")
         self.stop("orchestration:implementor",
                   self.transcript([assistant("claude-haiku-5-5")]))
         r = self.runs()[0]
@@ -341,6 +420,26 @@ class SubagentStopHookTests(PlatformTestCase):
         self.assertEqual(len(ev), 1)
         self.assertIn("claude-haiku-5-5", ev[0]["detail"])
         self.assertEqual(self.show("T-1")["model_mismatches"], 1)
+
+    def test_effort_mismatch_is_recorded_and_reported(self):
+        self.ok("run", "T-1", "--role", "implementor", "--model", "sonnet", "--effort", "low")
+        self.stop("orchestration:implementor",
+                  self.transcript([assistant("claude-sonnet-5-5", "high")]))
+        r = self.runs()[0]
+        self.assertEqual((r["model_resolved"], r["effort_resolved"], r["match"]),
+                         ("claude-sonnet-5-5", "high", 0))
+        ev = [e for e in self.events("T-1") if e["kind"] == "model_mismatch"]
+        self.assertEqual(len(ev), 1)
+        self.assertIn("effort requested=low resolved=high", ev[0]["detail"])
+        self.assertEqual(self.show("T-1")["model_mismatches"], 1)
+
+    def test_transcript_without_an_effort_is_not_a_mismatch(self):
+        self.ok("run", "T-1", "--role", "implementor", "--model", "sonnet", "--effort", "high")
+        self.stop("orchestration:implementor",
+                  self.transcript([assistant("claude-sonnet-5-5")]))
+        r = self.runs()[0]
+        self.assertEqual((r["effort_resolved"], r["match"]), (None, 1))
+        self.assertNotIn("model_mismatch", self.event_kinds("T-1"))
 
     def test_unrecorded_stage_dispatch_is_flagged(self):
         self.stop("orchestration:reviewer",
@@ -356,14 +455,14 @@ class SubagentStopHookTests(PlatformTestCase):
         self.assertEqual(len(self.events("T-1")), n)
 
     def test_transcript_without_an_assistant_entry_leaves_the_model_unresolved(self):
-        self.ok("run", "T-1", "--role", "implementor", "--model", "sonnet")
+        self.ok("run", "T-1", "--role", "implementor", "--model", "sonnet", "--effort", "low")
         self.stop("orchestration:implementor", self.transcript([USER_LINE]))
         self.assertIsNone(self.runs()[0]["model_resolved"])
         self.assertIn("model_unresolved", self.event_kinds("T-1"))
         self.assertEqual(self.show("T-1")["model_mismatches"], 0)
 
     def test_foreign_session_is_ignored(self):
-        self.ok("run", "T-1", "--role", "implementor", "--model", "sonnet")
+        self.ok("run", "T-1", "--role", "implementor", "--model", "sonnet", "--effort", "low")
         n = len(self.events("T-1"))
         self.stop("orchestration:implementor",
                   self.transcript([assistant("claude-haiku-5-5")]), sid="sid-intruder")
@@ -395,7 +494,7 @@ class HooksJsonSubagentStopTests(unittest.TestCase):
 # RESOLVED is None) the model the prompt asked for.
 SMOKE_SRC = r'''
 import json, os, re, sys
-PROJECTS, RESOLVED = %(projects)r, %(resolved)r
+PROJECTS, RESOLVED, EFFORT = %(projects)r, %(resolved)r, %(effort)r
 a = sys.argv[1:]
 if "--session-id" in a and os.path.realpath(os.getcwd()) == %(root)r:
     sid = a[a.index("--session-id") + 1]
@@ -403,13 +502,15 @@ if "--session-id" in a and os.path.realpath(os.getcwd()) == %(root)r:
     if RESOLVED is None:
         m = re.search(r"\b(fable|haiku|opus|sonnet)\b", text)
         RESOLVED = {"fable": "claude-fable-5-1"}.get(m.group(1), "claude-%%s-5-5" %% m.group(1))
+    if EFFORT is None:
+        EFFORT = re.search(r'effort "(\w+)"', text).group(1)
     key = re.sub(r"[^A-Za-z0-9]", "-", os.getcwd())  # as Claude Code names the project dir
     d = os.path.join(PROJECTS, key, sid, "subagents")
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "agent-x.jsonl"), "w") as f:
         f.write(json.dumps({"type": "user", "message": {"content": "go"}}) + "\n")
         f.write(json.dumps({"type": "assistant", "isSidechain": True,
-                            "message": {"model": RESOLVED}}) + "\n")
+                            "effort": EFFORT, "message": {"model": RESOLVED}}) + "\n")
     print(json.dumps({"type": "system", "session_id": sid}), flush=True)
     sys.exit(0)
 '''
@@ -422,9 +523,9 @@ class SmokeRoutingTests(AdapterTestCase):
         os.makedirs(os.path.join(self.claude_dir, "projects"))
         self.env["CLAUDE_CONFIG_DIR"] = self.claude_dir
 
-    def smoke_claude(self, resolved=None, session=False):
+    def smoke_claude(self, resolved=None, session=False, effort=None):
         src = SMOKE_SRC % {"projects": os.path.join(self.claude_dir, "projects"),
-                           "resolved": resolved, "root": os.path.realpath(self.root)}
+                           "resolved": resolved, "effort": effort, "root": os.path.realpath(self.root)}
         if session:
             src += SESSION_CLAUDE_SRC % {"record": self.record, "orch": ORCH,
                                          "report": True}
@@ -433,9 +534,30 @@ class SmokeRoutingTests(AdapterTestCase):
     def test_passes_when_the_transcript_model_matches(self):
         self.env["ORCH_CLAUDE_BIN"] = self.smoke_claude()
         p = self.ok("smoke-routing", timeout=120)
-        for word in ("haiku", "fable", "claude-haiku-5-5", "claude-fable-5-1"):
+        for word in ("haiku/high", "fable/high", "claude-haiku-5-5/high",
+                     "claude-fable-5-1/high"):
             self.assertIn(word, p.stdout)
         self.assertNotIn("fail", p.stdout.lower())
+
+    def test_the_requested_effort_is_asked_for_and_checked(self):
+        self.env["ORCH_CLAUDE_BIN"] = self.smoke_claude()
+        p = self.ok("smoke-routing", "--model", "haiku", "--effort", "low", "--json",
+                    timeout=120)
+        r = json.loads(p.stdout)["results"][0]
+        self.assertEqual((r["effort_requested"], r["effort_resolved"], r["ok"]),
+                         ("low", "low", True))
+
+    def test_fails_when_the_transcript_effort_differs(self):
+        self.env["ORCH_CLAUDE_BIN"] = self.smoke_claude(effort="low")
+        p = self.refused(3, "smoke-routing", "--model", "haiku", timeout=120)
+        self.assertIn("claude-haiku-5-5/low", p.stdout)
+        self.assertIn("fail", p.stdout.lower())
+
+    def test_an_unknown_effort_is_a_usage_error(self):
+        self.env["ORCH_CLAUDE_BIN"] = self.smoke_claude()
+        p = self.refused(2, "smoke-routing", "--effort", "medium")
+        self.assertNotIn("unrecognized arguments", p.stderr)  # the flag must exist
+        self.assertIn("medium", p.stderr)
 
     def test_fails_when_the_transcript_model_differs(self):
         self.env["ORCH_CLAUDE_BIN"] = self.smoke_claude(resolved="claude-sonnet-5-5")

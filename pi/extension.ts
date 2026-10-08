@@ -118,9 +118,8 @@ const PI_TOOLS: Record<string, string[]> = {
 	Write: ["write"],
 	Edit: ["edit"],
 };
-// The routing tiers' Pi models and thinking levels (scripts/orch PI_MODELS,
-// the same models as scripts/codex-agents). `orch route` prints them per
-// dispatch; the machine config's `pi_models` overrides the models, keyed by
+// The routing tiers' Pi models (scripts/orch PI_MODELS, the same models
+// as scripts/codex-agents). `orch route` prints them per dispatch; the machine config's `pi_models` overrides the models, keyed by
 // tier or by the old Claude names (haiku, sonnet, opus).
 export const PI_MODELS: Record<string, string> = {
 	light: "openai-codex/gpt-6-luna",
@@ -128,7 +127,8 @@ export const PI_MODELS: Record<string, string> = {
 	heavy: "openai-codex/gpt-6-astra",
 	frontier: "openai-codex/gpt-6-astra",
 };
-export const PI_THINKING: Record<string, string> = { light: "low", standard: "medium", heavy: "high", frontier: "xhigh" };
+// Thinking level per effort rung (scripts/orch PI_THINKING).
+export const PI_THINKING: Record<string, string> = { low: "low", high: "high" };
 // opus sets heavy and frontier: both run on the same model.
 const TIER_ALIASES: Record<string, string[]> = { haiku: ["light"], sonnet: ["standard"], opus: ["heavy", "frontier"] };
 
