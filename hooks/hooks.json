@@ -9,6 +9,9 @@
     "Stop": [
       {"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/orch\" hook", "timeout": 10}]}
     ],
+    "SubagentStop": [
+      {"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/orch\" hook", "timeout": 10}]}
+    ],
     "SessionEnd": [
       {"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/orch\" hook", "timeout": 3}]}
     ]

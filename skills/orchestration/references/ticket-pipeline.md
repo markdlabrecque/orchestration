@@ -12,7 +12,7 @@ You are the ticket orchestrator: the main thread for one ticket, in a worktree t
 
 Record each phase **when you enter it**: `orch phase <ticket> <phase>`. A refusal (exit 3) means the move is not allowed. Read the message and do what it says; never work around it.
 
-Stage agents are named as in Claude Code and Pi. On Codex, drop the `orchestration:` prefix and use the name as the `spawn_agent` agent type (`test-writer`, `implementor`, ...).
+Stage agents are named as in Claude Code and Pi. On Codex, spawn the per-tier agent `orch route` prints (`agent: implementor-standard`) as the `spawn_agent` agent type. Every dispatch goes through "Model routing" below.
 
 | Phase | Who does the work | Done when |
 |---|---|---|
@@ -45,6 +45,26 @@ Your brief names it; `orch preflight` decided it.
 Your brief also says whether accessibility tests are `on` or `off`. Pass that to the verifier as is. Don't look in `.orch` or the worktree to decide it: the brief is the answer.
 
 Verifier findings go through the same fix-now / follow-up triage as review findings, and they count against the same round cap. So do the errors the verifier reports (console, network, page, server log). Every error, whether this ticket caused it or not, is also flagged to the user: in the MR description and the final message. A pre-existing error gets a follow-up ticket.
+
+## Model routing
+
+Every stage dispatch (and any investigation or filing subagent) runs on the model `orch` picks. Never choose one yourself, and never dispatch without a recorded run.
+
+1. `orch route <ticket> --role <role> [--files N] [--lines N] [--ambiguous]`. Roles: `test-writer`, `implementor`, `reviewer`, `verifier`, `reporter`, `investigation`, `filer`.
+2. `orch run <ticket> --role <role> --model <tier>` with the `tier` `route` printed and the same flags. Pass the tier, not the model: on Pi and Codex two tiers can share a model, and the bare model reads as the lower one. A refusal (exit 3) means the value is below the floor: use what `route` printed.
+3. Dispatch with that value. Claude: the Agent tool's `model`. Pi: `model` and `thinking` on the `subagent` call. Codex: spawn the printed `agent` type (its file carries the model and effort).
+
+Flags:
+
+- **Reviewer**: `--files`/`--lines` from the diff's numstat against `BASE_BRANCH` (`git diff --numstat <base>...HEAD`: the file count and the sum of added and removed lines).
+- **Investigation**: `--files` with the number of touch points the question spans.
+- **`--ambiguous`**: the task's envelope is unclear (what to build, or where, is not settled by the spec and the code).
+
+A bounce is `orch phase <ticket> fix` from `review` or `verify`: run it before `route`/`run` for the fix implementor, since `orch` escalates on the bounce it records. `orch` escalates by itself: an implementor after a bounce runs a tier above the last one, the reviewer runs at most one tier below the implementor, and no stage drops more than one tier below the highest run on the ticket.
+
+After each stage, `orch show <ticket>`. `model_mismatches` > 0 (a subagent ran on another model than requested) or `unrecorded_dispatches` > 0 (a stage agent ran without `orch run`) is a permitted stop: `orch block <ticket> --reason "model routing failed: <which run, requested vs resolved>"`.
+
+When `orch phase <ticket> fix` (or `orch route` for the implementor) is refused because the last implementor already ran at `frontier`, there is nothing higher: `orch block <ticket>` for a human with the findings as the reason.
 
 ## Review rounds: cap of 2, then finish
 

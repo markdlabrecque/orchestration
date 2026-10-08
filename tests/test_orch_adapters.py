@@ -851,7 +851,7 @@ class SelftestTests(AdapterTestCase):
         self.env["ORCH_CLAUDE_BIN"] = self.session_claude()
 
     def selftest(self, *extra, timeout=150):
-        p = self.orch("selftest", "--json", *extra, timeout=timeout)
+        p = self.orch("selftest", "--json", "--skip-routing", *extra, timeout=timeout)
         try:
             out = json.loads(p.stdout)
         except ValueError:
@@ -960,7 +960,7 @@ class DesktopSelftestTests(AdapterTestCase):
         return title[1:] if title.startswith("t") else None
 
     def test_turn_based_selftest(self):
-        p = self.ok("selftest", "--json", "--timeout", "30")
+        p = self.ok("selftest", "--json", "--skip-routing", "--timeout", "30")
         out = json.loads(p.stdout)
         self.assertEqual(out["action"], "desktop_start")
         run = out["run"]
@@ -1242,7 +1242,7 @@ class FolderTrustTests(AdapterTestCase):
 
     def selftest_blocked(self, platform):
         self.env["ORCH_PLATFORM"] = platform
-        p = self.orch("selftest", "--json", "--timeout", "30", timeout=120)
+        p = self.orch("selftest", "--json", "--skip-routing", "--timeout", "30", timeout=120)
         out = json.loads(p.stdout)
         self.assertNotEqual(p.returncode, 0)
         self.assertIs(out["ok"], False)
@@ -1428,7 +1428,7 @@ class SelftestTeardownTests(AdapterTestCase):
     always reported."""
 
     def selftest(self, timeout="3"):
-        p = self.orch("selftest", "--json", "--timeout", timeout, timeout=150)
+        p = self.orch("selftest", "--json", "--skip-routing", "--timeout", timeout, timeout=150)
         try:
             out = json.loads(p.stdout)
         except ValueError:
@@ -1489,7 +1489,7 @@ class SelftestCleanTests(AdapterTestCase):
     """clean fails when it cannot tell whether something is left."""
 
     def selftest(self, timeout="3"):
-        p = self.orch("selftest", "--json", "--timeout", timeout, timeout=150)
+        p = self.orch("selftest", "--json", "--skip-routing", "--timeout", timeout, timeout=150)
         out = json.loads(p.stdout)
         return p, {s["name"]: s for s in out["steps"]}
 
@@ -1802,7 +1802,7 @@ class TrustWriteTests(AdapterTestCase):
 
 class TrustSelftestTests(AdapterTestCase):
     def selftest(self):
-        p = self.orch("selftest", "--json", "--timeout", "3", timeout=150)
+        p = self.orch("selftest", "--json", "--skip-routing", "--timeout", "3", timeout=150)
         out = json.loads(p.stdout)
         return p, {s["name"]: s for s in out["steps"]}
 
@@ -1833,7 +1833,7 @@ class HerdrMainWorkspaceTests(AdapterTestCase):
         self.env["ORCH_PLATFORM"] = "herdr"
 
     def selftest(self):
-        p = self.orch("selftest", "--json", "--timeout", "3", timeout=150)
+        p = self.orch("selftest", "--json", "--skip-routing", "--timeout", "3", timeout=150)
         try:
             out = json.loads(p.stdout)
         except ValueError:

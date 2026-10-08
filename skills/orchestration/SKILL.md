@@ -25,7 +25,7 @@ Two kinds of orchestrator and a set of stage agents:
 
 `orch` is `scripts/orch` in the plugin: `${CLAUDE_PLUGIN_ROOT}/scripts/orch` in Claude Code; in Pi and Codex, `../../scripts/orch` from the directory holding this file. Below it is written as `orch`.
 
-Stage agents are named per harness: `orchestration:<name>` in Claude Code (the Agent tool) and Pi (the `subagent` tool); `<name>` as the `spawn_agent` agent type in Codex, from `~/.codex/agents` (`scripts/codex-agents` writes them). [references/ticket-pipeline.md](references/ticket-pipeline.md) uses the Claude names.
+Stage agents are named per harness: `orchestration:<name>` in Claude Code (the Agent tool) and Pi (the `subagent` tool); `<name>-<tier>` as the `spawn_agent` agent type in Codex (the `agent` `orch route` prints), from `~/.codex/agents` (`scripts/codex-agents` writes them). [references/ticket-pipeline.md](references/ticket-pipeline.md) uses the Claude names.
 
 ## Which role am I?
 
