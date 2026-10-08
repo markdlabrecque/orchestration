@@ -33,16 +33,17 @@ function recorder(reply = "") {
 
 const ctx = (cwd, sid) => ({ cwd, sessionManager: { getSessionId: () => sid } });
 
-test("stage agents become orchestration:<name> profiles with Pi tools and thinking", () => {
+test("stage agents become orchestration:<name> profiles with Pi tools, no model and no thinking", () => {
   const agents = ext.loadStageAgents();
   assert.deepEqual(agents.map((a) => a.name), ["orchestration:implementor", "orchestration:reporter",
     "orchestration:reviewer", "orchestration:test-writer", "orchestration:verifier"]);
   const by = Object.fromEntries(agents.map((a) => [a.name, a]));
   assert.deepEqual(by["orchestration:implementor"].tools, ["read", "grep", "find", "ls", "bash", "write", "edit"]);
   assert.deepEqual(by["orchestration:reviewer"].tools, ["read", "grep", "find", "ls", "bash"]);
-  assert.equal(by["orchestration:implementor"].thinking, "medium");
-  assert.equal(by["orchestration:reviewer"].thinking, "high");
   for (const a of agents) {
+    // The dispatcher passes model and thinking per call, from `orch route`.
+    assert.equal(a.model, undefined, a.name);
+    assert.equal(a.thinking, undefined, a.name);
     assert.ok(a.systemPrompt.length > 100, a.name);
     assert.ok(!a.systemPrompt.startsWith("---"), a.name);
   }
@@ -67,59 +68,33 @@ function withXdg(config, fn) {
 
 const byName = (agents) => Object.fromEntries(agents.map((a) => [a.name.replace("orchestration:", ""), a]));
 
-test("each agent's model tier picks a Pi model; the implementor's dispatcher picks its own", () => {
+test("piModels maps the routing tiers, with the old Claude names as aliases", () => {
   withXdg(null, () => {
-    const a = byName(ext.loadStageAgents());
-    // Reviewer and verifier take the sonnet tier's model, with opus's thinking.
-    assert.equal(a.reviewer.model, "openai-codex/gpt-6.1-sol");
-    assert.equal(a.reviewer.thinking, "high");
-    assert.equal(a.verifier.model, "openai-codex/gpt-6.1-sol");
-    assert.equal(a.verifier.thinking, "high");
-    // The reporter runs on the haiku tier: luna, low thinking.
-    assert.equal(a.reporter.model, "openai-codex/gpt-6-luna");
-    assert.equal(a.reporter.thinking, "low");
-    assert.equal(a["test-writer"].model, "openai-codex/gpt-6.1-sol");
-    assert.equal(a.implementor.model, undefined);
-    assert.equal(a.implementor.thinking, "medium");
+    const m = ext.piModels();
+    assert.equal(m.light, "openai-codex/gpt-6-luna");
+    assert.equal(m.standard, "openai-codex/gpt-6.1-sol");
+    assert.equal(m.heavy, "openai-codex/gpt-6-astra");
+    assert.equal(m.frontier, "openai-codex/gpt-6-astra");
+    assert.equal(m.haiku, m.light);
+    assert.equal(m.sonnet, m.standard);
+    assert.equal(m.opus, m.heavy);
   });
 });
 
-test("the machine config's pi_models overrides the tier mapping", () => {
-  withXdg({ platform: "headless", pi_models: { haiku: "venice/small", sonnet: "venice/mid" } }, () => {
-    const a = byName(ext.loadStageAgents());
-    assert.equal(a.reporter.model, "venice/small");
-    assert.equal(a.reviewer.model, "venice/mid");
-    assert.equal(a["test-writer"].model, "venice/mid");
+test("the machine config's pi_models overrides the tier map, by tier or by old name", () => {
+  withXdg({ platform: "headless", pi_models: { light: "venice/small", sonnet: "venice/mid" } }, () => {
+    const m = ext.piModels();
+    assert.equal(m.light, "venice/small");
+    assert.equal(m.standard, "venice/mid");
+    assert.equal(m.heavy, "openai-codex/gpt-6-astra");
   });
-});
-
-test("a model Pi does not know is left out, so the agent runs on the session's model", () => {
-  withXdg(null, () => {
-    const a = byName(ext.loadStageAgents(undefined, (m) => m !== "openai-codex/gpt-6-luna"));
-    assert.equal(a.reporter.model, undefined);
-    assert.equal(a.reporter.thinking, "low");
-    assert.equal(a["test-writer"].model, "openai-codex/gpt-6.1-sol");
+  // opus sets heavy and frontier (both run on one model); a tier key wins.
+  withXdg({ platform: "headless", pi_models: { opus: "venice/big", frontier: "venice/top" } }, () => {
+    const m = ext.piModels();
+    assert.equal(m.heavy, "venice/big");
+    assert.equal(m.frontier, "venice/top");
+    assert.equal(m.opus, "venice/big");
   });
-});
-
-test("the provider checks models against the session's model registry", async () => {
-  const saved = { ...process.env };
-  process.env.ORCH_HOME = "/nonexistent-orch-home";
-  delete process.env.PI_SUBAGENT_CHILD;
-  try {
-    await withXdg(null, async () => {
-      delete globalThis[ext.AGENT_PROVIDERS];
-      const pi = fakePi();
-      ext.default(pi, recorder().hook);
-      const registry = { find: (provider, id) => (provider === "openai-codex" && id === "gpt-6.1-sol" ? { id } : undefined) };
-      await pi.emit("session_start", { reason: "startup" }, { ...ctx("/wt", "s1"), modelRegistry: registry });
-      const a = byName(globalThis[ext.AGENT_PROVIDERS].get("orchestration")());
-      assert.equal(a["test-writer"].model, "openai-codex/gpt-6.1-sol");
-      assert.equal(a.reporter.model, undefined);
-    });
-  } finally {
-    process.env = saved;
-  }
 });
 
 test("the factory registers the agent provider for the subagents extension", () => {
@@ -127,7 +102,9 @@ test("the factory registers the agent provider for the subagents extension", () 
   ext.default(fakePi(), recorder().hook);
   const providers = globalThis[ext.AGENT_PROVIDERS];
   assert.ok(providers instanceof Map);
-  assert.equal(providers.get("orchestration")().length, 5);
+  const agents = providers.get("orchestration")();
+  assert.equal(agents.length, 5);
+  for (const a of agents) assert.equal(a.model, undefined, a.name);
 });
 
 test("a ticket session reports start, tool use, stop and end to orch", async () => {

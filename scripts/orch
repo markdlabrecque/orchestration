@@ -75,7 +75,7 @@ HARNESS_MARKERS = (("pi", "PI_CODING_AGENT", "true"), ("codex", "CODEX_THREAD_ID
 # orch starts is neither.
 LAUNCH_ENV_DROP = ("PI_SUBAGENT_CHILD", "PI_SUBAGENT_ID", "PI_SUBAGENT_COORD_DIR",
                    "PI_SUBAGENT_MAX_TOKENS", "ORCH_PI_PARENT_SESSION")
-HOOK_EVENTS = ("SessionStart", "PostToolUse", "Stop", "SessionEnd")
+HOOK_EVENTS = ("SessionStart", "PostToolUse", "Stop", "SessionEnd", "SubagentStop")
 POST_TOOL_THROTTLE_S = 15
 # orca/herdr pass the prompt as one command-line argument; Linux caps a single
 # argument at 128 KB (MAX_ARG_STRLEN).
@@ -99,7 +99,32 @@ NEW_COLUMNS = (
     ("harness", "TEXT"),
     # 1 when orch added the worktree's trust table to Codex's config.toml.
     ("trust_codex", "INTEGER NOT NULL DEFAULT 0"),
+    # review -> fix and verify -> fix transitions (ci -> fix is not a bounce).
+    ("bounces", "INTEGER NOT NULL DEFAULT 0"),
 )
+# Model routing (orch-cli.md "Model routing"). Tiers in order; each role's
+# default tier; per-harness dispatch values. Codex: (model, reasoning effort),
+# Pi: (model, thinking); heavy and frontier share a model there.
+TIERS = ("light", "standard", "heavy", "frontier")
+ROLE_TIERS = {"filer": "light", "investigation": "light", "test-writer": "standard",
+              "implementor": "standard", "reviewer": "light", "verifier": "light",
+              "reporter": "light"}
+# Roles with a stage agent (agents/*.md; per-tier Codex agent files).
+AGENT_ROLES = ("test-writer", "implementor", "reviewer", "verifier", "reporter")
+CLAUDE_MODELS = {"light": "haiku", "standard": "sonnet", "heavy": "opus",
+                 "frontier": "fable"}
+CODEX_MODELS = {"light": ("gpt-6-luna", "low"), "standard": ("gpt-6.1-sol", "medium"),
+                "heavy": ("gpt-6-astra", "high"), "frontier": ("gpt-6-astra", "xhigh")}
+PI_MODELS = {"light": ("openai-codex/gpt-6-luna", "low"),
+             "standard": ("openai-codex/gpt-6.1-sol", "medium"),
+             "heavy": ("openai-codex/gpt-6-astra", "high"),
+             "frontier": ("openai-codex/gpt-6-astra", "xhigh")}
+# Old `pi_models` keys (Claude model names), read as the tiers they named.
+PI_MODEL_ALIASES = {"haiku": ("light",), "sonnet": ("standard",),
+                    "opus": ("heavy", "frontier")}  # opus: both run on one model
+# A change larger than this bumps the roles that read all of it.
+BIG_FILES, BIG_LINES = 5, 300
+SIZE_ROLES = ("investigation", "reviewer")
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 BUNDLED_ENGINES = {
     "create": os.path.join(PLUGIN_ROOT, "skills", "create-worktree", "scripts",
@@ -153,6 +178,19 @@ CREATE TABLE IF NOT EXISTS selftest_runs (
     run TEXT PRIMARY KEY,
     state TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runs (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket TEXT NOT NULL,
+    role TEXT NOT NULL,
+    model_requested TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    bounce_count INTEGER NOT NULL DEFAULT 0,
+    requested_at TEXT NOT NULL,
+    model_resolved TEXT,
+    agent_id TEXT,
+    resolved_at TEXT,
+    match INTEGER
 );
 """
 
@@ -392,7 +430,7 @@ def connect(sdir, timeout=30):
         db.execute("PRAGMA journal_mode=WAL")
     have = {r[0] for r in db.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
-    if not {"tickets", "events", "ci_results", "selftest_runs"} <= have:
+    if not {"tickets", "events", "ci_results", "selftest_runs", "runs"} <= have:
         db.executescript(SCHEMA)
     cols = {r[1] for r in db.execute("PRAGMA table_info(tickets)")}
     for name, decl in NEW_COLUMNS:
@@ -1795,8 +1833,21 @@ def cmd_list(args, db, sdir):
 
 
 def cmd_show(args, db, sdir):
-    t = ticket_dict(get_ticket(db, args.ticket), load_config(sdir))
-    emit(args, t, "\n".join("%s: %s" % (k, v) for k, v in t.items()))
+    row = get_ticket(db, args.ticket)
+    t = ticket_dict(row, load_config(sdir))
+    runs = ticket_runs(db, args.ticket)
+    t.update({
+        "bounces": row["bounces"],
+        "model_mismatches": sum(1 for r in runs if r["match"] == 0),
+        "unrecorded_dispatches": db.execute(
+            "SELECT COUNT(*) FROM events WHERE ticket=? AND kind='dispatch_unrecorded'",
+            (args.ticket,)).fetchone()[0],
+    })
+    text = "\n".join("%s: %s" % (k, v) for k, v in t.items())
+    if runs:
+        text += "\nruns:\n" + fmt_runs(runs)
+    t["runs"] = runs
+    emit(args, t, text)
 
 
 def cmd_next(args, db, sdir):
@@ -2138,9 +2189,14 @@ def cmd_phase(args, db, sdir):
         raise Refusal(EXIT_GATE,
                       "review cap reached (%d rounds): file the remaining findings as"
                       " follow-up tickets and move on to verify" % row["review_rounds"])
+    bounce = new == "fix" and cur in ("review", "verify")
+    if bounce:
+        last = last_run(db, args.ticket, "implementor")
+        if last and last["tier"] == TIERS[-1]:
+            raise Refusal(EXIT_GATE, frontier_bounce_msg(args.ticket))
     rounds = row["review_rounds"] + (1 if new == "review" else 0)
-    db.execute("UPDATE tickets SET phase=?, review_rounds=? WHERE id=?",
-               (new, rounds, args.ticket))
+    db.execute("UPDATE tickets SET phase=?, review_rounds=?, bounces=bounces+? WHERE id=?",
+               (new, rounds, 1 if bounce else 0, args.ticket))
     log_event(db, args.ticket, "phase", cur, new, args.note)
     emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
          "%s: %s -> %s" % (args.ticket, cur, new))
@@ -2316,6 +2372,184 @@ def cmd_events(args, db, sdir):
 
 
 
+# ---- model routing ---------------------------------------------------------
+
+def ticket_runs(db, tid):
+    return [dict(r) for r in db.execute("SELECT * FROM runs WHERE ticket=? ORDER BY seq",
+                                        (tid,))]
+
+
+def last_run(db, tid, role):
+    return db.execute("SELECT * FROM runs WHERE ticket=? AND role=? ORDER BY seq DESC"
+                      " LIMIT 1", (tid, role)).fetchone()
+
+
+def fmt_runs(runs):
+    lines = ["SEQ\tROLE\tTIER\tREQUESTED\tRESOLVED\tMATCH\tBOUNCES\tAGENT\tREQUESTED_AT"]
+    for r in runs:
+        lines.append("\t".join(str("-" if v is None else v) for v in (
+            r["seq"], r["role"], r["tier"], r["model_requested"], r["model_resolved"],
+            r["match"], r["bounce_count"], r["agent_id"], r["requested_at"])))
+    return "\n".join(lines)
+
+
+def frontier_bounce_msg(tid):
+    return ("the implementor of %s already ran at frontier; there is no higher tier to"
+            " escalate to: block the ticket for a human (`orch block %s --reason"
+            " \"bounced after a frontier implementor\"`)" % (tid, tid))
+
+
+def machine_config():
+    """The machine config (platforms.md "Machine config"), or {}."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    try:
+        with open(os.path.join(base, "orchestration", "config.json")) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def pi_models():
+    """tier -> (model, thinking): PI_MODELS with the machine config's
+    `pi_models` override, keyed by tier or by an old alias (a tier key wins;
+    `opus` sets heavy and frontier, which share a model).
+    The same map as pi/extension.ts piModels()."""
+    out = dict(PI_MODELS)
+    own = machine_config().get("pi_models")
+    if isinstance(own, dict):
+        keyed = [(t, v) for k, v in own.items() if k in PI_MODEL_ALIASES
+                 for t in PI_MODEL_ALIASES[k]]
+        keyed += [(k, v) for k, v in own.items() if k in TIERS]
+        for tier, model in keyed:
+            if isinstance(model, str) and model:
+                out[tier] = (model, PI_MODELS[tier][1])
+    return out
+
+
+def dispatch(harness, role, tier):
+    """The dispatch value of `tier` on `harness` as a dict (route's JSON minus
+    floors)."""
+    if harness == "codex":
+        model, effort = CODEX_MODELS[tier]
+        d = {"tier": tier, "model": model, "effort": effort}
+        if role in AGENT_ROLES:
+            d["agent"] = "%s-%s" % (role, tier)
+        return d
+    if harness == "pi":
+        model, thinking = pi_models()[tier]
+        return {"tier": tier, "model": model, "thinking": thinking}
+    return {"tier": tier, "model": CLAUDE_MODELS[tier]}
+
+
+def tier_of(harness, role, value):
+    """(tier, the value to record) for a --model value: a tier name, the
+    harness's dispatch value, or on Codex a per-tier agent name. A model two
+    tiers share (Codex/Pi heavy and frontier) is the lower tier. None when
+    unknown."""
+    if value in TIERS:
+        return value, dispatch(harness, role, value)["model"]
+    if harness == "codex":
+        for tier in TIERS:
+            if value in (CODEX_MODELS[tier][0], "%s-%s" % (role, tier)):
+                return tier, value
+    elif harness == "pi":
+        models = pi_models()
+        for tier in TIERS:
+            if value == models[tier][0]:
+                return tier, value
+    else:
+        for tier in TIERS:
+            if value == CLAUDE_MODELS[tier]:
+                return tier, value
+    return None, value
+
+
+def route_tier(db, row, role, files=None, lines=None, ambiguous=False):
+    """(tier, reasons): the role's default tier, bumped by --ambiguous and a
+    large change, then raised to the floors the ticket's runs set. Refuses
+    an implementor that would need a tier above frontier."""
+    if role not in ROLE_TIERS:
+        raise Refusal(EXIT_USAGE, "unknown role %r: one of %s"
+                      % (role, ", ".join(sorted(ROLE_TIERS))))
+    tid, top = row["id"], len(TIERS) - 1
+    level, reasons = TIERS.index(ROLE_TIERS[role]), []
+    if ambiguous:
+        level += 1
+        reasons.append("ambiguous: one tier up")
+    if role in SIZE_ROLES and ((files or 0) > BIG_FILES or (lines or 0) > BIG_LINES):
+        level += 1
+        reasons.append("large change (> %d files or > %d lines): one tier up"
+                       % (BIG_FILES, BIG_LINES))
+    level = min(level, top)
+    floors = []
+    impl = last_run(db, tid, "implementor")
+    if role == "implementor" and impl is not None and row["bounces"] > impl["bounce_count"]:
+        prev = TIERS.index(impl["tier"])
+        if prev >= top:
+            raise Refusal(EXIT_GATE, frontier_bounce_msg(tid))
+        floors.append((prev + 1, "after a bounce: one tier above the last implementor"
+                       " (%s)" % impl["tier"]))
+    if role == "reviewer" and impl is not None:
+        floors.append((TIERS.index(impl["tier"]) - 1, "reviewer: at most one tier below"
+                       " the last implementor (%s)" % impl["tier"]))
+    tiers = [TIERS.index(r["tier"]) for r in db.execute(
+        "SELECT tier FROM runs WHERE ticket=?", (tid,)) if r["tier"] in TIERS]
+    if tiers:
+        floors.append((max(tiers) - 1, "no de-escalation: at most one tier below the"
+                       " highest on the ticket (%s)" % TIERS[max(tiers)]))
+    for floor, why in floors:
+        if min(floor, top) > level:
+            reasons.append(why)
+    level = min(max([level] + [f for f, _ in floors]), top)
+    return TIERS[level], reasons
+
+
+def size_args(args):
+    return {"files": args.files, "lines": args.lines, "ambiguous": args.ambiguous}
+
+
+def cmd_route(args, db, sdir):
+    row = get_ticket(db, args.ticket)
+    tier, reasons = route_tier(db, row, args.role, **size_args(args))
+    d = dispatch(row_harness(row), args.role, tier)
+    d["floors"] = reasons
+    text = [d["model"], "tier: %s" % tier]
+    text += ["%s: %s" % (k, d[k]) for k in ("effort", "thinking", "agent") if k in d]
+    text += ["why: %s" % r for r in reasons]
+    emit(args, d, "\n".join(text))
+
+
+def cmd_run(args, db, sdir):
+    row = get_ticket(db, args.ticket)
+    harness = row_harness(row)
+    if args.role not in ROLE_TIERS:
+        route_tier(db, row, args.role)  # raises the usage error
+    tier, value = tier_of(harness, args.role, args.model)
+    if tier is None:
+        raise Refusal(EXIT_USAGE, "unknown model %r for harness %s: use a tier (%s) or"
+                      " the value `orch route` prints" % (args.model, harness,
+                                                          ", ".join(TIERS)))
+    need, reasons = route_tier(db, row, args.role, **size_args(args))
+    if TIERS.index(tier) < TIERS.index(need):
+        raise Refusal(EXIT_GATE, "%s is %s, below the %s floor for %s on %s%s" % (
+            args.model, tier, need, args.role, args.ticket,
+            (": " + "; ".join(reasons)) if reasons else " (the role's default)"))
+    seq = db.execute(
+        "INSERT INTO runs (ticket, role, model_requested, tier, bounce_count,"
+        " requested_at) VALUES (?,?,?,?,?,?)",
+        (args.ticket, args.role, value, tier, row["bounces"], now())).lastrowid
+    log_event(db, args.ticket, "run", row["phase"], row["phase"],
+              "role=%s model=%s tier=%s" % (args.role, value, tier))
+    r = dict(db.execute("SELECT * FROM runs WHERE seq=?", (seq,)).fetchone())
+    emit(args, r, str(seq))
+
+
+def cmd_runs(args, db, sdir):
+    get_ticket(db, args.ticket)
+    runs = ticket_runs(db, args.ticket)
+    emit(args, {"runs": runs}, fmt_runs(runs))
+
 
 # ---- watch -------------------------------------------------------------------
 
@@ -2355,6 +2589,91 @@ def cmd_watch(args):
             time.sleep(max(0.2, args.interval))
         except KeyboardInterrupt:
             return
+
+
+# ---- routing smoke test ----------------------------------------------------------
+
+SMOKE_MODELS = ("haiku", "fable")
+SMOKE_TIMEOUT_S = 180
+SMOKE_PROMPT = ('Use the Agent tool once, with subagent_type "general-purpose" and'
+                ' model "%s", on this task: "Reply with one line naming your model;'
+                ' use no tools." Then stop. Do nothing else.')
+
+
+def claude_projects_dir():
+    return os.path.join(os.environ.get("CLAUDE_CONFIG_DIR")
+                        or os.path.expanduser("~/.claude"), "projects")
+
+
+def smoke_routing(models, cfg):
+    """For each Claude model alias, a headless session dispatches a subagent
+    with it; the subagent's transcript (not its self-report) gives the model
+    it ran on. Returns [{"requested", "resolved", "ok", "note"}]."""
+    root = project_root()
+    key = re.sub(r"[^A-Za-z0-9]", "-", root)
+    env = {k: v for k, v in os.environ.items() if k not in LAUNCH_ENV_DROP}
+    results = []
+    for value in models:
+        sid = str(uuid.uuid4())
+        argv = [harness_bin("claude")] + headless_argv(
+            "claude", {"mode": "start", "sid": sid}, harness_args("claude", cfg))
+        note = ""
+        try:
+            proc = subprocess.Popen(argv, cwd=root, env=env, stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    text=True, start_new_session=True)
+            try:
+                proc.communicate(SMOKE_PROMPT % value, timeout=SMOKE_TIMEOUT_S)
+                if proc.returncode:
+                    note = "claude exited %d" % proc.returncode
+            except subprocess.TimeoutExpired:
+                note = "timed out after %ds" % SMOKE_TIMEOUT_S
+                with contextlib.suppress(OSError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+        except OSError as e:
+            note = "cannot start %s: %s" % (argv[0], e)
+        resolved = None
+        paths = glob.glob(os.path.join(claude_projects_dir(), key, sid, "subagents",
+                                       "agent-*.jsonl"))
+        for path in sorted(paths, key=os.path.getmtime):
+            resolved = transcript_model(path) or resolved
+        if not resolved and not note:
+            note = "no subagent transcript with a model"
+        results.append({"requested": value, "resolved": resolved,
+                        "ok": bool(resolved) and resolved.startswith("claude-%s-" % value),
+                        "note": note})
+    return results
+
+
+def fmt_smoke(results):
+    lines = ["%-10s %-24s %s" % ("REQUESTED", "RESOLVED", "RESULT")]
+    for r in results:
+        lines.append("%-10s %-24s %s" % (r["requested"], r["resolved"] or "-",
+                                         ("pass" if r["ok"] else "FAIL")
+                                         + ((" (%s)" % r["note"]) if r["note"] else "")))
+    return lines
+
+
+def cmd_smoke_routing(args):
+    harness = resolve_harness()[0]
+    if harness != "claude":
+        raise Refusal(EXIT_GATE, "smoke-routing is not supported on %s: it checks"
+                      " Claude Code's Agent tool model routing" % harness)
+    models = []
+    for value in args.models or SMOKE_MODELS:
+        alias = CLAUDE_MODELS.get(value, value)
+        if alias not in CLAUDE_MODELS.values():
+            raise Refusal(EXIT_USAGE, "unknown model %r: one of %s or a tier" % (
+                value, ", ".join(CLAUDE_MODELS.values())))
+        models.append(alias)
+    results = smoke_routing(models, load_config(state_dir()))
+    emit(args, {"results": results, "ok": all(r["ok"] for r in results)},
+         "\n".join(fmt_smoke(results)))
+    failed = [r["requested"] for r in results if not r["ok"]]
+    if failed:
+        raise Refusal(EXIT_GATE, "model routing smoke test failed for %s"
+                      % ", ".join(failed))
 
 
 # ---- selftest ------------------------------------------------------------------
@@ -2422,8 +2741,14 @@ class Selftest:
     def desktop(self):
         return self.st["platform"] == "desktop"
 
+    def steps(self):
+        """SELFTEST_STEPS, then the routing smoke test on Claude unless skipped."""
+        extra = ("routing",) if self.st.get("routing") \
+            and self.st.get("harness") == "claude" else ()
+        return SELFTEST_STEPS + extra
+
     def current(self):
-        return next((n for n in SELFTEST_STEPS if n not in self.recorded()), None)
+        return next((n for n in self.steps() if n not in self.recorded()), None)
 
     def step(self, name):
         return getattr(self, "step_" + name.replace("-", "_"))()
@@ -2431,8 +2756,9 @@ class Selftest:
     # -- driver --
     def run(self):
         """Advance as far as possible. Returns an action dict, or None when done."""
-        for name in SELFTEST_STEPS:
-            if name in self.recorded():
+        for name in SELFTEST_STEPS + ("routing",):
+            # steps() knows the harness only once preflight has run.
+            if name in self.recorded() or name not in self.steps():
                 continue
             if self.st.get("failed") and name not in ("teardown", "clean"):
                 self.record(name, "skip", "an earlier step failed")
@@ -2467,7 +2793,7 @@ class Selftest:
         name = self.current()
         if name:
             self.record(name, "fail", why)
-        for name in SELFTEST_STEPS:
+        for name in self.steps():
             if name in self.recorded():
                 continue
             if name not in ("teardown", "clean"):
@@ -2861,6 +3187,11 @@ class Selftest:
             return self.record("clean", "fail", "; ".join(problems))
         self.record("clean", "pass", "; ".join(["nothing left"] + notes))
 
+    def step_routing(self):
+        results = smoke_routing(SMOKE_MODELS, self.cfg)
+        self.record("routing", "pass" if all(r["ok"] for r in results) else "fail",
+                    "; ".join(fmt_smoke(results)[1:]))
+
     def safe_purge(self):
         try:
             self.purge()
@@ -2872,7 +3203,7 @@ class Selftest:
         tid = self.st["ticket"]
         with transaction(self.db):
             for table, col in (("tickets", "id"), ("events", "ticket"),
-                               ("ci_results", "ticket")):
+                               ("ci_results", "ticket"), ("runs", "ticket")):
                 self.db.execute("DELETE FROM %s WHERE %s=?" % (table, col), (tid,))
         for path in (os.path.join(self.sdir, "briefs", tid + ".md"),
                      os.path.join(self.sdir, "briefs", tid + ".resume.md"),
@@ -2946,7 +3277,8 @@ def cmd_selftest(args):
             run = uuid.uuid4().hex[:8]
             st = {"run": run, "ticket": "selftest-" + uuid.uuid4().hex[:8],
                   "platform": None, "timeout": args.timeout, "keep": args.keep,
-                  "steps": [], "failed": False, "harness_flag": args.harness}
+                  "steps": [], "failed": False, "harness_flag": args.harness,
+                  "routing": not args.skip_routing}
         test = Selftest(db, sdir, st)
         stop = None
         try:
@@ -3118,6 +3450,81 @@ def hook_skip(event, sid, row, pid):
     return False
 
 
+TRANSCRIPT_WAIT_S = 2.0
+
+
+def transcript_model(path):
+    """message.model of the last assistant entry in a subagent transcript, or
+    None. Synthetic entries (`<synthetic>`) name no model."""
+    model = None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                m = dig(obj, "message", "model") if isinstance(obj, dict) \
+                    and obj.get("type") == "assistant" else None
+                if isinstance(m, str) and m and not m.startswith("<"):
+                    model = m
+    except OSError:
+        return None
+    return model
+
+
+def subagent_report(payload):
+    """(role, agent_id, resolved model, the call's model from meta.json) for a
+    SubagentStop of a stage agent (`orchestration:<role>`), else None. The
+    transcript is written asynchronously: wait up to TRANSCRIPT_WAIT_S."""
+    kind = payload.get("agent_type")
+    if not isinstance(kind, str) or not kind.startswith("orchestration:"):
+        return None
+    role = kind[len("orchestration:"):]
+    agent_id = payload.get("agent_id")
+    agent_id = str(agent_id) if agent_id else "unknown"
+    path = payload.get("agent_transcript_path")
+    resolved = meta_model = None
+    if isinstance(path, str) and path:
+        deadline = time.time() + TRANSCRIPT_WAIT_S
+        while True:
+            resolved = transcript_model(path)
+            if resolved or time.time() >= deadline:
+                break
+            time.sleep(0.2)
+        try:
+            with open(re.sub(r"\.jsonl\Z", "", path) + ".meta.json") as f:
+                meta = json.load(f)
+            if isinstance(meta, dict) and isinstance(meta.get("model"), str):
+                meta_model = meta["model"]
+        except (OSError, ValueError):
+            pass
+    return role, agent_id, resolved, meta_model
+
+
+def record_subagent(db, tid, phase, ts, role, agent_id, resolved, meta_model):
+    """Pair a finished stage agent with the oldest unfilled run of its role."""
+    run = db.execute("SELECT * FROM runs WHERE ticket=? AND role=? AND agent_id IS NULL"
+                     " ORDER BY seq LIMIT 1", (tid, role)).fetchone()
+    if run is None:
+        log_event(db, tid, "dispatch_unrecorded", phase, phase,
+                  "role=%s resolved=%s requested=%s" % (role, resolved or "-",
+                                                        meta_model or "-"))
+        return
+    if resolved is None:
+        db.execute("UPDATE runs SET agent_id=? WHERE seq=?", (agent_id, run["seq"]))
+        log_event(db, tid, "model_unresolved", phase, phase,
+                  "role=%s agent_id=%s" % (role, agent_id))
+        return
+    match = resolved.startswith("claude-%s-" % run["model_requested"])
+    db.execute("UPDATE runs SET agent_id=?, model_resolved=?, resolved_at=?, match=?"
+               " WHERE seq=?", (agent_id, resolved, ts, int(match), run["seq"]))
+    if not match:
+        log_event(db, tid, "model_mismatch", phase, phase,
+                  "role=%s requested=%s resolved=%s" % (role, run["model_requested"],
+                                                        resolved))
+
+
 HOOK_KEY_COLUMNS = ("phase", "worktree", "retired_at", "session_id", "pid",
                     "pid_start", "activity", "last_seen_at", "session_seen", "platform")
 
@@ -3169,6 +3576,7 @@ def run_hook():
                 row = db.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
         if hook_skip(event, sid, row, pid):
             return
+        sub = subagent_report(payload) if event == "SubagentStop" else None
         with transaction(db):
             cur = db.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
             if cur is None or cur["retired_at"] is not None \
@@ -3195,9 +3603,11 @@ def run_hook():
                               % (sid, payload.get("source")))
                 out = ("You are the ticket orchestrator for %s. Run `orch show %s`"
                        " before anything else." % (tid, tid))
-            elif event == "PostToolUse":
+            elif event in ("PostToolUse", "SubagentStop"):
                 db.execute("UPDATE tickets SET activity='working', last_seen_at=?"
                            " WHERE id=?", (ts, tid))
+                if sub:
+                    record_subagent(db, tid, phase, ts, *sub)
             elif event == "Stop":
                 db.execute("UPDATE tickets SET activity='idle', last_seen_at=?"
                            " WHERE id=?", (ts, tid))
@@ -3278,6 +3688,17 @@ def build_parser():
     sp.add_argument("--force", action="store_true")
     sp.add_argument("--keep-worktree", action="store_true")
     add("events", cmd_events, "ticket")
+    for name, fn in (("route", cmd_route), ("run", cmd_run)):
+        sp = add(name, fn, "ticket")
+        sp.add_argument("--role", required=True)
+        if fn is cmd_run:
+            sp.add_argument("--model", required=True)
+        sp.add_argument("--files", type=int)
+        sp.add_argument("--lines", type=int)
+        sp.add_argument("--ambiguous", action="store_true")
+    add("runs", cmd_runs, "ticket")
+    sp = add("smoke-routing", cmd_smoke_routing)
+    sp.add_argument("--model", action="append", dest="models")
     sp = add("watch", cmd_watch)
     sp.add_argument("--interval", type=float, default=5.0)
     sp.add_argument("--once", action="store_true")
@@ -3287,12 +3708,13 @@ def build_parser():
     sp.add_argument("--timeout", type=float, default=180.0)
     sp.add_argument("--continue", dest="cont", metavar="RUN")
     sp.add_argument("--answer")
+    sp.add_argument("--skip-routing", action="store_true")
     return p
 
 
-READ_ONLY = (cmd_list, cmd_show, cmd_next, cmd_stale, cmd_events)
+READ_ONLY = (cmd_list, cmd_show, cmd_next, cmd_stale, cmd_events, cmd_route, cmd_runs)
 NO_DB = (cmd_init, cmd_preflight, cmd_platform, cmd_hook, cmd_watch,
-         cmd_selftest)
+         cmd_selftest, cmd_smoke_routing)
 
 
 def main(argv=None):

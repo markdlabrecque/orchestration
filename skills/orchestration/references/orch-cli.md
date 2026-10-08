@@ -12,12 +12,12 @@ The project root also holds `.orch` (written by the `setup-project` skill). `orc
 
 | Path | Holds |
 |---|---|
-| `state.db` (+ `-wal`, `-shm`) | SQLite store: tickets and the append-only event log |
+| `state.db` (+ `-wal`, `-shm`) | SQLite store: tickets, the append-only event log and the stage-agent runs ("Model routing") |
 | `logs/<ticket>.log` | Output of headless ticket sessions (appended across attempts) |
 | `briefs/<ticket>.md`, `briefs/<ticket>.resume.md` | Prompt given to the session by `spawn` / `resume` |
 | `config.json` | Optional project settings (below) |
 
-SQLite runs in WAL mode with a busy timeout. Every command is one transaction, so a killed process leaves either the old state or the new one, never half. Writes take `BEGIN IMMEDIATE`; read-only commands (`list`, `show`, `next`, `stale`, `events`, `platform`, `watch`) use a plain deferred read. `spawn`, `resume` and `retire` are the exception: they never hold the write lock while a platform command or worktree engine runs, and hold the ticket's in-flight marker instead (see "Launching sessions"). Older databases gain new columns automatically on first use.
+SQLite runs in WAL mode with a busy timeout. Every command is one transaction, so a killed process leaves either the old state or the new one, never half. Writes take `BEGIN IMMEDIATE`; read-only commands (`list`, `show`, `next`, `stale`, `events`, `route`, `runs`, `platform`, `watch`) use a plain deferred read. `spawn`, `resume` and `retire` are the exception: they never hold the write lock while a platform command or worktree engine runs, and hold the ticket's in-flight marker instead (see "Launching sessions"). Older databases gain new columns and tables (`bounces`, `runs`) automatically on first use.
 
 ### `config.json`
 
@@ -64,7 +64,7 @@ Each ticket records its harness (`harness`, null meaning `claude`). `resume` kee
 
 The skill is user-invoked only on every harness, so the prompt prefix loads it. The resume prompt carries it too on Pi and Codex (a session killed before its first turn was saved has no skill loaded); on Claude it is plain text, as before.
 
-- **Pi** sets its process title to `pi`, so the session id is not on its command line: a headless launch records the start time (`pid_start`) with the pid. The Pi extension runs `orch hook` with `ORCH_HOOK_AGENT_PID` set to the Pi process. Subagent children (`PI_SUBAGENT_CHILD=1`) report `PostToolUse` under the parent session's id, as Claude's subagents do. A launch drops the `PI_SUBAGENT_*` and `ORCH_PI_PARENT_SESSION` variables from the child's environment. Stage agents get the Pi model their tier names: `opus` → `openai-codex/gpt-6-astra`, `sonnet` → `openai-codex/gpt-6.1-sol`, `haiku` → `openai-codex/gpt-6-luna`, plus the matching thinking level (`high`, `medium`, `low`). The reviewer and verifier take the `sonnet` model with `high` thinking. The reporter takes the `haiku` tier: `gpt-6-luna`, `low`. The machine config's `pi_models` (`{"opus": "<provider>/<model>", ...}`) overrides the map. A model the session's model registry does not know is left out, so that agent runs on the session's model. The implementor gets no model: its dispatcher passes one. A `model` in the `subagent` call still wins.
+- **Pi** sets its process title to `pi`, so the session id is not on its command line: a headless launch records the start time (`pid_start`) with the pid. The Pi extension runs `orch hook` with `ORCH_HOOK_AGENT_PID` set to the Pi process. Subagent children (`PI_SUBAGENT_CHILD=1`) report `PostToolUse` under the parent session's id, as Claude's subagents do. A launch drops the `PI_SUBAGENT_*` and `ORCH_PI_PARENT_SESSION` variables from the child's environment. Stage agents carry no model and no thinking level: the dispatcher passes both on each `subagent` call, from `orch route` (see "Model routing").
 - **Codex** picks its thread id. `spawn` records `session_id` null; the first `SessionStart` attaches the thread: on `headless` only from the process `orch` launched (the hook waits up to 3 s for step 3 to record its pid), on `orca`/`herdr` the first session to report in. A headless session killed before its hook ran is still found: `resume` reads the last `thread.started` line of the ticket's log. Resume continues the thread only when Codex saved it (`$CODEX_HOME/sessions/*/*/*/rollout-*-<thread>.jsonl`); otherwise it starts fresh from the brief. On `orca` and `herdr`, `orch` appends `[projects."<worktree realpath>"]` / `trust_level = "trusted"` to `$CODEX_HOME/config.toml` (default `~/.codex`) when the file has no table for that path, records it as `trust_codex` and a `trust_mark` event (detail `codex <path>`), and removes exactly that table on retire (Codex ignores `-c projects…` overrides for the trust dialog). The same signature-checked temp-file replace and retries as for Claude's config apply; a missing file is created.
 
 ## Phases
@@ -99,6 +99,7 @@ ci         -> fix | mr
 - Entering `review` adds 1 to `review_rounds`.
 - `review -> fix` and `verify -> fix` are refused once `review_rounds` is 2 or more (the cap). The refusal says to file the remaining findings as follow-up tickets and move on to `verify`.
 - `ci -> fix` is never capped; CI repairs are not review rounds. `fix -> ci` returns straight to CI after such a repair.
+- `review -> fix` and `verify -> fix` add 1 to `bounces` (`ci -> fix` does not). They are refused (exit 3) when the ticket's last implementor run was at `frontier`: there is no higher tier, and the message says to `orch block` the ticket for a human.
 - `done` is reachable only through `orch merged`.
 
 ## Session health
@@ -125,7 +126,7 @@ A pid reused by an unrelated process is therefore not alive: `stale` lists the t
 
 ## Hooks
 
-The plugin ships `hooks/hooks.json`, which runs `orch hook` on `SessionStart`, `PostToolUse`, `Stop` and `SessionEnd` in **every** session where the plugin is enabled. `orch hook` reads the hook's JSON from stdin (`session_id`, `cwd`, `hook_event_name`, `source`, `reason`).
+The plugin ships `hooks/hooks.json`, which runs `orch hook` on `SessionStart`, `PostToolUse`, `Stop`, `SubagentStop` and `SessionEnd` in **every** session where the plugin is enabled. `orch hook` reads the hook's JSON from stdin (`session_id`, `cwd`, `hook_event_name`, `source`, `reason`).
 
 It must never disturb a session: it always exits 0, prints nothing except on `SessionStart` for a matched ticket, catches every error, and returns at once when there is no `<project root>/.agents/orchestration/state.db` for `cwd`. It matches under a plain read and takes the write lock (`BEGIN IMMEDIATE`) only when it is about to write, re-checking the ticket under the lock.
 
@@ -144,8 +145,11 @@ It must never disturb a session: it always exits 0, prints nothing except on `Se
 | `PostToolUse` | activity `working`, `last_seen_at`. Skipped when the activity is already `working` and `last_seen_at` is under 15 s old (keeps hooks cheap). |
 | `Stop` | activity `idle`, `last_seen_at` |
 | `SessionEnd` | activity `ended`, `last_seen_at`, `session_end` event with the reason |
+| `SubagentStop` | activity `working`, `last_seen_at`; for a stage agent, its run (see "Model routing") |
 
-Only `SessionStart` and `SessionEnd` write events; activity updates do not.
+Only `SessionStart`, `SessionEnd` and `SubagentStop` write events; activity updates do not.
+
+**`SubagentStop`** (Claude Code). Matched like the other events; a session id other than the recorded one is ignored before anything is read. The role is the `agent_type` after `orchestration:`; any other agent type is not a stage agent and only bumps the activity. For a stage agent the hook reads `agent_transcript_path` and takes `message.model` of the last `type: "assistant"` line (the transcript is written asynchronously: it retries for up to 2 s). It pairs with the ticket's oldest run of that role whose `agent_id` is null and fills `agent_id`, `model_resolved`, `resolved_at` and `match`: 1 when the resolved id starts with `claude-<requested alias>-` (`sonnet` ↔ `claude-sonnet-5-5`), else 0 plus a `model_mismatch` event (role, requested, resolved). No model in the transcript: only `agent_id` is filled, `model_resolved` stays null, and a `model_unresolved` event (role, agent id) is written. No run row for a stage agent: a `dispatch_unrecorded` event (role, resolved model, and the call's `model` from the transcript's `.meta.json` when present).
 
 ## Launching sessions
 
@@ -177,6 +181,30 @@ For `desktop`, `spawn` and `resume` exit 0 and print `{"action": "desktop_start"
 
 **Resume on `orca` / `herdr`** first closes the old terminal or workspace when `launch_ref` names one (best effort, ignore errors): `orca terminal close --worktree path:<worktree> --all --json`, `herdr workspace close <workspace>`. Then it opens a new one the same way as `spawn`. Resuming onto `desktop` keeps `launch_ref` only when it is a Desktop ref; any other ref is cleared.
 
+## Model routing
+
+`orch` picks the model of every stage dispatch, mechanically, so the choice does not depend on what the orchestrator remembers. Tiers, lowest first, and what each harness dispatches:
+
+| Tier | Claude (Agent tool `model`) | Codex (agent file: model, reasoning effort) | Pi (`subagent` call: model, thinking) |
+|---|---|---|---|
+| `light` | `haiku` | `gpt-6-luna`, `low` | `openai-codex/gpt-6-luna`, `low` |
+| `standard` | `sonnet` | `gpt-6.1-sol`, `medium` | `openai-codex/gpt-6.1-sol`, `medium` |
+| `heavy` | `opus` | `gpt-6-astra`, `high` | `openai-codex/gpt-6-astra`, `high` |
+| `frontier` | `fable` | `gpt-6-astra`, `xhigh` | `openai-codex/gpt-6-astra`, `xhigh` |
+
+Role defaults: `filer`, `investigation`, `reviewer`, `verifier`, `reporter` light; `test-writer`, `implementor` standard. Then, in order:
+
+1. `--ambiguous`: one tier up.
+2. `--files N` > 5 or `--lines N` > 300: `investigation` and `reviewer` one tier up (other roles ignore the size).
+3. Floors from the ticket's runs: an implementor after a bounce (the ticket's `bounces` grew since the last implementor run, or the ticket is in `review`/`verify`) runs one tier above the last implementor run, and is refused (exit 3, "block") when that was `frontier`; a reviewer runs at least one tier below the last implementor; every role runs at least one tier below the highest tier on the ticket (no mid-ticket de-escalation).
+4. Everything caps at `frontier`.
+
+On Pi the machine config's `pi_models` (`${XDG_CONFIG_HOME:-~/.config}/orchestration/config.json`) overrides the models by tier (`{"light": "<provider>/<model>", ...}`); the old keys `haiku`, `sonnet`, `opus` still work as `light`, `standard`, and `heavy` plus `frontier` (both run on one model; a tier key wins). `pi/extension.ts` `piModels()` reads the same map. On Codex, `scripts/codex-agents` writes one agent per stage and tier (`<name>_<tier>.toml`, agent `<name>-<tier>`, with that tier's model and effort; the reviewer read-only, the verifier on the session's sandbox) and removes the untiered `<name>.toml` of earlier versions (only one it generated: its first line says so); `orch route` prints the agent to spawn. Codex's `spawn_agent` `model` field is behind a config option, so the agent file carries the model instead.
+
+**Runs.** `orch run` records each dispatch **before** it happens in the `runs` table: `seq`, `ticket`, `role`, `model_requested`, `tier`, `bounce_count` (the ticket's `bounces` at dispatch), `requested_at`, and, filled by the `SubagentStop` hook on Claude, `agent_id`, `model_resolved`, `resolved_at`, `match` (1/0; null until resolved). `match = 0` is the loud failure: the subagent ran on another model than asked.
+
+**Smoke test.** `orch smoke-routing [--model M]...` (default `haiku` and `fable`; Claude only, other harnesses exit 3 "not supported") starts, per model, `claude -p --session-id <sid> --output-format stream-json --verbose <claude_args>` in the project root, asking it to dispatch a `general-purpose` subagent with that `model`. After it exits (timeout 180 s) it reads `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<project key>/<sid>/subagents/agent-*.jsonl` (the key is the project root with every non-alphanumeric character replaced by `-`) and checks the last assistant entry's `message.model` is `claude-<alias>-…`. The transcript is the verdict, never the subagent's self-report. Prints `REQUESTED RESOLVED RESULT` rows; exit 0 when all pass, 3 otherwise. `fable`, not `claude-fable-5-1`: the Agent tool accepts only the aliases `sonnet`, `opus`, `haiku`, `fable`.
+
 ## Commands
 
 Every command accepts `--json` (one JSON object on stdout). Exit codes: `0` ok, `2` usage, `3` gate refused, `4` ticket not found, `5` preflight failed. Refusals print the reason on stderr.
@@ -188,7 +216,7 @@ Every command accepts `--json` (one JSON object on stdout). Exit codes: `0` ok, 
 | `orch preflight` | main | Exit 0 and print `verify_env` (`ddev` or `docker`), `base_branch` and `platform`. Exit 5 listing every failure. Checks: `BASE_BRANCH` set in the environment or `.orch` (an optional `export ` prefix is allowed; a quoted value is the text inside the quotes, an unquoted value ends at the first whitespace-then-`#` comment); verification environment is `ddev` when the main checkout has `.ddev/config.yaml` **and** `ddev` is on `PATH`, else `docker` when `config.json` has `verify_harness` **and** `docker` is on `PATH`, else failure; the platform's binary (`orca` or `herdr`) is on `PATH` when the platform needs one. |
 | `orch add <ticket> --title T [--url U]` | main | New ticket in `ready`. Exit 3 if it exists. Exit 2 unless the id matches `^[A-Za-z0-9][A-Za-z0-9._-]*$` with no `..` (it names files under `logs/` and `briefs/`). |
 | `orch list` | any | All tickets: id, phase, status, platform, health, activity, last_seen_at, review_rounds, pid, alive, retired. |
-| `orch show <ticket>` | any | One ticket in full, including `alive`, `health` and `launch_ref`. |
+| `orch show <ticket>` | any | One ticket in full, including `alive`, `health` and `launch_ref`, plus `bounces`, `runs` (as `orch runs`), `model_mismatches` (runs with `match` 0) and `unrecorded_dispatches` (`dispatch_unrecorded` events). The text form prints the runs as a table after the fields. |
 | `orch next` | main | `ready` tickets, oldest first, limited to `max_workers` minus active tickets. Active = not `ready`/`done`/`blocked` and not retired. |
 | `orch spawn <ticket> [--worktree P] --brief-file F [--platform X] [--harness H]` | main | Requires `ready`. Without `--worktree`, the platform adapter creates the worktree first ([platforms.md](platforms.md)). Exit 3 if the realpath of `P` is the main checkout or contains it, lies inside the main checkout without being a linked worktree of its own (`git rev-parse --show-toplevel` there is the main checkout), or equals, contains or lies inside the worktree of another non-retired ticket that is not `ready` or `done`. Exit 3 while a launch is in progress (in-flight marker). Stores the brief, then launches per "Launching sessions" on `--platform` (default: the configured platform). Phase `dispatched`, attempt 1. |
 | `orch resume <ticket> [--note N] [--platform X] [--harness H]` | main | Exit 3 if the session is alive, a launch is in progress (in-flight marker), or the ticket is `ready`, `done` or retired. A `blocked` ticket first returns to its remembered phase (`unblock` event). Attempt + 1, then launches per "Launching sessions" on the ticket's platform, or `--platform`. |
@@ -204,5 +232,9 @@ Every command accepts `--json` (one JSON object on stdout). Exit codes: `0` ok, 
 | `orch watch [--interval S] [--once]` | any | Live table of non-retired tickets; see [platforms.md](platforms.md). |
 | `orch selftest [...]` | main | Lifecycle self-check; see [platforms.md](platforms.md). |
 | `orch events <ticket>` | any | The ticket's event log, oldest first. |
+| `orch route <ticket> --role R [--files N] [--lines N] [--ambiguous]` | ticket | Read-only: the tier and dispatch value for the ticket's harness ("Model routing"). Text: the model on the first line, then `tier:`, `effort:` (Codex), `thinking:` (Pi), `agent:` (Codex, stage roles) and a `why:` line per bump or floor applied. `--json`: `{"tier", "model", "effort"\|"thinking", "agent", "floors": [reasons]}`. Roles: `filer`, `investigation`, `test-writer`, `implementor`, `reviewer`, `verifier`, `reporter`; another exits 2. An implementor after a frontier bounce exits 3 (block for a human). |
+| `orch run <ticket> --role R --model M [--files N] [--lines N] [--ambiguous]` | ticket | Records the dispatch in `runs` before it happens, and a `run` event; prints the run's `seq` (`--json`: the row). `M` is the harness's dispatch value (Claude alias, Codex or Pi model) or a tier name (recorded as that tier's dispatch value); on Codex also the per-tier agent name (`implementor-heavy`), and a bare `gpt-6-astra` (heavy and frontier share it) is `heavy`. An unknown value exits 2. A tier below what `orch route` gives for the same flags exits 3 with the reason. The pipeline passes `route`'s `tier`, since a shared model (Pi heavy/frontier, Codex roles without an agent) would be read as the lower tier. |
+| `orch runs <ticket>` | any | The ticket's runs, oldest first. |
+| `orch smoke-routing [--model M]...` | main | Checks Claude's Agent tool really runs subagents on the requested model; see "Model routing". |
 
 Every state change appends an event: timestamp, ticket, kind, from phase, to phase, detail.

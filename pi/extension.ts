@@ -5,8 +5,8 @@
 //    SessionEnd) so orch knows each ticket session's health. Only inside a
 //    project root (~/Projects/<project>) that has .agents/orchestration/state.db.
 // 2. Offers the stage agents (agents/*.md) to the `subagents` extension as
-//    `orchestration:<name>` profiles, translated to Pi tools, model and
-//    thinking.
+//    `orchestration:<name>` profiles, translated to Pi tools. The dispatcher
+//    passes model and thinking per call, from `orch route`.
 //
 // Contract: skills/orchestration/references/orch-cli.md ("Hooks", "Harnesses").
 
@@ -118,42 +118,36 @@ const PI_TOOLS: Record<string, string[]> = {
 	Write: ["write"],
 	Edit: ["edit"],
 };
-// The agents name Claude model tiers. Each tier maps to a Pi model (the
-// same choices as scripts/codex-agents) and a thinking level. Providers
-// differ per machine: the machine config's `pi_models` overrides the map,
-// and a model the session's registry does not know is left out, so that
-// agent runs on the session's model.
-const PI_THINKING: Record<string, string> = { haiku: "low", sonnet: "medium", opus: "high" };
+// The routing tiers' Pi models and thinking levels (scripts/orch PI_MODELS,
+// the same models as scripts/codex-agents). `orch route` prints them per
+// dispatch; the machine config's `pi_models` overrides the models, keyed by
+// tier or by the old Claude names (haiku, sonnet, opus).
 export const PI_MODELS: Record<string, string> = {
-	haiku: "openai-codex/gpt-6-luna",
-	sonnet: "openai-codex/gpt-6.1-sol",
-	opus: "openai-codex/gpt-6-astra",
+	light: "openai-codex/gpt-6-luna",
+	standard: "openai-codex/gpt-6.1-sol",
+	heavy: "openai-codex/gpt-6-astra",
+	frontier: "openai-codex/gpt-6-astra",
 };
-// The implementor is also dispatched outside the pipeline (analyze-ticket),
-// whose dispatcher passes the model: leave it unset.
-const NO_MODEL = new Set(["implementor"]);
-// Reviewer and verifier run on the sonnet tier's model with their own
-// (opus) thinking: judgment at high effort, not the frontier model's cost.
-// The same choice as scripts/codex-agents.
-const MODEL_TIER: Record<string, string> = { reviewer: "sonnet", verifier: "sonnet" };
-// The reporter only writes up the run: haiku tier, model and thinking.
-const TIER: Record<string, string> = { reporter: "haiku" };
+export const PI_THINKING: Record<string, string> = { light: "low", standard: "medium", heavy: "high", frontier: "xhigh" };
+// opus sets heavy and frontier: both run on the same model.
+const TIER_ALIASES: Record<string, string[]> = { haiku: ["light"], sonnet: ["standard"], opus: ["heavy", "frontier"] };
 
-type ModelCheck = (model: string) => boolean;
-
-/** The tier -> model map: PI_MODELS, overridden by the machine config's `pi_models`. */
+/** The tier -> model map, overridden by the machine config's `pi_models`
+ * (a tier key wins over an old alias), plus the old names as aliases. */
 export function piModels(): Record<string, string> {
+	const out: Record<string, string> = { ...PI_MODELS };
 	const base = process.env.XDG_CONFIG_HOME || path.join(process.env.HOME || "", ".config");
 	try {
 		const cfg = JSON.parse(fs.readFileSync(path.join(base, "orchestration", "config.json"), "utf8"));
 		const own = cfg?.pi_models;
 		if (own && typeof own === "object" && !Array.isArray(own)) {
-			const out = { ...PI_MODELS };
-			for (const [k, v] of Object.entries(own)) if (typeof v === "string" && v) out[k] = v;
-			return out;
+			const valid = (v: unknown): v is string => typeof v === "string" && !!v;
+			for (const [k, v] of Object.entries(own)) if (valid(v) && TIER_ALIASES[k]) for (const t of TIER_ALIASES[k]) out[t] = v;
+			for (const [k, v] of Object.entries(own)) if (valid(v) && k in PI_MODELS) out[k] = v;
 		}
 	} catch {}
-	return { ...PI_MODELS };
+	for (const [alias, tiers] of Object.entries(TIER_ALIASES)) out[alias] = out[tiers[0]];
+	return out;
 }
 
 export interface StageAgent {
@@ -167,12 +161,7 @@ export interface StageAgent {
 	filePath: string;
 }
 
-export function parseAgent(
-	text: string,
-	filePath: string,
-	models: Record<string, string> = PI_MODELS,
-	available: ModelCheck = () => true,
-): StageAgent | null {
+export function parseAgent(text: string, filePath: string): StageAgent | null {
 	const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
 	if (!m) return null;
 	const fm: Record<string, string> = {};
@@ -189,22 +178,17 @@ export function parseAgent(
 				.flatMap((t) => PI_TOOLS[t] ?? []),
 		),
 	];
-	const tier = TIER[fm.name] ?? fm.model ?? "";
-	const model = NO_MODEL.has(fm.name) ? undefined : models[MODEL_TIER[fm.name] ?? tier];
 	return {
 		name: `orchestration:${fm.name}`,
 		description: fm.description,
 		tools: tools.length ? tools : undefined,
-		model: model && available(model) ? model : undefined,
-		thinking: PI_THINKING[tier],
 		systemPrompt: m[2].trim(),
 		source: "user",
 		filePath,
 	};
 }
 
-export function loadStageAgents(dir = AGENTS_DIR, available: ModelCheck = () => true): StageAgent[] {
-	const models = piModels();
+export function loadStageAgents(dir = AGENTS_DIR): StageAgent[] {
 	let names: string[];
 	try {
 		names = fs.readdirSync(dir).filter((n) => n.endsWith(".md")).sort();
@@ -215,33 +199,18 @@ export function loadStageAgents(dir = AGENTS_DIR, available: ModelCheck = () => 
 	for (const n of names) {
 		const file = path.join(dir, n);
 		try {
-			const a = parseAgent(fs.readFileSync(file, "utf8"), file, models, available);
+			const a = parseAgent(fs.readFileSync(file, "utf8"), file);
 			if (a) agents.push(a);
 		} catch {}
 	}
 	return agents;
 }
 
-// The session's model registry, once a session started; until then every
-// mapped model is offered.
-let registry: { find(provider: string, id: string): unknown } | undefined;
-
-export function modelKnown(model: string): boolean {
-	if (!registry) return true;
-	const slash = model.indexOf("/");
-	if (slash <= 0) return false;
-	try {
-		return !!registry.find(model.slice(0, slash), model.slice(slash + 1));
-	} catch {
-		return false;
-	}
-}
-
 export function registerStageAgents(): void {
 	const g = globalThis as Record<symbol, unknown>;
 	if (!(g[AGENT_PROVIDERS] instanceof Map)) g[AGENT_PROVIDERS] = new Map();
 	(g[AGENT_PROVIDERS] as Map<string, () => StageAgent[]>).set("orchestration", () =>
-		loadStageAgents(AGENTS_DIR, modelKnown),
+		loadStageAgents(AGENTS_DIR),
 	);
 }
 
@@ -261,7 +230,6 @@ export default function orchestration(pi: ExtensionAPI, hook = runHook) {
 
 	pi.on("session_start", async (event: any, ctx: any) => {
 		cwd = ctx?.cwd ?? process.cwd();
-		if (typeof ctx?.modelRegistry?.find === "function") registry = ctx.modelRegistry;
 		lastPost = 0;
 		if (child) {
 			sessionId = process.env[PARENT_ENV];

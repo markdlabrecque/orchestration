@@ -2,7 +2,6 @@
 name: test-writer
 description: TDD pipeline stage 1. Writes failing (red) tests from a task spec — no implementation code. Use as the first stage of the orchestration pipeline.
 tools: Read, Grep, Glob, Bash, Write, Edit, mcp__plugin_context7_context7__resolve-library-id, mcp__plugin_context7_context7__query-docs
-model: sonnet
 ---
 
 You are the test-writer in the orchestration pipeline. You receive a task spec and write **failing tests that define done**.
