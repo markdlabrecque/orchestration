@@ -1478,6 +1478,39 @@ class ReadinessRegressionTests(unittest.TestCase):
 
 
 class HelpTests(OrchTestCase):
+    def help_usage(self, out):
+        section = out.split("\n\n", 1)[0]
+        self.assertTrue(section.startswith("usage:"), out)
+        return " ".join(section.split())
+
+    def test_run_help_marks_effort_required_and_retains_all_arguments(self):
+        out = self.ok("run", "--help").stdout
+        usage = self.help_usage(out)
+        # Strip optional groups before checking required arguments. This catches
+        # required flags accidentally nested inside any optional group.
+        required = re.sub(r"\[[^\]]*\]", "", usage)
+        for argument in ("--role ROLE", "--model MODEL", "--effort {low,high}"):
+            with self.subTest(required=argument):
+                self.assertIn(argument, required)
+        self.assertRegex(required, r"\bticket\b")
+        for argument in ("-h", "--json", "--files FILES", "--lines LINES",
+                         "--ambiguous"):
+            with self.subTest(optional=argument):
+                self.assertIn("[" + argument + "]", usage)
+
+    def test_smoke_routing_help_explains_optional_effort_and_default(self):
+        out = self.ok("smoke-routing", "--help").stdout
+        self.assertIn("[--effort {low,high}]", self.help_usage(out))
+        # Limit semantic checks to this option's description, allowing wrapping
+        # and wording changes without accepting unrelated text elsewhere.
+        match = re.search(r"(?m)^  --effort \{low,high\}([^\n]*(?:\n {4,}[^\n]+)*)", out)
+        self.assertIsNotNone(match, out)
+        description = " ".join(match.group(1).lower().split())
+        for word in ("requested", "subagent", "effort", "transcript"):
+            self.assertIn(word, description)
+        self.assertRegex(description, r"check(?:ed|s|ing)?")
+        self.assertRegex(description, r"default\W+(?:is\s+)?high\b")
+
     def test_help_lists_subcommands(self):
         out = self.ok("--help").stdout
         for name in ("merged", "block", "phase"):

@@ -324,11 +324,20 @@ class RunTests(RoutingTestCase):
 
     def test_run_requires_a_valid_effort(self):
         self.add("t1")
-        self.refused(2, "run", "t1", "--role", "implementor", "--model", "sonnet")
-        for bad in ("medium", "xhigh", ""):
-            self.refused(2, "run", "t1", "--role", "implementor", "--model", "sonnet",
-                         "--effort", bad)
-        self.assertEqual(self.runs("t1"), [])
+        self.log_run("t1", "implementor", "sonnet")
+        before_runs = self.runs("t1")
+        before_events = self.events("t1")
+        for effort_args in ((), ("--effort", "medium"), ("--effort", "xhigh"),
+                            ("--effort", "")):
+            with self.subTest(effort_args=effort_args):
+                p = self.refused(2, "run", "t1", "--role", "implementor",
+                                 "--model", "sonnet", *effort_args)
+                self.assertIn("effort", p.stderr)
+                if not effort_args:
+                    self.assertIn("run needs --effort (low|high)", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(self.runs("t1"), before_runs)
+                self.assertEqual(self.events("t1"), before_events)
 
     def test_run_accepts_a_codex_agent_name_when_the_effort_agrees(self):
         self.add("t1")
@@ -340,9 +349,17 @@ class RunTests(RoutingTestCase):
 
     def test_run_with_an_unknown_model_is_a_usage_error(self):
         self.add("t1")
+        self.log_run("t1", "implementor", "sonnet")
+        before_runs = self.runs("t1")
+        before_events = self.events("t1")
+        # Omit effort deliberately: model validation must still take priority.
         p = self.refused(2, "run", "t1", "--role", "implementor", "--model", "gpt-4")
-        self.assertIn("gpt-4", p.stderr)
-        self.assertEqual(self.runs("t1"), [])
+        self.assertRegex(p.stderr, r"unknown model\s+['\"]gpt-4['\"]")
+        self.assertNotIn("needs --effort", p.stderr)
+        self.assertNotIn("required", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(self.runs("t1"), before_runs)
+        self.assertEqual(self.events("t1"), before_events)
 
     def test_show_reports_runs_and_bounces(self):
         self.add("t1")
@@ -355,9 +372,15 @@ class RunTests(RoutingTestCase):
 
     def test_runs_and_show_carry_the_effort(self):
         self.add("t1")
-        row = self.log_run("t1", "test-writer", "sonnet", effort="high")
-        self.assertEqual((row["effort_requested"], row["effort_resolved"]), ("high", None))
-        self.assertEqual(self.show("t1")["runs"][0]["effort_requested"], "high")
+        for effort in ("low", "high"):
+            with self.subTest(effort=effort):
+                row = self.log_run("t1", "test-writer", "sonnet", effort=effort)
+                self.assertEqual((row["effort_requested"], row["effort_resolved"]),
+                                 (effort, None))
+                self.assertEqual(self.runs("t1")[-1]["effort_requested"], effort)
+                self.assertEqual(self.show("t1")["runs"][-1]["effort_requested"], effort)
+        self.assertEqual([r["effort_requested"] for r in self.runs("t1")],
+                         ["low", "high"])
         for args in (("runs", "t1"), ("show", "t1")):
             out = self.ok(*args).stdout
             self.assertRegex(out, r"\bEFFORT\b", args)

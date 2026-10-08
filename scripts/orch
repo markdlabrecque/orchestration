@@ -3903,15 +3903,19 @@ def build_parser():
         sp = add(name, fn, "ticket")
         sp.add_argument("--role", required=True)
         if fn is cmd_run:
+            sp.usage = ("%(prog)s [-h] [--json] ticket --role ROLE --model MODEL "
+                        "--effort {low,high} [--files FILES] [--lines LINES] [--ambiguous]")
             sp.add_argument("--model", required=True)
-            sp.add_argument("--effort", choices=EFFORTS)  # required: cmd_run checks
+            sp.add_argument("--effort", choices=EFFORTS,
+                            help="required effort for this run")  # required: cmd_run checks
         sp.add_argument("--files", type=int)
         sp.add_argument("--lines", type=int)
         sp.add_argument("--ambiguous", action="store_true")
     add("runs", cmd_runs, "ticket")
     sp = add("smoke-routing", cmd_smoke_routing)
     sp.add_argument("--model", action="append", dest="models")
-    sp.add_argument("--effort", choices=EFFORTS, default="high")
+    sp.add_argument("--effort", choices=EFFORTS, default="high",
+                    help="requested subagent effort, checked against the transcript (default: high)")
     sp = add("watch", cmd_watch)
     sp.add_argument("--interval", type=float, default=5.0)
     sp.add_argument("--once", action="store_true")
