@@ -121,6 +121,30 @@ class RouteTests(RoutingTestCase):
         r = self.route("t1", "implementor")
         self.assertEqual((r["tier"], r["model"], r["effort"]), ("heavy", "opus", "low"))
 
+    def test_ci_repair_routes_standard_low_after_heavy_review_fix(self):
+        self.to_review("t1")
+        self.log_run("t1", "implementor", CLAUDE["standard"], effort="high")
+        self.ok("phase", "t1", "fix")
+        r = self.route("t1", "implementor")
+        self.assertEqual((r["tier"], r["effort"]), ("heavy", "low"))
+        self.log_run("t1", "implementor", CLAUDE["heavy"])
+        self.phases("t1", "review", "verify", "report", "mr", "ci")
+
+        before = self.show("t1")
+        counts = (before["bounces"], before["review_rounds"])
+        self.ok("phase", "t1", "fix")
+        after = self.show("t1")
+        self.assertEqual((after["bounces"], after["review_rounds"]), counts)
+        latest = self.runs("t1")[-1]
+        self.assertEqual((latest["role"], latest["tier"], latest["bounce_count"]),
+                         ("implementor", "heavy", after["bounces"]))
+
+        r = self.route("t1", "implementor")
+        self.assertEqual((r["tier"], r["model"], r["effort"]),
+                         ("standard", CLAUDE["standard"], "low"))
+        self.assertFalse(any("after a bounce" in reason for reason in r["floors"]),
+                         r["floors"])
+
     def test_frontier_low_bounces_to_frontier_high_and_tiers_cap_there(self):
         self.to_review("t1")
         self.log_run("t1", "implementor", "opus", effort="high")
