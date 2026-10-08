@@ -207,7 +207,7 @@ On Pi the machine config's `pi_models` (`${XDG_CONFIG_HOME:-~/.config}/orchestra
 
 ## Commands
 
-Every command accepts `--json` (one JSON object on stdout). Exit codes: `0` ok, `2` usage, `3` gate refused, `4` ticket not found, `5` preflight failed. Refusals print the reason on stderr.
+Every command accepts `--json`, before or after the command name (one JSON object on stdout). Exit codes: `0` ok, `2` usage, `3` gate refused, `4` ticket not found, `5` preflight failed. Refusals print the reason on stderr.
 
 | Command | Who | Effect |
 |---|---|---|
@@ -224,10 +224,10 @@ Every command accepts `--json` (one JSON object on stdout). Exit codes: `0` ok, 
 | `orch stale` | main | Active tickets whose health is `dead`, including `dispatched` ones nobody reported in for: the recovery list. An `orca`, `herdr` or `desktop` ticket that no session has reported in for yet (no pid) is listed only once `stall_minutes` have passed since its launch, since its pid only arrives with the first hook. |
 | `orch hook` | hooks | See "Hooks". |
 | `orch phase <ticket> <phase> [--note N]` | ticket | Validated transition (table above). |
-| `orch block <ticket> --reason R` | either | Phase `blocked`; remembers the prior phase. |
+| `orch block <ticket> --reason R` | either | Phase `blocked`; remembers the prior phase. The reason is recorded in STATE.md. |
 | `orch unblock <ticket>` | either | Back to the remembered phase. Exit 3 if there is none. |
 | `orch ci <ticket> --sha S (--passed \| --failed)` | ticket | Records the CI verdict for that commit. Requires phase `ci`. |
-| `orch merged <ticket> --sha S` | ticket | Requires phase `ci`. Exit 3 unless the latest CI verdict for exactly `S` is `passed`. Then phase `done`. |
+| `orch merged <ticket> --sha S [--mr URL]` | ticket | Requires phase `ci`. Exit 3 unless the latest CI verdict for exactly `S` is `passed`. Then phase `done`; STATE.md gets `completed: <mr>` with `--mr`, else `completed: commit <sha>`. |
 | `orch retire <ticket> [--force] [--keep-worktree]` | main | Requires `done` (or `--force`) and no launch in progress; holds the in-flight marker while it runs, so no `resume` launches meanwhile. Closes what the platform opened. `headless`: signals the session's process group (SIGTERM, SIGKILL after 3 s) when alive and leading its group. `orca`: `orca terminal close --worktree path:<worktree> --all --json`. `herdr`: `herdr workspace close <workspace>`. Platform close errors are reported but don't block retiring. After closing, a session still alive by the identity check is signalled. Then, unless `--keep-worktree`, removes the folder trust `orch` added for the worktree (the key, or the entry it created; a failure only warns) and removes the worktree, branch and DDEV project through the platform adapter (see [platforms.md](platforms.md)); a refusal there (uncommitted work without `--force`) leaves the ticket un-retired and exits 3. Then sets `retired_at`. `desktop`: prints `{"action": "desktop_archive", "ref": ...}` for the main orchestrator to archive the session. |
 | `orch watch [--interval S] [--once]` | any | Live table of non-retired tickets; see [platforms.md](platforms.md). |
 | `orch selftest [...]` | main | Lifecycle self-check; see [platforms.md](platforms.md). |
