@@ -18,6 +18,44 @@ OLD_PI_SOURCES=("$HOME/Projects/claude-code-marketplace/orchestration")
 
 say() { printf '\n== %s\n' "$*"; }
 
+# First line: the version Claude Code has installed (version and commit from
+# its install record) against this checkout (plugin.json and HEAD). Nothing
+# to update means exit 0 right here. A dirty checkout always counts as new.
+version_check() {
+  local avail_ver avail_sha installed
+  avail_ver=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' \
+    "$ROOT/.claude-plugin/plugin.json")
+  avail_sha=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
+  if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then
+    avail_sha="$avail_sha+dirty"
+  fi
+  installed=$(python3 - "$PLUGIN" <<'EOF'
+import json, os, sys
+home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+try:
+    with open(os.path.join(home, "plugins", "installed_plugins.json")) as f:
+        data = json.load(f)
+except (OSError, ValueError):
+    sys.exit(0)
+records = data.get("plugins", data).get(sys.argv[1]) or []
+if records:
+    r = records[0]
+    print(r.get("version", "?"), (r.get("gitCommitSha") or "")[:7] or "?")
+EOF
+)
+  local available="$avail_ver ($avail_sha)"
+  if [ -z "$installed" ]; then
+    echo "orchestration: not installed in Claude Code; $available available."
+    return 0
+  fi
+  local inst_ver=${installed%% *} inst_sha=${installed##* }
+  if [ "$inst_ver" = "$avail_ver" ] && [ "$inst_sha" = "$avail_sha" ]; then
+    echo "orchestration $available is installed and up to date."
+    exit 0
+  fi
+  echo "orchestration $inst_ver ($inst_sha) installed; $available available."
+}
+
 install_claude() {
   say "Claude Code"
   local old
@@ -62,6 +100,8 @@ install_pi() {
     pi install "$ROOT"
   fi
 }
+
+if command -v claude >/dev/null; then version_check; fi
 
 harnesses=("$@")
 if [ ${#harnesses[@]} -eq 0 ]; then
