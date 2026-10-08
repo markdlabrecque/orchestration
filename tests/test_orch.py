@@ -9,6 +9,7 @@ import fcntl
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import sqlite3
@@ -1242,6 +1243,130 @@ class StateMdTests(OrchTestCase):
         for initial in ("", self.SKELETON):
             with self.subTest(seeded=bool(initial)):
                 self.run_parallel_appends(initial)
+
+
+def readiness_failure_fixture(mode):
+    """Run only in an outer, time-bounded process; no readiness implementation."""
+    case = unittest.TestCase()
+    procs = []
+    with tempfile.TemporaryDirectory(prefix="orch-ready-") as root:
+        path = os.path.join(root, "STATE.md")
+        with open(path, "w") as f:
+            f.write("unchanged\n")
+        sync_read, sync_write = os.pipe()
+        child = (
+            "import os, sys, time\n"
+            "mode = sys.argv[1]\n"
+            "if mode == 'timeout':\n"
+            "    os.write(2, b'controlled-stderr-marker\\n')\n"
+            "    os.write(1, b'rea')\n"
+            "elif mode == 'malformed':\n"
+            "    os.write(1, b'not-ready\\n')\n"
+            "else:\n"
+            "    os.close(1)\n"
+            "os.write(int(sys.argv[2]), b'S')\n"
+            "os.close(int(sys.argv[2]))\n"
+            "while True: time.sleep(60)\n"
+        )
+        try:
+            with open(path, "rb") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                try:
+                    # A ready peer must also be stopped on another child's failure.
+                    procs.append(subprocess.Popen(
+                        [sys.executable, "-c",
+                         "import os,time; os.write(1,b'ready\\n'); time.sleep(60)"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+                    procs.append(subprocess.Popen(
+                        [sys.executable, "-c", child, mode, str(sync_write)],
+                        pass_fds=(sync_write,), stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True))
+                    os.close(sync_write)
+                    sync_write = None
+                    case.assertTrue(select.select([sync_read], [], [], 10)[0],
+                                    "controlled child did not start")
+                    case.assertEqual(os.read(sync_read, 1), b"S")
+                    helper = getattr(StateMdTests, "wait_for_ready", None)
+                    case.assertTrue(callable(helper),
+                                    "missing StateMdTests.wait_for_ready readiness helper")
+                    runner = StateMdTests("test_parallel_appends_are_intact")
+                    started = time.monotonic()
+                    with case.assertRaises(AssertionError) as caught:
+                        helper(runner, procs, timeout=0.25)
+                    case.assertLess(time.monotonic() - started, 5,
+                                    "readiness failure exceeded cleanup allowance")
+                    message = str(caught.exception)
+                    case.assertIn(mode, message.lower())
+                    case.assertRegex(message, r"(?i)(child|index|pending).*1")
+                    case.assertIn(str(procs[1].pid), message)
+                    if mode == "timeout":
+                        case.assertIn("0.25", message)
+                        case.assertIn("controlled-stderr-marker", message)
+                        case.assertIn("rea", message)
+                    elif mode == "malformed":
+                        case.assertIn("not-ready", message)
+                    else:
+                        case.assertRegex(message, r"(?i)(observed|stdout|data).*(b?['\"]['\"]|empty)")
+                    if mode != "timeout":
+                        case.assertRegex(message, r"(?i)stderr.*(empty|b?['\"]['\"])")
+                    for p in procs:
+                        # waitpid, unlike poll, proves the helper already reaped it.
+                        with case.assertRaises(ChildProcessError):
+                            os.waitpid(p.pid, os.WNOHANG)
+                        case.assertIsNotNone(p.returncode)
+                        case.assertTrue(p.stdout.closed)
+                        case.assertTrue(p.stderr.closed)
+                    case.assertIn("returncode", message.lower())
+                    with open(path) as f:
+                        case.assertEqual(f.read(), "unchanged\n")
+                finally:
+                    fcntl.flock(held, fcntl.LOCK_UN)
+                # A separate open description must acquire the parent's lock.
+                with open(path, "rb") as probe:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(probe, fcntl.LOCK_UN)
+        finally:
+            os.close(sync_read)
+            if sync_write is not None:
+                os.close(sync_write)
+            # Safety cleanup happens after assertions, never hides a helper leak.
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+                p.wait(timeout=3)
+                p.stdout.close()
+                p.stderr.close()
+
+
+class ReadinessRegressionTests(unittest.TestCase):
+    def run_fixture(self, mode):
+        outer = subprocess.Popen(
+            [sys.executable, "-c",
+             "from test_orch import readiness_failure_fixture; "
+             "readiness_failure_fixture(%r)" % mode],
+            cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True)
+        try:
+            out, err = outer.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail("readiness fixture exceeded 20-second outer safety bound")
+        finally:
+            # Also kill controlled descendants if a broken helper blocks forever.
+            try:
+                os.killpg(outer.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            outer.communicate(timeout=5)
+        self.assertEqual(outer.returncode, 0, out + err)
+
+    def test_partial_readiness_times_out_and_reaps_children(self):
+        self.run_fixture("timeout")
+
+    def test_readiness_eof_reaps_children(self):
+        self.run_fixture("eof")
+
+    def test_malformed_readiness_reaps_children(self):
+        self.run_fixture("malformed")
 
 
 class HelpTests(OrchTestCase):
