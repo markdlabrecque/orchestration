@@ -51,6 +51,8 @@ if [ -e "$root/.git" ] || [ -L "$root/.git" ]; then
   [ "$(pwd -P)" = "$root" ] || refuse "invoke from the project root to use --relocate-checkout."
   [ "$relocate" -eq 1 ] || refuse "root checkout requires explicit --relocate-checkout approval; --force only overwrites config."
   [ ! -L "$root/.git" ] && [ -d "$root/.git" ] || refuse "relocation requires a real .git directory, not a symlink or linked worktree."
+  git_symlink="$(find "$root/.git" -type l -print -quit)" || refuse "could not inspect .git for unsafe symlinks."
+  [ -z "$git_symlink" ] || refuse "symlink inside .git is unsafe for relocation."
   [ ! -e "$root/code" ] && [ ! -L "$root/code" ] || refuse "code already exists; refusing to merge or replace it."
   [ ! -e "$root/.git/worktrees" ] || refuse "checkout has linked worktrees; relocation would break their metadata."
   [ ! -e "$root/.git/objects/info/alternates" ] || refuse "checkout uses alternate object storage; relocation is unsafe."
