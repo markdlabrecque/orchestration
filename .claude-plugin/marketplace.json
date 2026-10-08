@@ -1,0 +1,15 @@
+{
+  "name": "orchestration",
+  "description": "Ticket-to-merge orchestration plugin for Claude Code.",
+  "owner": {
+    "name": "Mark Labrecque",
+    "email": "mark@affinitybridge.com"
+  },
+  "plugins": [
+    {
+      "name": "orchestration",
+      "source": "./",
+      "description": "Run coding tickets end to end: one worktree and headless orchestrator session per ticket, a TDD stage-agent pipeline, squash-merge on green CI, and SQLite state that survives crashes."
+    }
+  ]
+}

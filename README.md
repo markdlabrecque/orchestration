@@ -39,6 +39,7 @@ Run coding tickets end to end. A main orchestrator gives each ticket its own wor
 | `scripts/orch-project.sh` | Shared project-root resolver the shell engines source |
 | `agents/` | Stage agents: `test-writer`, `implementor`, `reviewer`, `verifier`, `reporter` (spawned as `orchestration:<name>`; plain `<name>` on Codex) |
 | `scripts/orch` | State CLI, Python 3.9+ standard library only |
+| `scripts/install-local` | Installs or refreshes this checkout in Claude Code, Codex and Pi |
 | `scripts/codex-agents` | Writes the stage agents to `~/.codex/agents` for Codex |
 | `hooks/hooks.json` | Reports each session's activity to `orch` (Claude Code and Codex) |
 | `pi/extension.ts`, `package.json` | Pi package: the same hooks, plus the stage agents for the `subagents` extension |
@@ -78,10 +79,12 @@ Every key resolves the same way: environment variable, then `.orch`, then the de
 
 The skill is user-invoked only on every harness. Ticket sessions run on the harness the main orchestrator runs on; `ORCH_HARNESS` overrides the detection.
 
-| Harness | Install | Start it |
-|---|---|---|
-| Claude Code | `/plugin marketplace add <this marketplace>`, then `/plugin install orchestration@affinity-bridge-skills` | `/orchestration` |
-| Pi | `pi install <checkout>/orchestration` (needs the `subagents` extension for stage agents). Stage agents run on `openai-codex` models by tier; set `pi_models` in `~/.config/orchestration/config.json` to use other providers | `/skill:orchestration` |
-| Codex | `codex plugin marketplace add <checkout>`, `codex plugin add orchestration@affinity-bridge-skills`, then `<checkout>/orchestration/scripts/codex-agents`. Ticket sessions enable hooks themselves (`--enable hooks`) | `$orchestration:orchestration` |
+Run `scripts/install-local` from this checkout. It installs the plugin in every harness on `PATH` (or only the ones you name: `scripts/install-local codex`), and removes older installs from other marketplaces. Re-run it after every change, then restart open sessions. Claude Code and Codex install a copy, so they need the re-run; Pi loads the checkout in place.
 
-Codex installs a copy of the plugin: run `codex plugin add` again after updating it, and `codex-agents` again after the agents change. Check a machine with `orch selftest` on each harness you use.
+| Harness | What the script does | Start it |
+|---|---|---|
+| Claude Code | Adds this checkout as the `orchestration` marketplace and installs `orchestration@orchestration` | `/orchestration` |
+| Pi | `pi install <checkout>` (needs the `subagents` extension for stage agents). Stage agents run on `openai-codex` models by tier; set `pi_models` in `~/.config/orchestration/config.json` to use other providers | `/skill:orchestration` |
+| Codex | Adds this checkout as the `orchestration` marketplace, installs `orchestration@orchestration`, then runs `scripts/codex-agents`. Ticket sessions enable hooks themselves (`--enable hooks`) | `$orchestration:orchestration` |
+
+Check a machine with `orch selftest` on each harness you use.

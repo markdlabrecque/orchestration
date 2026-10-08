@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Install or refresh this checkout of the plugin in Claude Code, Codex and Pi.
+#
+#     install-local [claude|codex|pi ...]    # default: every harness on PATH
+#
+# Safe to re-run after every change. Claude Code and Codex install a copy, so
+# each run reinstalls from this checkout; Pi loads the checkout in place.
+# Restart open sessions to pick up the new copy.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+MARKET=orchestration
+PLUGIN="orchestration@$MARKET"
+# Earlier installs of this plugin from other marketplaces; removed so only
+# this checkout is active.
+OLD_PLUGINS=(orchestration@affinity-bridge-skills orchestration@marks-personal-plugins)
+OLD_PI_SOURCES=("$HOME/Projects/claude-code-marketplace/orchestration")
+
+say() { printf '\n== %s\n' "$*"; }
+
+install_claude() {
+  say "Claude Code"
+  local old
+  for old in "${OLD_PLUGINS[@]}"; do
+    claude plugin uninstall "$old" --scope user >/dev/null 2>&1 && echo "removed $old" || true
+  done
+  if ! claude plugin marketplace list | grep -q "($ROOT)"; then
+    claude plugin marketplace add "$ROOT"
+  fi
+  claude plugin marketplace update "$MARKET"
+  # Reinstall rather than update: the cache is keyed by version, so an
+  # unbumped version would keep the old copy.
+  claude plugin uninstall "$PLUGIN" --scope user >/dev/null 2>&1 || true
+  claude plugin install "$PLUGIN" --scope user
+}
+
+install_codex() {
+  say "Codex"
+  local old
+  # `codex plugin remove` succeeds even when nothing is installed.
+  for old in "${OLD_PLUGINS[@]}"; do
+    grep -qF "[plugins.\"$old\"]" "${CODEX_HOME:-$HOME/.codex}/config.toml" 2>/dev/null || continue
+    codex plugin remove "$old" >/dev/null && echo "removed $old"
+  done
+  if ! codex plugin marketplace list | grep -q "^$MARKET "; then
+    codex plugin marketplace add "$ROOT"
+  fi
+  codex plugin remove "$PLUGIN" >/dev/null 2>&1 || true
+  codex plugin add "$PLUGIN"
+  "$ROOT/scripts/codex-agents"
+}
+
+install_pi() {
+  say "Pi"
+  local old
+  for old in "${OLD_PI_SOURCES[@]}"; do
+    pi remove "$old" >/dev/null 2>&1 && echo "removed $old" || true
+  done
+  if pi list | grep -qx "    $ROOT"; then
+    echo "already loads $ROOT in place"
+  else
+    pi install "$ROOT"
+  fi
+}
+
+harnesses=("$@")
+if [ ${#harnesses[@]} -eq 0 ]; then
+  for h in claude codex pi; do
+    command -v "$h" >/dev/null && harnesses+=("$h")
+  done
+fi
+
+for h in "${harnesses[@]}"; do
+  case "$h" in
+    claude|codex|pi) "install_$h" ;;
+    *) echo "unknown harness: $h (use claude, codex or pi)" >&2; exit 2 ;;
+  esac
+done
+
+say "Done. Restart open sessions, then run \`orch selftest\` on each harness."
