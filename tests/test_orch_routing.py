@@ -853,6 +853,12 @@ if "--session-id" in a and os.path.realpath(os.getcwd()) == %(root)r:
 class SmokeRoutingTests(AdapterTestCase):
     def setUp(self):
         super().setUp()
+        # Exercise Claude's project-key encoding with both punctuation and space.
+        root = os.path.join(self.projects, "proj_a b")
+        os.rename(self.root, root)
+        self.root = root
+        self.repo = os.path.join(self.root, "code", "main")
+        self.state_dir = os.path.join(self.root, ".agents", "orchestration")
         self.claude_dir = os.path.join(self.tmp, "claude-config")
         os.makedirs(os.path.join(self.claude_dir, "projects"))
         self.env["CLAUDE_CONFIG_DIR"] = self.claude_dir
@@ -866,6 +872,9 @@ class SmokeRoutingTests(AdapterTestCase):
         return self._script("fake-smoke-claude", src)
 
     def test_passes_when_the_transcript_model_matches(self):
+        for character in ("_", " "):
+            with self.subTest(project_basename_character=character):
+                self.assertIn(character, os.path.basename(os.path.realpath(self.root)))
         self.env["ORCH_CLAUDE_BIN"] = self.smoke_claude()
         p = self.ok("smoke-routing", timeout=120)
         for word in ("haiku/high", "fable/high", "claude-haiku-5-5/high",
