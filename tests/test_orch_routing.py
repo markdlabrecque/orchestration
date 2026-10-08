@@ -56,6 +56,61 @@ class RoutingTestCase(OrchTestCase):
         self.db_exec("UPDATE tickets SET harness=? WHERE id=?", (harness, ticket))
 
 
+class JsonPlacementTests(RoutingTestCase):
+    def snapshot(self):
+        return {table: self.db_exec("SELECT * FROM %s ORDER BY seq" % table)
+                for table in ("runs", "events")}
+
+    def assert_placements(self, command, expected):
+        before = self.snapshot()
+        for args in (("--json", *command), (*command, "--json"),
+                     ("--json", *command, "--json")):
+            with self.subTest(args=args):
+                # Use raw stdout: j() appends --json and would mask the defect.
+                obj = json.loads(self.ok(*args).stdout)
+                self.assertEqual(obj, expected)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_route_json_placements_and_plain_text_are_read_only(self):
+        self.add("t1")
+        before = self.snapshot()
+        self.assert_placements(("route", "t1", "--role", "implementor"),
+                               {"tier": "standard", "model": "sonnet",
+                                "effort": "low", "floors": []})
+        text = self.ok("route", "t1", "--role", "implementor").stdout
+        self.assertEqual(text.splitlines(), ["sonnet", "tier: standard", "effort: low"])
+        self.assertEqual(self.snapshot(), before)
+
+    def test_empty_runs_json_placements_and_plain_table_are_read_only(self):
+        self.add("t1")
+        self.assert_runs_output([])
+
+    def test_populated_runs_json_placements_and_plain_table_are_read_only(self):
+        self.add("t1")
+        row = json.loads(self.ok("run", "t1", "--role", "test-writer",
+                                 "--model", "sonnet", "--effort", "high", "--json").stdout)
+        self.assertEqual((row["role"], row["tier"], row["model_requested"],
+                          row["effort_requested"], row["effort_resolved"]),
+                         ("test-writer", "standard", "sonnet", "high", None))
+        self.assertEqual(len(self.snapshot()["runs"]), 1)
+        self.assert_runs_output([row])
+
+    def assert_runs_output(self, rows):
+        before = self.snapshot()
+        self.assert_placements(("runs", "t1"), {"runs": rows})
+        lines = self.ok("runs", "t1").stdout.splitlines()
+        self.assertEqual(lines[0].split("\t"),
+                         ["SEQ", "ROLE", "TIER", "REQUESTED", "EFFORT", "RESOLVED",
+                          "EFFORT_RESOLVED", "MATCH", "BOUNCES", "AGENT", "REQUESTED_AT"])
+        fields = ("seq", "role", "tier", "model_requested", "effort_requested",
+                  "model_resolved", "effort_resolved", "match", "bounce_count",
+                  "agent_id", "requested_at")
+        self.assertEqual([line.split("\t") for line in lines[1:]],
+                         [[str("-" if row[key] is None else row[key]) for key in fields]
+                          for row in rows])
+        self.assertEqual(self.snapshot(), before)
+
+
 class RouteTests(RoutingTestCase):
     def test_role_defaults(self):
         self.add("t1")
