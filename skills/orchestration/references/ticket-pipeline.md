@@ -51,8 +51,8 @@ Verifier findings go through the same fix-now / follow-up triage as review findi
 Every stage dispatch (and any investigation or filing subagent) runs on the model `orch` picks. Never choose one yourself, and never dispatch without a recorded run.
 
 1. `orch route <ticket> --role <role> [--files N] [--lines N] [--ambiguous]`. Roles: `test-writer`, `implementor`, `reviewer`, `verifier`, `reporter`, `investigation`, `filer`.
-2. `orch run <ticket> --role <role> --model <tier> --effort <effort>` with the `tier` and `effort` `route` printed and the same flags. Pass the tier, not the model: on Pi and Codex two tiers can share a model, and the bare model reads as the lower one. A refusal (exit 3) means the value is below the floor: use what `route` printed.
-3. Dispatch with that value. Claude: the Agent tool's `model` and `effort`. Pi: `model` and `thinking` on the `subagent` call. Codex: spawn the printed `agent` type (its file carries the model and effort).
+2. `orch run <ticket> --role <role> --model <tier> --effort <effort>` with the `tier` and `effort` `route` printed and the same flags. Pass the tier to preserve its identity in the run record: on Pi and Codex two tiers can share a model, and the bare model reads as the lower one. Replaying the printed tier and effort with unchanged ticket state and flags satisfies the floor; changed state or flags can still cause a refusal. Read any refusal and respect it; never work around it.
+3. Dispatch using the preceding `route` output, not the tier passed to `run`. Claude: pass the printed model and `effort` to the Agent tool. Pi: pass the printed model and `thinking` on the `subagent` call. Codex: spawn the printed `agent` type where available; its file carries the model and effort. Roles without per-rung agents have no printed `agent`; do not invent an agent name.
 
 Flags:
 
