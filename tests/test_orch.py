@@ -10,6 +10,7 @@ import json
 import os
 import re
 import select
+import selectors
 import shutil
 import signal
 import sqlite3
@@ -1182,6 +1183,95 @@ class StateMdTests(OrchTestCase):
 
     SKELETON = "# proj orchestration state\n\n## Notes\n\n## Activity\n\n"
 
+    READY_TIMEOUT = 30.0
+    CLEANUP_TIMEOUT = 2.0
+
+    def cleanup_children(self, procs):
+        """Stop the whole group before bounded raw output collection and reaping."""
+        errors = []
+        output = [[bytearray(), bytearray()] for p in procs]
+        for p in procs:
+            try:
+                if p.poll() is None:
+                    p.kill()
+            except OSError as exc:
+                errors.append(str(exc))
+        deadline = time.monotonic() + self.CLEANUP_TIMEOUT
+        try:
+            with selectors.DefaultSelector() as selector:
+                for i, p in enumerate(procs):
+                    for stream_index, pipe in enumerate((p.stdout, p.stderr)):
+                        if pipe is not None and not pipe.closed:
+                            os.set_blocking(pipe.fileno(), False)
+                            selector.register(pipe, selectors.EVENT_READ, (i, stream_index))
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        errors.append("output collection timeout")
+                        break
+                    for key, _ in selector.select(remaining):
+                        data = os.read(key.fd, 65536)
+                        if data:
+                            i, stream_index = key.data
+                            output[i][stream_index].extend(data)
+                        else:
+                            selector.unregister(key.fileobj)
+        except Exception as exc:
+            errors.append(str(exc))
+        finally:
+            for p in procs:
+                try:
+                    p.wait(timeout=max(0, deadline - time.monotonic()))
+                except Exception as exc:
+                    errors.append(str(exc))
+                finally:
+                    for pipe in (p.stdout, p.stderr):
+                        if pipe is not None:
+                            try:
+                                pipe.close()
+                            except Exception as exc:
+                                errors.append(str(exc))
+        return output, errors
+
+    def wait_for_ready(self, procs, timeout=READY_TIMEOUT):
+        """Require exact handshakes under one deadline, without buffered reads."""
+        observed = [bytearray() for p in procs]
+        pending = set(range(len(procs)))
+        deadline = time.monotonic() + timeout
+        try:
+            with selectors.DefaultSelector() as selector:
+                for i, p in enumerate(procs):
+                    selector.register(p.stdout, selectors.EVENT_READ, i)
+                while pending:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise AssertionError("readiness timeout after %s seconds; pending %s" %
+                                             (timeout, sorted(pending)))
+                    for key, _ in selector.select(remaining):
+                        i = key.data
+                        data = os.read(key.fd, 65536)
+                        observed[i].extend(data)
+                        if not data:
+                            raise AssertionError("readiness eof child index %s PID %s" %
+                                                 (i, procs[i].pid))
+                        if not b"ready\n".startswith(observed[i]):
+                            raise AssertionError("malformed readiness child index %s PID %s" %
+                                                 (i, procs[i].pid))
+                        if observed[i] == b"ready\n":
+                            pending.remove(i)
+                            selector.unregister(key.fileobj)
+        except BaseException as primary:
+            output, errors = self.cleanup_children(procs)
+            details = []
+            for i, p in enumerate(procs):
+                details.append("child index %s PID %s observed stdout=%r stderr=%r returncode=%r" %
+                               (i, p.pid, bytes(observed[i]) + bytes(output[i][0]),
+                                bytes(output[i][1]), p.returncode))
+            if isinstance(primary, AssertionError):
+                raise AssertionError("%s; %s; cleanup errors=%r" %
+                                     (primary, "; ".join(details), errors)) from primary
+            raise
+
     def run_parallel_appends(self, initial):
         """N real processes append while the parent holds LOCK_EX; none may
         write until it lets go, and the result must be whole lines."""
@@ -1204,12 +1294,11 @@ class StateMdTests(OrchTestCase):
             with open(path, "rb") as held:
                 fcntl.flock(held, fcntl.LOCK_EX)
                 try:
-                    procs = [subprocess.Popen([sys.executable, "-c", child, ORCH, root, str(i)],
-                                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                              text=True)
-                             for i in range(n)]
-                    for p in procs:
-                        self.assertEqual(p.stdout.readline(), "ready\n")
+                    for i in range(n):
+                        procs.append(subprocess.Popen(
+                            [sys.executable, "-c", child, ORCH, root, str(i)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+                    self.wait_for_ready(procs)
                     time.sleep(0.5)
                     with open(path, newline="") as f:
                         self.assertEqual(f.read(), initial, "append did not wait for the lock")
@@ -1219,10 +1308,9 @@ class StateMdTests(OrchTestCase):
                 out, err = p.communicate(timeout=60)
                 self.assertEqual(p.returncode, 0, err)
         finally:
-            for p in procs:
-                if p.poll() is None:
-                    p.kill()
-                    p.wait()
+            _, errors = self.cleanup_children(procs)
+            if errors and sys.exc_info()[0] is None:
+                self.fail("child cleanup failed: %r" % errors)
         with open(path, newline="") as f:
             text = f.read()
         self.assertTrue(text.endswith("\n"))
