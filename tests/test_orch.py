@@ -661,22 +661,15 @@ class TransitionTests(OrchTestCase):
         self.ok("phase", "T-1", "ci")
 
     def test_review_cap(self):
+        # Review entries are history; only successful bounces consume the cap.
         self.dispatched("T-1")
         self.phases("T-1", "spec", "tests", "implement", "review")
-        self.assertEqual(self.show("T-1")["review_rounds"], 1)
-        self.phases("T-1", "fix", "review")
-        self.assertEqual(self.show("T-1")["review_rounds"], 2)
-        p = self.refused(3, "phase", "T-1", "fix")
-        self.assertRegex(p.stderr.lower(), r"follow.?up")
-        self.assertEqual(self.show("T-1")["phase"], "review")
-        self.ok("phase", "T-1", "verify")
+        for bounce in (1, 2, 3):
+            self.phases("T-1", "fix", "review")
+            self.assertEqual(self.show("T-1")["bounces"], bounce)
+        self.assertEqual(self.show("T-1")["review_rounds"], 4)
         self.refused(3, "phase", "T-1", "fix")
-        self.phases("T-1", "report", "mr", "ci")
-        self.ok("phase", "T-1", "fix")  # CI repair is never capped
-        self.ok("phase", "T-1", "ci")
-        self.ok("phase", "T-1", "fix")
-        self.ok("phase", "T-1", "ci")
-        self.assertEqual(self.show("T-1")["review_rounds"], 2)
+        self.assertEqual(self.show("T-1")["phase"], "review")
 
     def test_block_unblock_restores_prior_phase(self):
         self.dispatched("T-1")

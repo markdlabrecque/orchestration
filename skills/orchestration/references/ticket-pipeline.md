@@ -51,7 +51,7 @@ Verifier findings go through the same fix-now / follow-up triage as review findi
 Every stage dispatch (and any investigation or filing subagent) runs on the model `orch` picks. Never choose one yourself, and never dispatch without a recorded run.
 
 1. `orch route <ticket> --role <role> [--files N] [--lines N] [--ambiguous]`. Roles: `test-writer`, `implementor`, `reviewer`, `verifier`, `reporter`, `investigation`, `filer`.
-2. `orch run <ticket> --role <role> --model <tier> --effort <effort>` with the `tier` and `effort` `route` printed and the same flags. Pass the tier to preserve its identity in the run record: on Pi and Codex two tiers can share a model, and the bare model reads as the lower one. Replaying the printed tier and effort with unchanged ticket state and flags satisfies the floor; changed state or flags can still cause a refusal. Read any refusal and respect it; never work around it.
+2. `orch run <ticket> --role <role> --model <tier> --effort <effort>` with the `tier` and `effort` `route` printed and the same flags. Pass the tier to preserve its identity in the run record: on Pi and Codex two tiers can share a model, and the bare model reads as the lower one. Replaying the printed tier and effort with unchanged ticket state and flags satisfies the floor; changed state or flags can still cause a refusal. On refusal (exit 3), read the reason. For a below-floor value, retry with the appropriate route output for the current ticket state and flags. For unknown-history or frontier refusals, stop routing, recording and dispatching; retain the findings and explicitly `orch block` for a human as described below. Unknown history requires evidence-backed human reconciliation, not a retry. Never work around a refusal.
 3. Dispatch using the preceding `route` output, not the tier passed to `run`. Claude: pass the printed model and `effort` to the Agent tool. Pi: pass the printed model and `thinking` on the `subagent` call. Codex: spawn the printed `agent` type where available; its file carries the model and effort. Roles without per-rung agents have no printed `agent`; do not invent an agent name.
 
 Flags:
@@ -68,11 +68,19 @@ After each stage, `orch show <ticket>`. `model_mismatches` > 0 (a subagent ran o
 
 When `orch phase <ticket> fix` (or `orch route` for the implementor) is refused because the last implementor already ran at `frontier/high`, there is nothing higher: `orch block <ticket>` for a human with the findings as the reason.
 
-## Review history and approved repair budgets
+## Review history and durable repair budgets
 
 Entering `review` adds to `review_rounds`, the review-entry history. CI repairs (`ci → fix → ci`) don't count as review rounds.
 
-The approved policy allows three successful review/verification bounces per ticket and two separate CI repairs. Escalation and resume do not reset either budget. [Issue #12](https://github.com/markdlabrecque/orchestration/issues/12) owns implementation of these budgets and the before-dispatch refusal and human-blocking gates. They are not yet implemented in `cmd_phase`; this policy does not claim the current CLI enforces them. Exhausted budgets require a human stop with remaining findings recorded, not follow-ups followed by declaring unresolved work finished.
+`orch phase` permits three successful `review -> fix` or `verify -> fix` transitions combined, tracked by `bounces`, and two separate `ci -> fix` transitions, tracked by `ci_repairs`. Review entries are unlimited history, not repair slots. CI repair changes neither bounce count nor review-entry history and keeps normal default/floor routing. Other phase edges, route reads and run records consume neither budget. New tickets start at zero; escalation, fresh agents, restart, resume/attach and block/unblock never replenish either count.
+
+Before any fix dispatch, successfully enter `fix`, then record the implementor with `orch run`. The transition consumes its slot even if dispatch or the agent fails. Legal-edge and retired checks run first. For review/verify fixes, the three-bounce budget is checked before the frontier/high gate; frontier/high may stop earlier without consuming a slot. The review frontier gate does not apply to CI repairs. Phase, counters and one successful phase event commit atomically; refusals exit 3 without changing them.
+
+After a budget, unknown-history or frontier refusal, stop routing, recording and dispatching that fix. Record the remaining findings and explicitly `orch block <ticket> --reason "<gate>; findings: <link>"` for a human. Refusal does not itself change phase to blocked. Read-only routing cannot authorize dispatch after refusal. Follow-up tickets retain findings but cannot bypass the stop or justify finishing unresolved must-fix work.
+
+Use `orch show` on resume to inspect both durable counts. Legacy migration preserves existing bounces and run snapshots, reconstructs missing counts only from successful phase events with an initial creation event, a continuous phase chain and agreement with current phase, and retains over-cap values. Missing or detectably truncated history yields `null`, a durable unknown that refuses the relevant repair. Initialized values are not recomputed on subsequent opens. The checks cannot detect all history loss, including a removed complete round trip. Retain SQLite backups and tracker/session evidence, and stop for investigation if completeness is uncertain.
+
+No reset, override or reconciliation command is provided. Unknown history remains blocked until evidence-backed human reconciliation under separately authorized state maintenance recovers the actual count. Retain that count, the reasoning and supporting exports, backups, tracker links or session records in the tracker or durable evidence files, and link them in the block reason. Never assume zero or forgive attempts. See [orch-cli.md](orch-cli.md#durable-budgets-and-legacy-history) for migration and inspection details.
 
 ## Review findings: fix now or file a ticket
 
@@ -131,7 +139,7 @@ Ask once, two options max, with a recommendation. Once answered, run to the end.
 | Visible defect in this ticket's own output | Fix it. It's the deliverable. |
 | "Reviewer found a separate bug. File it?" | File it. Report the ID. |
 | "Run `ddev drush cim -y`? It wipes local drift." | Run it. The worktree's DDEV database is disposable. |
-| Approved repair budget exhausted with findings left | Record the findings and block for a human under the policy owned by [issue #12](https://github.com/markdlabrecque/orchestration/issues/12). |
+| Repair budget exhausted or history unknown | Stop before fix dispatch, retain findings and evidence, and explicitly `orch block` for a human. No reset or route-around dispatch. |
 
 An offer at the end of a message ("Want me to…", "Your call") is a stop in disguise. Either do the thing or drop the sentence.
 

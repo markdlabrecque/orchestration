@@ -98,9 +98,20 @@ ci         -> fix | mr
 
 - Entering `review` adds 1 to `review_rounds`.
 - CI repairs do not count as review rounds. `fix -> ci` returns straight to CI after such a repair.
-- The approved repair budgets are three successful review/verification bounces and two separate CI repairs per ticket, without resets on escalation or resume. [Issue #12](https://github.com/markdlabrecque/orchestration/issues/12) owns their implementation and human-blocking gates. These budgets are not yet implemented in `cmd_phase`; do not treat the current refusal behavior as the approved policy.
-- `review -> fix` and `verify -> fix` add 1 to `bounces` (`ci -> fix` does not). They are refused (exit 3) when the ticket's last implementor run was at `frontier`/`high`: there is no higher rung, and the message says to `orch block` the ticket for a human.
+- `review -> fix` and `verify -> fix` share three successful bounces per ticket, persisted in `bounces`. A fourth exits 3 before dispatch. Budget exhaustion is checked before the last-implementor `frontier/high` gate, which may refuse earlier without consuming a bounce. Review entries have no cap.
+- `ci -> fix` consumes one of two independent repairs, persisted in `ci_repairs`; a third exits 3. It changes neither `bounces` nor `review_rounds` and is not subject to the review frontier gate. `fix -> ci` consumes nothing.
+- A successful repair transition consumes its slot even if dispatch never happens or the agent fails. Phase, counters and one phase event commit together under `BEGIN IMMEDIATE`. Illegal or retired transitions are checked first. Refusal leaves state and successful event history unchanged; it does not automatically block.
+- After refusal, stop routing, recording and dispatching the requested fix. Retain the findings and explicitly `orch block <ticket> --reason "<budget or frontier gate>; findings: <link>"` for a human. A route read is not permission to bypass refusal. Follow-ups do not authorize declaring unresolved must-fix work complete.
+- Neither budget resets on escalation, new agents, restart, resume/attach, block/unblock, or other phase edges. Routes and run records do not consume either budget. Record each implementor through `orch run` before dispatch; its `bounce_count` remains the current bounce snapshot.
 - `done` is reachable only through `orch merged`.
+
+## Durable budgets and legacy history
+
+SQLite is authoritative. `orch show` exposes `bounces` and `ci_repairs` in text and JSON; JSON `null` means unknown, not zero. New tickets start with both counts known at zero. Existing bounce counts, review-entry history and run snapshots are preserved exactly, including over-cap counts.
+
+On first addition of a missing budget column, a transactional migration counts successful `kind=phase` transitions into `fix` from the relevant origins. It requires an initial `add` event into `ready`, a continuous recorded phase chain and agreement with the current phase. Missing or detectably truncated history produces a durable unknown count. Later opens do not repeat migration or recalculate initialized counts downward. Pre-bounces databases use the same history checks for review/verify bounces. Complete history with no repairs establishes zero.
+
+These checks cannot detect every loss, such as removal of an entire round trip that leaves a continuous chain. Preserve database backups and external tracker/session evidence. If history is known or suspected to be incomplete, stop for human investigation before requesting repair; do not treat an apparently reconstructed zero as proof against that evidence. Unknown counts refuse the relevant repair until evidence-backed human reconciliation. An unknown bounce count also refuses every `orch run` with exit 3 because a dispatch snapshot cannot record unknown as zero or NULL. There is no reconciliation, reset or override CLI command. Keep the ticket blocked pending separately authorized state maintenance that recovers the actual count, never forgives attempts. Retain the recovered count, the reasoning and supporting event exports, backups, tracker links or session records in the tracker or durable evidence files; link those records in the block reason. The CLI does not itself collect or validate external reconciliation evidence.
 
 ## Session health
 
@@ -202,8 +213,10 @@ Every role starts at effort `low`; bumps below change the tier, not the effort.
 
 1. `--ambiguous`: one tier up.
 2. `--files N` > 5 or `--lines N` > 300: `investigation` and `reviewer` one tier up (other roles ignore the size).
-3. Floors from the ticket's runs: an implementor after a bounce (the ticket's `bounces` grew since the last implementor run, or the ticket is in `review`/`verify`) runs one rung above the last implementor run (effort first, then tier: `standard/low` -> `standard/high` -> `heavy/low`), and is refused (exit 3, "block") when that was `frontier/high`; a reviewer runs at least one tier below the last implementor; every role runs at least one tier below the highest tier on the ticket (no mid-ticket de-escalation).
+3. Floors from the ticket's runs: an implementor after a bounce (the ticket's `bounces` grew since the last implementor run) runs one rung above the last implementor run (effort first, then tier: `standard/low` -> `standard/high` -> `heavy/low`), and is refused (exit 3, "block") when that was `frontier/high`; a reviewer runs at least one tier below the last implementor; every role runs at least one tier below the highest tier on the ticket (no mid-ticket de-escalation).
 4. Everything caps at `frontier/high`.
+
+Enter `fix` successfully before routing or recording the repair dispatch. Merely being in `review` or `verify` does not add a rung; the successful review/verify-to-fix transition increases `bounces`. The phase command's last-implementor `frontier/high` gate remains separate from routing floors and can refuse that transition before dispatch.
 
 A CI repair (`ci -> fix`) is not a bounce and adds no bounce rung. It leaves `bounces` and `review_rounds` unchanged; entering `review` still adds to review-entry history. The repair uses the normal role default and applicable floors, including highest recorded tier minus one. With `heavy` as the highest recorded tier, a last implementor run that recorded the current bounce count, and no other escalation, the CI-repair implementor routes at `standard/low`. This is not an unconditional standard route and does not retain the previous effort. Review/verification bounces still trigger the effort-first escalation above.
 

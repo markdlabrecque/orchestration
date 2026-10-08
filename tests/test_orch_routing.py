@@ -116,8 +116,6 @@ class RouteTests(RoutingTestCase):
         self.assertTrue(any("one rung above" in w and "standard/low" in w
                             for w in r["floors"]), r["floors"])
         self.log_run("t1", "implementor", "sonnet", effort="high")
-        # The review cap (2 rounds) would refuse a second bounce; reset it.
-        self.db_exec("UPDATE tickets SET review_rounds=0 WHERE id=?", ("t1",))
         self.phases("t1", "review", "fix")
         r = self.route("t1", "implementor")
         self.assertEqual((r["tier"], r["model"], r["effort"]), ("heavy", "opus", "low"))
@@ -153,8 +151,6 @@ class RouteTests(RoutingTestCase):
         r = self.route("t1", "implementor", "--ambiguous")
         self.assertEqual((r["tier"], r["model"], r["effort"]), ("frontier", "fable", "low"))
         self.log_run("t1", "implementor", "fable")
-        # The review cap (2 rounds) would refuse a second bounce; reset it.
-        self.db_exec("UPDATE tickets SET review_rounds=0 WHERE id=?", ("t1",))
         self.phases("t1", "review", "fix")
         r = self.route("t1", "implementor")
         self.assertEqual((r["tier"], r["model"], r["effort"]), ("frontier", "fable", "high"))
