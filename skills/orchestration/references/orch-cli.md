@@ -187,10 +187,10 @@ For `desktop`, `spawn` and `resume` exit 0 and print `{"action": "desktop_start"
 
 | Tier | Claude (Agent tool `model`) | Codex (agent file model) | Pi (`subagent` call model) |
 |---|---|---|---|
-| `light` | `haiku` | `gpt-6-luna` | `openai-codex/gpt-6-luna` |
-| `standard` | `sonnet` | `gpt-6.1-sol` | `openai-codex/gpt-6.1-sol` |
-| `heavy` | `opus` | `gpt-6-astra` | `openai-codex/gpt-6-astra` |
-| `frontier` | `fable` | `gpt-6-astra` | `openai-codex/gpt-6-astra` |
+| `light` | `haiku` | `gpt-6-luna` | `openai/gpt-6-luna` |
+| `standard` | `sonnet` | `gpt-6.1-sol` | `openai/gpt-6.1-sol` |
+| `heavy` | `opus` | `gpt-6-astra` | `openai/gpt-6-astra` |
+| `frontier` | `fable` | `gpt-6-astra` | `openai/gpt-6-astra` |
 
 Each tier has two effort rungs, `low` and `high`, one word on every harness: Claude Agent tool `effort`, Codex `model_reasoning_effort`, Pi `thinking`. The tier picks the model, the effort the rung. Rungs form one ladder: `light/low` < `light/high` < `standard/low` < ... < `frontier/low` < `frontier/high` (the top).
 

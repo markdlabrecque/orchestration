@@ -122,10 +122,10 @@ const PI_TOOLS: Record<string, string[]> = {
 // as scripts/codex-agents). `orch route` prints them per dispatch; the machine config's `pi_models` overrides the models, keyed by
 // tier or by the old Claude names (haiku, sonnet, opus).
 export const PI_MODELS: Record<string, string> = {
-	light: "openai-codex/gpt-6-luna",
-	standard: "openai-codex/gpt-6.1-sol",
-	heavy: "openai-codex/gpt-6-astra",
-	frontier: "openai-codex/gpt-6-astra",
+	light: "openai/gpt-6-luna",
+	standard: "openai/gpt-6.1-sol",
+	heavy: "openai/gpt-6-astra",
+	frontier: "openai/gpt-6-astra",
 };
 // Thinking level per effort rung (scripts/orch PI_THINKING).
 export const PI_THINKING: Record<string, string> = { low: "low", high: "high" };
