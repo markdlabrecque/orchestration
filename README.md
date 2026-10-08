@@ -67,9 +67,10 @@ Each project lives in its own folder under `~/Projects` (`ORCH_PROJECTS_DIR` ove
     └── <id>/                ticket worktrees; DDEV name: <id>-<PROJECT_NAME>
 ```
 
-1. Make `~/Projects/<project>/code/` and clone the repository into it.
-2. Run the `setup-project` skill from anywhere in the project folder. It writes `.orch` with every default filled in: `PROJECT_NAME` (the folder's name), `MAIN_CHECKOUT`, `WORKTREE_ROOT` (`code`), `BASE_BRANCH` (from `origin/HEAD`) and `ACCESSIBILITY_TESTS=false`.
-3. Check `BASE_BRANCH`. Ticket worktrees are cut from it and MRs squash-merge into it.
+1. Start with either a repository cloned inside `~/Projects/<project>/code/`, or an existing checkout at `~/Projects/<project>/` with a real `.git` directory.
+2. Run the `setup-project` skill. For a root checkout, the agent explains the move and asks for explicit confirmation before any mutation. Approval allows `setup-project.sh --relocate-checkout`, invoked at the project root, to move the checkout into `code/main`. This preserves Git history, the current branch, hidden and untracked entries, and symlinks. The outer folder keeps its name and retains `.orch` and `.agents` state. Declining or withholding confirmation leaves everything unchanged. Any existing `code` entry causes refusal; linked worktrees with a `.git` file are not relocated.
+3. For an already arranged checkout inside `code/`, setup runs from anywhere inside the project without relocation. It writes `.orch` with every default filled in: `PROJECT_NAME`, `MAIN_CHECKOUT`, `WORKTREE_ROOT=code`, `BASE_BRANCH` from `origin/HEAD`, and `ACCESSIBILITY_TESTS=false`. Existing `.orch` requires separate overwrite approval and `--force`; that flag never authorizes relocation.
+4. Check `BASE_BRANCH`. If `origin/HEAD` is unavailable, setup warns and leaves it empty. Ticket worktrees are cut from this branch and MRs squash-merge into it.
 
 Set `ACCESSIBILITY_TESTS=true` in `.orch` to have the verifier run an automated accessibility scan (axe) on every screen a ticket changes. Any other value means off.
 
