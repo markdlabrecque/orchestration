@@ -73,6 +73,8 @@ Each project lives in its own folder under `~/Projects` (`ORCH_PROJECTS_DIR` ove
 
 Set `ACCESSIBILITY_TESTS=true` in `.orch` to have the verifier run an automated accessibility scan (axe) on every screen a ticket changes. Any other value means off.
 
+`<project root>/STATE.md` is a human-readable log the orchestrator creates on first use, with a `## Notes` section for your own text and a `## Activity` section. `orch` only ever appends lines to the end of the file, never rewriting what is there: `- <UTC timestamp> #<ticket> <event>` for `picked up` (spawn, and resume as `picked up: attempt <n>`), `blocked: <reason>` and `completed: <MR link or sha>` (`orch merged --mr <url>`). When `ORCH_HOME` is set and no project folder resolves, it is written there instead.
+
 Every key resolves the same way: environment variable, then `.orch`, then the default. Relative paths in `.orch` resolve against the project root.
 
 ## Install and invoke

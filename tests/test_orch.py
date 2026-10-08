@@ -1090,5 +1090,123 @@ class HardeningTests(OrchTestCase):
             con.close()
 
 
+class StateMdTests(OrchTestCase):
+    """STATE.md activity log in the project root (append-only)."""
+
+    LINE = re.compile(r"^- (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)Z? (#\S+) (.*)$")
+
+    def setUp(self):
+        super().setUp()
+        self.init()
+        self.state_md = os.path.join(self.root, "STATE.md")
+
+    def md(self):
+        with open(self.state_md, newline="") as f:
+            return f.read()
+
+    def events_logged(self):
+        """(ticket, text) for each activity line; asserts each is well formed."""
+        out = []
+        for line in self.md().splitlines():
+            if not line.startswith("- "):
+                continue
+            m = self.LINE.match(line)
+            self.assertIsNotNone(m, "malformed activity line: %r" % line)
+            out.append((m.group(2), m.group(3)))
+        return out
+
+    def test_lifecycle_lines_in_order_and_add_writes_nothing(self):
+        self.add("T-1")
+        self.assertFalse(os.path.exists(self.state_md), "orch add must not log")
+        self.spawn("T-1", sleep=0)
+        self.wait_dead("T-1")
+        self.ok("resume", "T-1")
+        self.wait_dead("T-1")
+        self.ok("block", "T-1", "--reason", "needs input")
+        self.ok("unblock", "T-1")
+        self.phases("T-1", "spec", "tests", "implement", "review", "verify",
+                    "report", "mr", "ci")
+        self.ok("ci", "T-1", "--sha", "abc123", "--passed")
+        self.ok("merged", "T-1", "--sha", "abc123",
+                "--mr", "https://example.com/mr/9")
+        self.assertEqual(self.events_logged(), [
+            ("#T-1", "picked up"),
+            ("#T-1", "picked up: attempt 2"),
+            ("#T-1", "blocked: needs input"),
+            ("#T-1", "completed: https://example.com/mr/9"),
+        ])
+        head = self.md().split("## Activity")[0]
+        self.assertTrue(head.startswith("# proj orchestration state\n\n## Notes\n"))
+
+    def test_merged_without_mr_logs_sha(self):
+        self.to_ci("T-1")
+        self.ok("ci", "T-1", "--sha", "abc123", "--passed")
+        self.ok("merged", "T-1", "--sha", "abc123")
+        self.assertEqual(self.events_logged()[-1], ("#T-1", "completed: abc123"))
+
+    def test_existing_notes_preserved_and_appended_only(self):
+        original = ("# proj orchestration state\n\n## Notes\n\n"
+                    "Hand written: keep me.\n  odd   spacing\n\nextra line\n"
+                    "## Activity\n\n- 2020-01-01T00:00:00Z #OLD picked up\n")
+        with open(self.state_md, "w", newline="") as f:
+            f.write(original)
+        self.add("T-1")
+        self.ok("block", "T-1", "--reason", "r1")
+        after1 = self.md()
+        self.assertTrue(after1.startswith(original))
+        self.ok("unblock", "T-1")
+        self.ok("block", "T-1", "--reason", "r2")
+        after2 = self.md()
+        self.assertTrue(after2.startswith(after1))
+        self.assertEqual(len(after2.splitlines()) - len(original.splitlines()), 2)
+
+    def test_existing_file_without_trailing_newline(self):
+        with open(self.state_md, "w", newline="") as f:
+            f.write("# proj orchestration state\n\n## Notes\n\n## Activity\n\n- old line")
+        self.add("T-1")
+        self.ok("block", "T-1", "--reason", "why")
+        lines = self.md().splitlines()
+        self.assertEqual(lines[-2], "- old line")
+        self.assertRegex(lines[-1], r"^- \S+ #T-1 blocked: why$")
+
+    def test_parallel_appends_are_intact(self):
+        """state_md_append from many real processes, SQLite uninvolved."""
+        n = 24
+        root = os.path.join(self.tmp, "lockroot")
+        os.makedirs(root)
+        go = os.path.join(root, "go")
+        child = (
+            "import sys, os, time\n"
+            "from importlib.machinery import SourceFileLoader\n"
+            "m = SourceFileLoader('orch_mod', sys.argv[1]).load_module()\n"
+            "root, go, i = sys.argv[2], sys.argv[3], sys.argv[4]\n"
+            "def slow_open(*a, **k):\n"  # widen the open -> size-check window
+            "    f = open(*a, **k)\n"
+            "    time.sleep(0.2)\n"
+            "    return f\n"
+            "m.open = slow_open\n"
+            "while not os.path.exists(go):\n"
+            "    time.sleep(0.001)\n"
+            "m.state_md_append(root, '- 2026-01-01T00:00:00Z #T-%s blocked: reason %s' % (i, i))\n")
+        procs = [subprocess.Popen([sys.executable, "-c", child, ORCH, root, go, str(i)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 for i in range(n)]
+        time.sleep(1)
+        open(go, "w").close()
+        for p in procs:
+            out, err = p.communicate(timeout=60)
+            self.assertEqual(p.returncode, 0, err)
+        with open(os.path.join(root, "STATE.md")) as f:
+            text = f.read()
+        self.assertEqual(text.count("## Activity"), 1)
+        self.assertEqual(text.count("## Notes"), 1)
+        lines = [l for l in text.splitlines() if l.startswith("- ")]
+        self.assertEqual(len(lines), n)
+        for l in lines:
+            self.assertRegex(l, r"^- 2026-01-01T00:00:00Z #T-\d+ blocked: reason \d+$")
+        self.assertEqual(sorted(l.split()[2] for l in lines),
+                         sorted("#T-%d" % i for i in range(n)))
+
+
 if __name__ == "__main__":
     unittest.main()

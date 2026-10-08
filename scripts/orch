@@ -4,6 +4,7 @@
 import argparse
 import collections
 import contextlib
+import fcntl
 import glob
 import datetime
 import json
@@ -544,6 +545,45 @@ def ticket_dict(row, cfg, full=True, alive=None):
             "created_at": row["created_at"],
         })
     return d
+
+
+# ---- STATE.md activity log --------------------------------------------------
+
+def state_md_append(root, line):
+    """Append one activity line to <root>/STATE.md (append-only, flock'd);
+    creates the file with the Notes/Activity skeleton on first use."""
+    path = os.path.join(root, "STATE.md")
+    name = read_orch(root).get("PROJECT_NAME") or os.path.basename(root)
+    with open(path, "a+b") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            size = f.seek(0, os.SEEK_END)
+            if size == 0:
+                data = "# %s orchestration state\n\n## Notes\n\n## Activity\n\n" % name
+            else:
+                f.seek(-1, os.SEEK_END)
+                data = "" if f.read(1) == b"\n" else "\n"
+            f.write((data + line + "\n").encode("utf-8"))
+            f.flush()
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def state_md_log(tid, event):
+    """Log `event` for ticket `tid`; a failure only warns."""
+    if str(tid).startswith("selftest-"):
+        return
+    try:
+        try:
+            root = project_root()
+        except Refusal:
+            root = os.environ.get("ORCH_HOME")
+            if not root:
+                raise
+        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        state_md_append(root, "- %s #%s %s" % (ts, tid, " ".join(event.split())))
+    except (OSError, Refusal, subprocess.SubprocessError) as e:
+        print("orch: warning: could not write STATE.md: %s" % e, file=sys.stderr)
 
 
 def log_event(db, tid, kind, from_phase, to_phase, detail=None):
@@ -1587,14 +1627,24 @@ LAUNCH_COLUMNS = ("phase", "prior_phase", "platform", "pid", "pid_start",
                   "session_seen", "launch_ref", "launched_at", "worktree_ref", "harness")
 
 
+def log_picked_up(db, tid):
+    attempt = get_ticket(db, tid)["attempt"]
+    state_md_log(tid, "picked up" + (": attempt %d" % attempt if attempt > 1 else ""))
+
+
 def finish_launch(db, sdir, cfg, row, evs, platform, session, prompt_file,
                   desktop_action, marker):
     """Steps 2 and 3 of `spawn`/`resume` (step 1 is already committed; `row`
     is the ticket as it was before it). Clears `marker` whatever happens.
     Returns (output, is_action)."""
     try:
-        return launch_steps(db, sdir, cfg, row, evs, platform, session,
-                            prompt_file, desktop_action, marker)
+        result = launch_steps(db, sdir, cfg, row, evs, platform, session,
+                              prompt_file, desktop_action, marker)
+        log_picked_up(db, row["id"])
+        return result
+    except TrustBlocked:
+        log_picked_up(db, row["id"])  # the session started behind the dialog
+        raise
     finally:
         release_launch(db, row["id"], marker)
 
@@ -2105,6 +2155,7 @@ def cmd_block(args, db, sdir):
     db.execute("UPDATE tickets SET phase='blocked', prior_phase=? WHERE id=?",
                (cur, args.ticket))
     log_event(db, args.ticket, "block", cur, "blocked", args.reason)
+    state_md_log(args.ticket, "blocked: " + args.reason)
     emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
          "%s blocked (was %s)" % (args.ticket, cur))
 
@@ -2151,6 +2202,7 @@ def cmd_merged(args, db, sdir):
                       % (args.ticket, args.sha))
     db.execute("UPDATE tickets SET phase='done' WHERE id=?", (args.ticket,))
     log_event(db, args.ticket, "merged", "ci", "done", args.sha)
+    state_md_log(args.ticket, "completed: " + (args.mr or args.sha))
     emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
          "%s merged at %s" % (args.ticket, args.sha))
 
@@ -3221,6 +3273,7 @@ def build_parser():
     g.add_argument("--failed", action="store_true")
     sp = add("merged", cmd_merged, "ticket")
     sp.add_argument("--sha", required=True)
+    sp.add_argument("--mr")
     sp = add("retire", cmd_retire, "ticket")
     sp.add_argument("--force", action="store_true")
     sp.add_argument("--keep-worktree", action="store_true")
