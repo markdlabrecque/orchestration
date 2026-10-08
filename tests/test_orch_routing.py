@@ -238,6 +238,28 @@ class RouteTests(RoutingTestCase):
             json.dump({"pi_models": models}, f)
         self.assert_pi_tier_models(models)
 
+    def test_pi_opus_alias_survives_implementor_bounce_to_frontier(self):
+        cfg_dir = os.path.join(self.env["XDG_CONFIG_HOME"], "orchestration")
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "config.json"), "w") as f:
+            json.dump({"pi_models": {"opus": "venice/big"}}, f)
+        self.to_review("t1")
+        self.set_harness("t1", "pi")
+
+        r = self.route("t1", "implementor", "--ambiguous")
+        self.assertEqual((r["tier"], r["model"], r["effort"], r["thinking"]),
+                         ("heavy", "venice/big", "low", "low"))
+        # Record the tier explicitly because heavy and frontier share a model.
+        row = self.log_run("t1", "implementor", "heavy", effort="high")
+        self.assertEqual((row["tier"], row["model_requested"], row["effort_requested"]),
+                         ("heavy", "venice/big", "high"))
+        self.ok("phase", "t1", "fix")
+
+        r = self.route("t1", "implementor")
+        self.assertEqual((r["tier"], r["effort"], r["thinking"]),
+                         ("frontier", "low", "low"))
+        self.assertEqual(r["model"], "venice/big")
+
     def test_pi_models_override(self):
         cfg_dir = os.path.join(self.env["XDG_CONFIG_HOME"], "orchestration")
         os.makedirs(cfg_dir, exist_ok=True)
