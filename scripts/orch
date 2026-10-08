@@ -51,6 +51,9 @@ TRANSITIONS = {
     "ci": {"fix", "mr"},
 }
 
+PHASE_ORDER = ("spec", "tests", "implement", "review", "fix", "verify", "report",
+               "mr", "ci", "ready", "dispatched", "done", "blocked")
+
 REVIEW_CAP = 2
 # Ticket sessions run unattended: each harness skips its permission prompts by
 # default. Pi has none; `--approve` trusts the worktree's project resources
@@ -2258,7 +2261,7 @@ def cmd_merged(args, db, sdir):
                       % (args.ticket, args.sha))
     db.execute("UPDATE tickets SET phase='done' WHERE id=?", (args.ticket,))
     log_event(db, args.ticket, "merged", "ci", "done", args.sha)
-    state_md_log(args.ticket, "completed: " + (args.mr or args.sha))
+    state_md_log(args.ticket, "completed: " + (args.mr or "commit " + args.sha))
     emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
          "%s merged at %s" % (args.ticket, args.sha))
 
@@ -3634,14 +3637,30 @@ def cmd_hook(args):
 
 def build_parser():
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--json", action="store_true", help="print one JSON object")
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="print one JSON object")
     p = argparse.ArgumentParser(prog="orch", parents=[common],
                                 description="Orchestration state CLI")
     sub = p.add_subparsers(dest="cmd", metavar="command")
     sub.required = True
 
+    HELP = {
+        "init": "create the state directory", "platform": "show the detected platform",
+        "preflight": "check required tools", "add": "add a ticket",
+        "list": "list tickets", "show": "show one ticket", "next": "list ready tickets that fit the free worker slots",
+        "spawn": "start a ticket session", "resume": "resume a ticket session",
+        "attach": "attach a session to a ticket", "stale": "list stale tickets",
+        "hook": "harness hook entry point", "phase": "move a ticket to a phase",
+        "block": "block a ticket", "unblock": "unblock a ticket",
+        "ci": "record a CI result", "merged": "mark a ticket merged",
+        "retire": "retire a ticket's worktree", "events": "show a ticket's events",
+        "route": "pick a model for a role", "run": "record a subagent run",
+        "runs": "list a ticket's subagent runs", "smoke-routing": "smoke-test model routing",
+        "watch": "watch ticket state", "selftest": "run the end-to-end self test",
+    }
+
     def add(name, fn, *ticket_args):
-        sp = sub.add_parser(name, parents=[common])
+        sp = sub.add_parser(name, parents=[common], help=HELP[name])
         sp.set_defaults(fn=fn)
         for a in ticket_args:
             sp.add_argument(a)
@@ -3671,10 +3690,10 @@ def build_parser():
     add("stale", cmd_stale)
     add("hook", cmd_hook)
     sp = add("phase", cmd_phase, "ticket")
-    sp.add_argument("phase", choices=sorted(PHASE_STATUS))
+    sp.add_argument("phase", choices=PHASE_ORDER)
     sp.add_argument("--note")
     sp = add("block", cmd_block, "ticket")
-    sp.add_argument("--reason", required=True)
+    sp.add_argument("--reason", required=True, help="why it is blocked, recorded in STATE.md")
     add("unblock", cmd_unblock, "ticket")
     sp = add("ci", cmd_ci, "ticket")
     sp.add_argument("--sha", required=True)
@@ -3683,7 +3702,7 @@ def build_parser():
     g.add_argument("--failed", action="store_true")
     sp = add("merged", cmd_merged, "ticket")
     sp.add_argument("--sha", required=True)
-    sp.add_argument("--mr")
+    sp.add_argument("--mr", help="MR URL, recorded in STATE.md as the completed line (defaults to 'commit <sha>')")
     sp = add("retire", cmd_retire, "ticket")
     sp.add_argument("--force", action="store_true")
     sp.add_argument("--keep-worktree", action="store_true")
@@ -3722,6 +3741,7 @@ def main(argv=None):
         cmd_hook(None)
         return 0
     args = build_parser().parse_args(argv)
+    args.json = getattr(args, "json", False)
     try:
         if args.fn in NO_DB:
             return args.fn(args) or 0

@@ -1143,7 +1143,16 @@ class StateMdTests(OrchTestCase):
         self.to_ci("T-1")
         self.ok("ci", "T-1", "--sha", "abc123", "--passed")
         self.ok("merged", "T-1", "--sha", "abc123")
-        self.assertEqual(self.events_logged()[-1], ("#T-1", "completed: abc123"))
+        self.assertEqual(self.events_logged()[-1], ("#T-1", "completed: commit abc123"))
+
+    def test_json_flag_before_command(self):
+        self.add("T-1")
+        p = self.ok("--json", "block", "T-1", "--reason", "r")
+        try:
+            t = json.loads(p.stdout)
+        except ValueError:
+            self.fail("orch --json block did not print JSON: %r" % p.stdout)
+        self.assertEqual(t["phase"], "blocked")
 
     def test_existing_notes_preserved_and_appended_only(self):
         original = ("# proj orchestration state\n\n## Notes\n\n"
@@ -1233,6 +1242,29 @@ class StateMdTests(OrchTestCase):
         for initial in ("", self.SKELETON):
             with self.subTest(seeded=bool(initial)):
                 self.run_parallel_appends(initial)
+
+
+class HelpTests(OrchTestCase):
+    def test_help_lists_subcommands(self):
+        out = self.ok("--help").stdout
+        for name in ("merged", "block", "phase"):
+            self.assertIn(name, out)
+
+    def test_phase_help_lists_phases_in_workflow_order(self):
+        out = self.ok("phase", "-h").stdout
+        m = re.search(r"\{([^}]*)\}", out)
+        self.assertIsNotNone(m, out)
+        names = [x.strip() for x in m.group(1).split(",")]
+        order = ["spec", "tests", "implement", "review", "fix", "verify",
+                 "report", "mr", "ci"]
+        for n in order:
+            self.assertIn(n, names)
+        idx = [names.index(n) for n in order]
+        self.assertEqual(idx, sorted(idx), names)
+
+    def test_merged_and_block_help_mention_state_md(self):
+        self.assertIn("STATE.md", self.ok("merged", "-h").stdout)
+        self.assertIn("STATE.md", self.ok("block", "-h").stdout)
 
 
 if __name__ == "__main__":
