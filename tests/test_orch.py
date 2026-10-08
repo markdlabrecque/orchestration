@@ -5,6 +5,7 @@ Contract: skills/orchestration/references/orch-cli.md
 Run from the plugin dir:  python3 -m unittest discover -s tests -v
 """
 
+import fcntl
 import json
 import os
 import re
@@ -1169,43 +1170,69 @@ class StateMdTests(OrchTestCase):
         self.assertEqual(lines[-2], "- old line")
         self.assertRegex(lines[-1], r"^- \S+ #T-1 blocked: why$")
 
-    def test_parallel_appends_are_intact(self):
-        """state_md_append from many real processes, SQLite uninvolved."""
+    SKELETON = "# proj orchestration state\n\n## Notes\n\n## Activity\n\n"
+
+    def run_parallel_appends(self, initial):
+        """N real processes append while the parent holds LOCK_EX; none may
+        write until it lets go, and the result must be whole lines."""
         n = 24
-        root = os.path.join(self.tmp, "lockroot")
-        os.makedirs(root)
-        go = os.path.join(root, "go")
+        root = tempfile.mkdtemp(dir=self.tmp)
+        path = os.path.join(root, "STATE.md")
+        with open(path, "w", newline="") as f:
+            f.write(initial)
         child = (
-            "import sys, os, time\n"
-            "from importlib.machinery import SourceFileLoader\n"
-            "m = SourceFileLoader('orch_mod', sys.argv[1]).load_module()\n"
-            "root, go, i = sys.argv[2], sys.argv[3], sys.argv[4]\n"
-            "def slow_open(*a, **k):\n"  # widen the open -> size-check window
-            "    f = open(*a, **k)\n"
-            "    time.sleep(0.2)\n"
-            "    return f\n"
-            "m.open = slow_open\n"
-            "while not os.path.exists(go):\n"
-            "    time.sleep(0.001)\n"
-            "m.state_md_append(root, '- 2026-01-01T00:00:00Z #T-%s blocked: reason %s' % (i, i))\n")
-        procs = [subprocess.Popen([sys.executable, "-c", child, ORCH, root, go, str(i)],
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                 for i in range(n)]
-        time.sleep(1)
-        open(go, "w").close()
-        for p in procs:
-            out, err = p.communicate(timeout=60)
-            self.assertEqual(p.returncode, 0, err)
-        with open(os.path.join(root, "STATE.md")) as f:
+            "import sys, importlib.machinery, importlib.util\n"
+            "loader = importlib.machinery.SourceFileLoader('orch_mod', sys.argv[1])\n"
+            "spec = importlib.util.spec_from_file_location('orch_mod', sys.argv[1], loader=loader)\n"
+            "m = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(m)\n"
+            "i = sys.argv[3]\n"
+            "print('ready', flush=True)\n"
+            "m.state_md_append(sys.argv[2], '- 2026-01-01T00:00:00Z #T-%s blocked: reason %s' % (i, i))\n")
+        procs = []
+        try:
+            with open(path, "rb") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                try:
+                    procs = [subprocess.Popen([sys.executable, "-c", child, ORCH, root, str(i)],
+                                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                              text=True)
+                             for i in range(n)]
+                    for p in procs:
+                        self.assertEqual(p.stdout.readline(), "ready\n")
+                    time.sleep(0.5)
+                    with open(path, newline="") as f:
+                        self.assertEqual(f.read(), initial, "append did not wait for the lock")
+                finally:
+                    fcntl.flock(held, fcntl.LOCK_UN)
+            for p in procs:
+                out, err = p.communicate(timeout=60)
+                self.assertEqual(p.returncode, 0, err)
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
+        with open(path, newline="") as f:
             text = f.read()
+        self.assertTrue(text.endswith("\n"))
         self.assertEqual(text.count("## Activity"), 1)
         self.assertEqual(text.count("## Notes"), 1)
-        lines = [l for l in text.splitlines() if l.startswith("- ")]
+        activity = re.compile(r"^- 2026-01-01T00:00:00Z #T-\d+ blocked: reason \d+$")
+        lines = []
+        for l in filter(None, text.splitlines()):
+            if l in ("## Notes", "## Activity") or l.startswith("# "):
+                continue
+            self.assertRegex(l, activity)
+            lines.append(l)
         self.assertEqual(len(lines), n)
-        for l in lines:
-            self.assertRegex(l, r"^- 2026-01-01T00:00:00Z #T-\d+ blocked: reason \d+$")
         self.assertEqual(sorted(l.split()[2] for l in lines),
                          sorted("#T-%d" % i for i in range(n)))
+
+    def test_parallel_appends_are_intact(self):
+        for initial in ("", self.SKELETON):
+            with self.subTest(seeded=bool(initial)):
+                self.run_parallel_appends(initial)
 
 
 if __name__ == "__main__":
