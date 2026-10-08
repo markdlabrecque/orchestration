@@ -5,7 +5,7 @@ description: Set up a project folder for orchestration by writing its `.orch` co
 
 # Set up a project
 
-Projects live in `~/Projects/<project-name>/`, with the main git checkout cloned by the user into `code/`:
+Projects live in `~/Projects/<project-name>/`. Setup accepts an existing checkout inside `code/`, or a checkout at the project root that the user explicitly approves moving into `code/main`:
 
 ```
 ~/Projects/<project-name>/
@@ -15,13 +15,18 @@ Projects live in `~/Projects/<project-name>/`, with the main git checkout cloned
     └── <main checkout>/
 ```
 
-Run the script from anywhere inside the project folder:
+## Consent and setup
+
+1. Inspect the layout without changing it. If the project root has a `.git` directory, explain that setup will move the checkout, including `.git`, hidden and untracked files, into `code/main`. The outer folder keeps its name, `.orch` and `.agents` stay there, and Git history and the current branch move with the checkout.
+2. Ask for explicit confirmation of that move **before invoking the script or creating any directories**. A general request to set up the project is not relocation approval. If the user declines or has not confirmed, stop with the filesystem unchanged.
+3. If `.orch` exists, obtain separate overwrite approval. `--force` grants only that permission, never relocation permission.
+4. Run from the project root with `--relocate-checkout` only after move approval. For an already arranged `code/` layout, run from anywhere inside the project without that flag. The script refuses any existing `code` entry during relocation, symlinked Git metadata, and `.git`-file linked worktrees. Resolve conflicts with the user rather than moving or deleting them yourself.
 
 ```
-${CLAUDE_PLUGIN_ROOT}/skills/setup-project/scripts/setup-project.sh [--force]
+${CLAUDE_PLUGIN_ROOT}/skills/setup-project/scripts/setup-project.sh [--force] [--relocate-checkout]
 ```
 
-It finds the project root by walking up, finds the main checkout in `code/`, and writes `.orch`:
+The script finds the project root directly under `ORCH_PROJECTS_DIR`, discovers the main checkout in `code/`, and writes `.orch`:
 
 | Key | Default |
 |---|---|
@@ -34,7 +39,7 @@ It finds the project root by walking up, finds the main checkout in `code/`, and
 
 Relative paths in `.orch` resolve against the project folder.
 
-- Never clone the repository yourself. If the script says there is no main checkout, tell the user to clone it into `code/`.
+- Never clone the repository yourself. If neither starting layout has a checkout, tell the user to clone it into `code/`.
 - The script refuses when `.orch` exists. Pass `--force` only when the user asked to overwrite it.
 - If the script says `BASE_BRANCH` is empty, ask the user which branch to use and set it in `.orch`.
 
