@@ -38,12 +38,12 @@ Stage agents are named per harness: `orchestration:<name>` in Claude Code (the A
 A request to start, work on, or resume tickets authorizes this whole loop. Do not re-ask for each step.
 
 1. **Check the project.** Run from the project root (`~/Projects/<project>`). If `.orch` is missing, run the `setup-project` skill first. Then check the main checkout (`MAIN_CHECKOUT` in `.orch`): branch and working tree. Surface uncommitted work before starting; preserve it.
-2. **Preflight.** `orch init`, then `orch preflight`. It reports the harness and platform you are running on; every ticket session you start runs there too (see "Platforms" below). Exit 5 is a stop: nothing gets created. Tell the user what failed. A missing `BASE_BRANCH` needs a line in `.orch`. No verification environment (no DDEV, no `verify_harness` Docker harness) needs a decision on how verification should run. Ask once, two options max, with a recommendation.
+2. **Preflight.** `orch init`, then `orch preflight`. It reports the harness and platform you are running on; every ticket session you start runs there too (see "Platforms" below). Exit 5 is a stop: nothing gets created. Tell the user what failed. A missing `BASE_BRANCH` needs a line in `.orch`. Under the default `auto` policy, no verification environment (no DDEV, no `verify_harness` Docker harness) needs a decision on how verification should run. A project may explicitly select `verify_policy: "local-tests"` in project-root `.agents/orchestration/config.json` instead; see [references/orch-cli.md](references/orch-cli.md#configjson). Ask once, two options max, with a recommendation.
 3. **Recover first.** `orch stale` lists tickets whose session died. `orch resume <ticket>` each one. The ticket orchestrator picks up from its recorded phase.
 4. **Add tickets.** For each requested ticket: read the ticket, its comments and linked MRs; check dependencies and readiness per the project's `AGENTS.md`; assign it if the project says to; then `orch add <ticket> --title "<title>" --url <url>`.
 5. **Dispatch.** `orch next` returns what fits under `max_workers`. For each:
    1. Create and provision the worktree with the `create-worktree` skill. The worktree name is the ticket id alone (`19`, not `ticket-19`). It is cut from `BASE_BRANCH`.
-   2. Write the brief (template below) to a temp file. Accessibility tests are `on` only when `.orch` in the project root has `ACCESSIBILITY_TESTS=true` (any case). Missing, or any other value, is `off`.
+   2. Write the brief (template below) to a temp file, using `verify_env` from preflight. For `local-tests`, require all project-required automated tests, independent review and exact-head CI; go from review to report without a separate verify, browser or accessibility stage. Accessibility tests are `on` only when `.orch` in the project root has `ACCESSIBILITY_TESTS=true` (any case). Missing, or any other value, is `off`.
    3. `orch spawn <ticket> --worktree <absolute path> --brief-file <file>`. On Desktop, carry out the printed action (below).
    A ticket whose prerequisite is not `done` stays in `ready` until it is.
 6. **Supervise until every ticket is done.** Check `orch list` on a slow cadence (a background wakeup or monitor, not a sleep loop). React by phase and `health`:
@@ -63,7 +63,7 @@ You are the ticket orchestrator for <ticket-ref> (<ticket-url>), working in
 <absolute-worktree-path> on branch <branch>. Follow
 references/ticket-pipeline.md. Start with `orch show <ticket-id>`;
 the recorded phase is where you are. BASE_BRANCH is <base>: rebase onto it and
-target your MR at it. Verification environment: <ddev | docker>.
+target your MR at it. Verification environment: <ddev | docker | local-tests>.
 Accessibility tests: <on | off>. You own this
 ticket until it is merged. Do not create worktrees, spawn ticket sessions, or
 retire anything. Record every phase change with `orch`.

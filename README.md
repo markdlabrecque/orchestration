@@ -5,7 +5,8 @@
 1. **You start it.** Open a session in the project root (`~/Projects/<project>`),
    type `/orchestration` and list the tickets you want done.
 2. **It checks the project.** `BASE_BRANCH` is set in `.orch`, and there's a local
-   site to test on (DDEV or a Docker harness). If something's missing, it stops
+   site to test on (DDEV or a Docker harness), unless the project explicitly
+   selects `local-tests` below. If something's missing, it stops
    and tells you.
 3. **Each ticket gets its own space.** A fresh worktree cut from `BASE_BRANCH`,
    its own local site, and its own agent session. Several tickets can run at once.
@@ -17,7 +18,9 @@
    - **Verify**: an agent uses the change like a real user. It reports confusing
      spots and errors (console, network, server logs), plus an accessibility
      scan if `ACCESSIBILITY_TESTS=true`. The results go on the ticket as a
-     comment with screenshots.
+     comment with screenshots. Under `local-tests`, review goes straight to
+     report without browser or accessibility checks; all project-required
+     automated tests, independent review and exact-head CI still must pass.
    - **Report**: a short write-up of what changed.
 5. **It opens the MR**, waits for CI, and squash-merges once CI is green. If the
    project says a person must merge, it stops and waits for you instead.
@@ -52,7 +55,15 @@ Run coding tickets end to end. A main orchestrator gives each ticket its own wor
 - The harness on `PATH`: `claude`, `pi` (with the `subagents` extension) or `codex`. For Orca or Herdr, their CLI too (`orca`, `herdr`). For Desktop, the main session needs the `start_session` tool.
 - `glab` or `gh` for MRs and CI.
 - The `setup-project`, `create-worktree` and `retire-worktree` skills (bundled) for project setup and worktree setup and teardown.
-- A verification environment: DDEV in the project, or a Docker harness command in `<project root>/.agents/orchestration/config.json` (`verify_harness`). Without one, preflight stops before any ticket starts.
+- A verification environment: DDEV in the project, or a Docker harness command in `<project root>/.agents/orchestration/config.json` (`verify_harness`). Without one, default preflight stops before any ticket starts. Projects requiring only local automated tests can explicitly select `verify_policy` below.
+
+### Verification policy
+
+Set `"verify_policy": "local-tests"` in `<project root>/.agents/orchestration/config.json` to select local automated tests even when DDEV or Docker is available. No container or container tool is required. Completion requires all project-required automated tests with complete passing evidence, independent review and exact-head CI before merge.
+
+The only accepted values are `auto` and `local-tests`. Absence defaults to `auto`, preserving DDEV-first, Docker-second detection and refusal when neither is available. Every other supplied value, including null, booleans, empty strings and wrong case, is rejected. This setting uses the existing root state-directory config loading, with `ORCH_HOME` overriding that directory. Checkout/worktree config files, `.orch`, environment policy variables and prose in `AGENTS.md` do not select it. It does not change base-branch, platform, harness or merge gates.
+
+`spawn` retains local-tests instructions in the stored ticket brief and both resume paths replay them, so config changes do not switch an existing ticket's policy. Legacy launch callers still work without a verification environment; preflight remains the missing-environment gate.
 
 ## Project setup
 
@@ -76,7 +87,7 @@ Set `ACCESSIBILITY_TESTS=true` in `.orch` to have the verifier run an automated 
 
 `<project root>/STATE.md` is a human-readable log the orchestrator creates on first use, with a `## Notes` section for your own text and a `## Activity` section. `orch` only ever appends lines to the end of the file, never rewriting what is there: `- <UTC timestamp> #<ticket> <event>` for `picked up` (spawn, and resume as `picked up: attempt <n>`), `blocked: <reason>` and `completed: <MR link or commit <sha>>` (`orch merged --mr <url>`). When `ORCH_HOME` is set and no project folder resolves, it is written there instead.
 
-Every key resolves the same way: environment variable, then `.orch`, then the default. Relative paths in `.orch` resolve against the project root.
+Every `.orch` key resolves the same way: environment variable, then `.orch`, then the default. Relative paths in `.orch` resolve against the project root.
 
 ## Install and invoke
 

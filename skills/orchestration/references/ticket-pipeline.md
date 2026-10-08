@@ -37,12 +37,13 @@ If the project's `AGENTS.md` says merges wait for a human, stop after a green `c
 
 ### Verification environment
 
-Your brief names it; `orch preflight` decided it.
+Your stored launch brief names it; `orch preflight` decided it. On resume, retain that context even if project config has changed.
 
+- **local-tests** → require complete passing evidence for all project-required automated tests and independent review. After review passes, enter `report` directly, without a separate verify, browser or accessibility stage. Exact-head CI remains required before merge. Missing, failed or incomplete test evidence blocks completion. If a verifier is dispatched, pass `local-tests` and the automated-test evidence for its evidence-only branch.
 - **ddev** → `orchestration:verifier` on the ticket's own DDEV site.
 - **docker** → start the project's `verify_harness` from `<project root>/.agents/orchestration/config.json`. The verifier runs against it.
 
-Your brief also says whether accessibility tests are `on` or `off`. Pass that to the verifier as is. Don't look in `.orch` or the worktree to decide it: the brief is the answer.
+For `ddev` and `docker`, your brief also says whether accessibility tests are `on` or `off`. Pass that to the verifier as is. Don't look in `.orch` or the worktree to decide it: the brief is the answer.
 
 Verifier findings go through the same fix-now / follow-up triage as review findings. Successful review/verification bounces share the approved repair budget described below. So do the errors the verifier reports (console, network, page, server log). Every error, whether this ticket caused it or not, is also flagged to the user: in the MR description and the final message. A pre-existing error gets a follow-up ticket.
 

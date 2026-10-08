@@ -25,12 +25,19 @@ SQLite runs in WAL mode with a busy timeout. Every command is one transaction, s
 {
   "max_workers": 3,
   "claude_args": ["--dangerously-skip-permissions"],
+  "verify_policy": "auto",
   "verify_harness": "docker compose -f .agents/orchestration/verify.yml up -d",
   "stall_minutes": 20
 }
 ```
 
 Ticket sessions run unattended, so by default they skip permission prompts: without that, every push, merge and worktree command stops and waits. A project can set a narrower `claude_args` here. All keys are optional. Defaults: `max_workers` 3, `claude_args` as shown, `verify_harness` unset, `stall_minutes` 20. A `config.json` that is not a valid JSON object makes any command that reads it exit 3 with the path and parse error.
+
+`verify_policy` is read only from this root state-directory `config.json`, with `ORCH_HOME` overriding the directory. Its exact accepted values are `auto` and `local-tests`; absence defaults to `auto`. Null, booleans, empty strings, wrong case and all other values refuse with exit 5 at preflight or spawn. Checkout/worktree config, `.orch`, environment policy variables and prose `AGENTS.md` do not override it.
+
+`auto` preserves DDEV-first, Docker-second detection and missing-environment refusal. `local-tests` explicitly selects local automated tests even if containers exist, requiring no DDEV/Docker tool. All project-required automated tests, independent review and exact-head CI before merge remain required. The ticket pipeline goes from review to report without separate verify, browser or accessibility checks. Other preflight gates are unchanged.
+
+`spawn` stores local-tests instructions in the brief before launch. Both continuable resume and fresh recovery replay that retained context rather than current config. Legacy callers without a verification environment still launch; preflight remains the missing-environment gate.
 
 ## Platforms
 
@@ -88,7 +95,7 @@ dispatched -> spec
 spec       -> tests | implement        (implement = skip lane: trivial or no-code)
 tests      -> implement
 implement  -> review
-review     -> fix | verify | report    (report = no-code lane)
+review     -> fix | verify | report    (report = no-code or local-tests lane)
 fix        -> review | ci
 verify     -> fix | report
 report     -> mr
@@ -190,7 +197,7 @@ For `desktop`, `spawn` and `resume` exit 0 and print `{"action": "desktop_start"
 
 **In-flight marker.** `spawn`, `resume` and `retire` release the write lock while platform commands and engines run, so each first claims the ticket: the `launching` column holds `{"token", "op", "pid", "pid_start", "at"}` (the orch process and when). `spawn` claims it before creating a worktree, `resume` in step 1, `retire` before it closes anything. While a ticket holds a live marker, `spawn`, `resume` and `retire` (with or without `--force`) on it exit 3 with `launch in progress for <ticket>: orch pid <pid> started a <op> at <time>; ...`; so does a `spawn` without `--worktree` of another ticket with the same worktree name. The owner clears the marker in step 3, in the step-2 rollback, when retire finishes or fails, and on any error or interrupt. A marker older than 10 minutes, or whose orch process is gone (pid not running, or running with another start time), is abandoned and ignored, so a crash mid-launch never wedges the ticket.
 
-**Resume prompt.** When the session has reported in before (`session_seen`, or for headless a log line carrying the session id), resume continues it: `--resume <sid>` with a prompt telling the session to run `orch show <ticket>` first. Otherwise it starts fresh with `--session-id <same sid>` and the stored brief. `--note` text is appended to either prompt. A fresh start with no stored brief exits 3 (`no stored brief; re-spawn`).
+**Resume prompt.** When the session has reported in before (`session_seen`, or for headless a log line carrying the session id), resume continues it: `--resume <sid>` with a prompt telling the session to run `orch show <ticket>` first and replaying any retained local-tests instructions from the stored brief. Otherwise it starts fresh with `--session-id <same sid>` and the stored brief. `--note` text is appended to either prompt. A fresh start with no stored brief exits 3 (`no stored brief; re-spawn`).
 
 **Resume on `orca` / `herdr`** first closes the old terminal or workspace when `launch_ref` names one (best effort, ignore errors): `orca terminal close --worktree path:<worktree> --all --json`, `herdr workspace close <workspace>`. Then it opens a new one the same way as `spawn`. Resuming onto `desktop` keeps `launch_ref` only when it is a Desktop ref; any other ref is cleared.
 
@@ -236,7 +243,7 @@ Every command accepts `--json`, before or after the command name (one JSON objec
 |---|---|---|
 | `orch init` | main | Create the directory and database. Safe to re-run. |
 | `orch platform` | any | `{"platform": ...}` per "Platforms", and `harness`, `harness_source` per "Harnesses". |
-| `orch preflight` | main | Exit 0 and print `verify_env` (`ddev` or `docker`), `base_branch` and `platform`. Exit 5 listing every failure. Checks: `BASE_BRANCH` set in the environment or `.orch` (an optional `export ` prefix is allowed; a quoted value is the text inside the quotes, an unquoted value ends at the first whitespace-then-`#` comment); verification environment is `ddev` when the main checkout has `.ddev/config.yaml` **and** `ddev` is on `PATH`, else `docker` when `config.json` has `verify_harness` **and** `docker` is on `PATH`, else failure; the platform's binary (`orca` or `herdr`) is on `PATH` when the platform needs one. |
+| `orch preflight` | main | Exit 0 and print `verify_env` (`ddev`, `docker` or `local-tests`), `base_branch` and `platform`. Exit 5 listing every failure. Checks: `BASE_BRANCH` set in the environment or `.orch` (an optional `export ` prefix is allowed; a quoted value is the text inside the quotes, an unquoted value ends at the first whitespace-then-`#` comment); verification environment is `local-tests` when `verify_policy` explicitly selects it, otherwise `ddev` when the main checkout has `.ddev/config.yaml` **and** `ddev` is on `PATH`, else `docker` when `config.json` has `verify_harness` **and** `docker` is on `PATH`, else failure; the platform's binary (`orca` or `herdr`) is on `PATH` when the platform needs one. |
 | `orch add <ticket> --title T [--url U]` | main | New ticket in `ready`. Exit 3 if it exists. Exit 2 unless the id matches `^[A-Za-z0-9][A-Za-z0-9._-]*$` with no `..` (it names files under `logs/` and `briefs/`). |
 | `orch list` | any | All tickets: id, phase, status, platform, health, activity, last_seen_at, review_rounds, pid, alive, retired. |
 | `orch show <ticket>` | any | One ticket in full, including `alive`, `health` and `launch_ref`, plus `bounces`, `runs` (as `orch runs`), `model_mismatches` (runs with `match` 0) and `unrecorded_dispatches` (`dispatch_unrecorded` events). The text form prints the runs as a table after the fields. |
