@@ -775,6 +775,27 @@ SKILL_COMMANDS = {"claude": "/orchestration:orchestration", "pi": "/skill:orches
 SKILL_COMMAND = SKILL_COMMANDS["claude"]
 
 
+LOCAL_TESTS_CONTEXT = (
+    "Verification environment: local-tests\n"
+    "Run all project-required automated tests and retain complete passing evidence. "
+    "Independent review and exact-head CI are required before merge. "
+    "After review passes, go to report without a separate verify, browser or "
+    "accessibility stage. Missing, failed or incomplete test evidence is not passing."
+)
+
+
+def verification_policy(cfg):
+    policy = cfg.get("verify_policy", "auto")
+    if policy not in ("auto", "local-tests"):
+        raise Refusal(EXIT_PREFLIGHT, "invalid verify_policy: expected auto or local-tests")
+    return policy
+
+
+def retained_verification_context(brief):
+    """Read launch-time policy from the stored brief, never the current config."""
+    return LOCAL_TESTS_CONTEXT if LOCAL_TESTS_CONTEXT in (brief or "") else ""
+
+
 def ticket_prompt(brief, harness="claude"):
     return "%s %s" % (SKILL_COMMANDS[harness], brief)
 
@@ -1815,9 +1836,12 @@ def cmd_preflight(args):
     base, orch_file = base_branch()
     if not base:
         failures.append("BASE_BRANCH is not set in %s" % orch_file)
+    policy = verification_policy(cfg)
     verify_env = None
     has_ddev_cfg = os.path.exists(os.path.join(main, ".ddev", "config.yaml"))
-    if has_ddev_cfg and shutil.which("ddev"):
+    if policy == "local-tests":
+        verify_env = "local-tests"
+    elif has_ddev_cfg and shutil.which("ddev"):
         verify_env = "ddev"
     elif cfg.get("verify_harness") and shutil.which("docker"):
         verify_env = "docker"
@@ -1976,6 +2000,8 @@ def spawn_ticket(db, sdir, cfg, tid, brief, platform, worktree=None, wref=None,
         check_spawnable(row, tid)
         if not brief.strip():
             raise Refusal(EXIT_GATE, "brief for %s is empty" % tid)
+        if verification_policy(cfg) == "local-tests" and not retained_verification_context(brief):
+            brief += "\n\n" + LOCAL_TESTS_CONTEXT
         check_prompt_size(platform, tid, ticket_prompt(brief, harness))
         if worktree is not None:
             if not os.path.isdir(worktree):
@@ -2148,7 +2174,11 @@ def resume_ticket(db, sdir, cfg, tid, note=None, platform=None, harness=None):
             row = dict(row, session_id=sid)
         extra = ("\n\nNote from the orchestrator:\n" + note) if note else ""
         if harness == old_harness and session_continuable(sdir, row, harness):
-            prompt = resume_prompt(tid, harness) + extra
+            context = retained_verification_context(row["brief"])
+            prompt = resume_prompt(tid, harness)
+            if context:
+                prompt += "\n\n" + context
+            prompt += extra
             session = {"mode": "resume", "sid": sid}
         else:
             # Nothing to continue (the session never reported in, or the ticket

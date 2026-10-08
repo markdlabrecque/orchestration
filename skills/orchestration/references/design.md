@@ -47,7 +47,7 @@ The main orchestrator does traffic control: preflight, add, dispatch, resume, re
 | Done | Squash-merged into `BASE_BRANCH` (the integration branch) after CI passes on that SHA | Review approval is not done; a green merge is |
 | Who merges | The ticket orchestrator, via MR | Keeps each ticket's evidence on its MR |
 | Who retires | The main orchestrator, after `done` | A ticket session never deletes the ground it stands on |
-| Verification | DDEV if the project has it, else the project's Docker harness, else preflight stops before anything starts | Verification is never silently skipped |
+| Verification | Explicit `local-tests` policy uses automated-test evidence and review-to-report; otherwise DDEV if the project has it, else the project's Docker harness, else preflight stops before anything starts | Verification is never silently skipped |
 | Session permissions | Ticket sessions run with `--dangerously-skip-permissions` by default; a project can narrow `claude_args` | Unattended tickets otherwise stop at every push, merge and delete |
 | Skill invocation | `disable-model-invocation: true`; `orch` starts each fresh ticket prompt with `/orchestration:orchestration` | Orchestration launches sessions, worktrees and merges, so only a person starts it. Ticket sessions load it through the command, not the Skill tool |
 | Blocked tickets | Keep their worktree | The next attempt reads the partial diff |
