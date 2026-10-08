@@ -97,8 +97,8 @@ ci         -> fix | mr
 ```
 
 - Entering `review` adds 1 to `review_rounds`.
-- `review -> fix` and `verify -> fix` are refused once `review_rounds` is 2 or more (the cap). The refusal says to file the remaining findings as follow-up tickets and move on to `verify`.
-- `ci -> fix` is never capped; CI repairs are not review rounds. `fix -> ci` returns straight to CI after such a repair.
+- CI repairs do not count as review rounds. `fix -> ci` returns straight to CI after such a repair.
+- The approved repair budgets are three successful review/verification bounces and two separate CI repairs per ticket, without resets on escalation or resume. [Issue #12](https://github.com/markdlabrecque/orchestration/issues/12) owns their implementation and human-blocking gates. These budgets are not yet implemented in `cmd_phase`; do not treat the current refusal behavior as the approved policy.
 - `review -> fix` and `verify -> fix` add 1 to `bounces` (`ci -> fix` does not). They are refused (exit 3) when the ticket's last implementor run was at `frontier`/`high`: there is no higher rung, and the message says to `orch block` the ticket for a human.
 - `done` is reachable only through `orch merged`.
 
@@ -202,6 +202,8 @@ Every role starts at effort `low`; bumps below change the tier, not the effort.
 2. `--files N` > 5 or `--lines N` > 300: `investigation` and `reviewer` one tier up (other roles ignore the size).
 3. Floors from the ticket's runs: an implementor after a bounce (the ticket's `bounces` grew since the last implementor run, or the ticket is in `review`/`verify`) runs one rung above the last implementor run (effort first, then tier: `standard/low` -> `standard/high` -> `heavy/low`), and is refused (exit 3, "block") when that was `frontier/high`; a reviewer runs at least one tier below the last implementor; every role runs at least one tier below the highest tier on the ticket (no mid-ticket de-escalation).
 4. Everything caps at `frontier/high`.
+
+A CI repair (`ci -> fix`) is not a bounce and adds no bounce rung. It leaves `bounces` and `review_rounds` unchanged; entering `review` still adds to review-entry history. The repair uses the normal role default and applicable floors, including highest recorded tier minus one. With `heavy` as the highest recorded tier, a last implementor run that recorded the current bounce count, and no other escalation, the CI-repair implementor routes at `standard/low`. This is not an unconditional standard route and does not retain the previous effort. Review/verification bounces still trigger the effort-first escalation above.
 
 On Pi the machine config's `pi_models` (`${XDG_CONFIG_HOME:-~/.config}/orchestration/config.json`) overrides the models by tier (`{"light": "<provider>/<model>", ...}`); the old keys `haiku`, `sonnet`, `opus` still work as `light`, `standard`, and `heavy` plus `frontier` (both run on one model; a tier key wins). `pi/extension.ts` `piModels()` reads the same map. On Codex, `scripts/codex-agents` writes one agent per stage, tier and effort (`<name>_<tier>_<effort>.toml`, agent `<name>-<tier>-<effort>`, with that tier's model and the effort as `model_reasoning_effort`; the reviewer read-only, the verifier on the session's sandbox) and removes the `<name>.toml` and `<name>_<tier>.toml` of earlier versions (only ones it generated: the first line says so); `orch route` prints the agent to spawn. Codex's `spawn_agent` `model` field is behind a config option, so the agent file carries the model instead.
 

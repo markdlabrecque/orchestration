@@ -44,7 +44,7 @@ Your brief names it; `orch preflight` decided it.
 
 Your brief also says whether accessibility tests are `on` or `off`. Pass that to the verifier as is. Don't look in `.orch` or the worktree to decide it: the brief is the answer.
 
-Verifier findings go through the same fix-now / follow-up triage as review findings, and they count against the same round cap. So do the errors the verifier reports (console, network, page, server log). Every error, whether this ticket caused it or not, is also flagged to the user: in the MR description and the final message. A pre-existing error gets a follow-up ticket.
+Verifier findings go through the same fix-now / follow-up triage as review findings. Successful review/verification bounces share the approved repair budget described below. So do the errors the verifier reports (console, network, page, server log). Every error, whether this ticket caused it or not, is also flagged to the user: in the MR description and the final message. A pre-existing error gets a follow-up ticket.
 
 ## Model routing
 
@@ -62,15 +62,17 @@ Flags:
 
 A bounce is `orch phase <ticket> fix` from `review` or `verify`: run it before `route`/`run` for the fix implementor, since `orch` escalates on the bounce it records. `orch` escalates by itself: an implementor after a bounce runs a rung above the last one (higher effort within the tier first, then the next tier), the reviewer runs at most one tier below the implementor, and no stage drops more than one tier below the highest run on the ticket.
 
+A CI repair (`ci -> fix`) is not a bounce and adds no bounce rung. It leaves `bounces` and `review_rounds` unchanged, without erasing review-entry history. Use the normal role default and applicable floors, including highest recorded tier minus one. If the highest recorded tier is `heavy`, the last implementor recorded the current bounce count, and there is no other escalation, the CI-repair implementor routes at `standard/low`. CI repair does not always mean standard and does not preserve the prior effort. Review/verification bounces still escalate effort first as described above.
+
 After each stage, `orch show <ticket>`. `model_mismatches` > 0 (a subagent ran on another model than requested) or `unrecorded_dispatches` > 0 (a stage agent ran without `orch run`) is a permitted stop: `orch block <ticket> --reason "model routing failed: <which run, requested vs resolved>"`.
 
 When `orch phase <ticket> fix` (or `orch route` for the implementor) is refused because the last implementor already ran at `frontier/high`, there is nothing higher: `orch block <ticket>` for a human with the findings as the reason.
 
-## Review rounds: cap of 2, then finish
+## Review history and approved repair budgets
 
-Two review rounds, no more. After round 2, `orch` refuses `review → fix`. Every remaining finding becomes a follow-up ticket, and the ticket carries on to `verify` and finishes. The report says the work could use more review passes and lists the follow-ups. This is not a stop and not a question.
+Entering `review` adds to `review_rounds`, the review-entry history. CI repairs (`ci → fix → ci`) don't count as review rounds.
 
-CI repairs (`ci → fix → ci`) don't count as review rounds.
+The approved policy allows three successful review/verification bounces per ticket and two separate CI repairs. Escalation and resume do not reset either budget. [Issue #12](https://github.com/markdlabrecque/orchestration/issues/12) owns implementation of these budgets and the before-dispatch refusal and human-blocking gates. They are not yet implemented in `cmd_phase`; this policy does not claim the current CLI enforces them. Exhausted budgets require a human stop with remaining findings recorded, not follow-ups followed by declaring unresolved work finished.
 
 ## Review findings: fix now or file a ticket
 
@@ -129,7 +131,7 @@ Ask once, two options max, with a recommendation. Once answered, run to the end.
 | Visible defect in this ticket's own output | Fix it. It's the deliverable. |
 | "Reviewer found a separate bug. File it?" | File it. Report the ID. |
 | "Run `ddev drush cim -y`? It wipes local drift." | Run it. The worktree's DDEV database is disposable. |
-| Round cap hit with findings left | File them as follow-ups, continue to `verify`. |
+| Approved repair budget exhausted with findings left | Record the findings and block for a human under the policy owned by [issue #12](https://github.com/markdlabrecque/orchestration/issues/12). |
 
 An offer at the end of a message ("Want me to…", "Your call") is a stop in disguise. Either do the thing or drop the sentence.
 
