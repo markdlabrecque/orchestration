@@ -2196,8 +2196,10 @@ def cmd_phase(args, db, sdir):
     if new == "done":
         raise Refusal(EXIT_GATE, "done is reachable only through `orch merged`")
     if new not in TRANSITIONS.get(cur, ()):
-        raise Refusal(EXIT_GATE, "illegal transition %s -> %s for %s"
-                      % (cur, new, args.ticket))
+        message = "illegal transition %s -> %s for %s" % (cur, new, args.ticket)
+        if cur == "ready":
+            message += "; dispatch the ticket with `orch spawn %s` before phase transitions" % args.ticket
+        raise Refusal(EXIT_GATE, message)
     if new == "fix" and cur in ("review", "verify") and row["review_rounds"] >= REVIEW_CAP:
         raise Refusal(EXIT_GATE,
                       "review cap reached (%d rounds): file the remaining findings as"

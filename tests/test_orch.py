@@ -618,6 +618,33 @@ class TransitionTests(OrchTestCase):
         self.refused(3, "phase", "T-1", "done")  # ci -> done only via merged
         self.assertEqual(self.show("T-1")["phase"], "ci")
 
+    def test_ready_phase_refusal_explains_dispatch_without_mutation(self):
+        self.add("T-16")
+        with sqlite3.connect(self.db_path()) as db:
+            before = list(db.iterdump())
+
+        p = self.refused(3, "phase", "T-16", "spec")
+
+        with sqlite3.connect(self.db_path()) as db:
+            self.assertEqual(list(db.iterdump()), before)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(p.stdout, "")
+        self.assertTrue(p.stderr.startswith(
+            "orch: illegal transition ready -> spec for T-16"), p.stderr)
+        self.assertIn("orch spawn T-16", p.stderr)
+        self.assertRegex(p.stderr.lower(), r"dispatch")
+        self.assertRegex(p.stderr.lower(), r"before|first")
+
+    def test_non_ready_illegal_transition_keeps_exact_diagnostic(self):
+        self.dispatched("T-16")
+        self.phases("T-16", "spec")
+
+        p = self.refused(3, "phase", "T-16", "review")
+
+        self.assertEqual(p.stderr,
+                         "orch: illegal transition spec -> review for T-16\n")
+        self.assertEqual(p.stdout, "")
+
     def test_skip_lane_spec_to_implement(self):
         self.dispatched("T-1")
         self.phases("T-1", "spec", "implement")
