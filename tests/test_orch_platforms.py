@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -793,21 +794,64 @@ class HookTests(PlatformTestCase):
 
     def test_walk_finds_native_versions_binary(self):
         """The native CLI's executable is .../claude/versions/<version>."""
-        vdir = os.path.join(self.tmp, "share", "claude", "versions")
-        os.makedirs(vdir)
-        native = os.path.join(vdir, "2.1.288")
-        os.symlink("/bin/bash", native)
-        payload = json.dumps({"session_id": self.sid, "cwd": self.wt,
-                              "hook_event_name": "SessionStart", "source": "startup"})
-        e = {k: v for k, v in self.env.items() if k != "ORCH_HOOK_CLAUDE_PID"}
-        # `; echo` keeps bash from exec-ing the hook in its own process.
-        p = subprocess.run([native, "-c", '"$0" hook; echo "PID=$$"',
-                            os.path.join(PLUGIN, "scripts", "orch")],
-                           input=payload, cwd=self.wt, env=e, capture_output=True,
-                           text=True, timeout=30)
-        self.assertIn(self.context_line("T-1"), p.stdout)
-        bash_pid = int(re.search(r"PID=(\d+)", p.stdout).group(1))
-        self.assertEqual(self.show("T-1")["pid"], bash_pid)
+        real_ps = os.path.realpath(shutil.which("ps"))
+        fake_bin = os.path.join(self.tmp, "native-ps")
+        os.makedirs(fake_bin)
+        query_log = os.path.join(self.tmp, "ps-queries.jsonl")
+        fake_ps = os.path.join(fake_bin, "ps")
+        with open(fake_ps, "w") as f:
+            f.write(f"#!{sys.executable}\n" + '''import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["TEST_PS_LOG"], "a") as log:
+    log.write(json.dumps(args) + "\\n")
+fields = args[1:] if args[:1] == ["-ww"] else args
+if len(fields) == 4 and fields[0] == "-o" and fields[2] == "-p":
+    field, pid = fields[1], fields[3]
+    native = pid == os.environ["TEST_NATIVE_PID"]
+    if field == "ppid=,comm=":
+        # Close all fallback ancestry, never inspect a host agent.
+        print("1 /tmp/path with spaces/claude/versions/2.1.288"
+              if native else os.environ["TEST_NATIVE_PID"] + " /bin/sh")
+        sys.exit(0)
+    if field == "command=":
+        print("/bin/sh -c sleep 60")
+        sys.exit(0)
+os.execv(os.environ["TEST_REAL_PS"], [os.environ["TEST_REAL_PS"], *args])
+''')
+        os.chmod(fake_ps, 0o755)
+        payload_path = os.path.join(self.tmp, "native-payload.json")
+        with open(payload_path, "w") as f:
+            json.dump({"session_id": self.sid, "cwd": self.wt,
+                       "hook_event_name": "SessionStart", "source": "startup"}, f)
+        result_path = os.path.join(self.tmp, "native-result")
+        output_path = os.path.join(self.tmp, "native-output")
+        e = {k: v for k, v in self.env.items()
+             if k not in ("ORCH_HOOK_CLAUDE_PID", "ORCH_HOOK_AGENT_PID")}
+        e.update(PATH=fake_bin + os.pathsep + e["PATH"],
+                 TEST_REAL_PS=real_ps, TEST_PS_LOG=query_log)
+        self.assertNotIn("ORCH_HOOK_CLAUDE_PID", e)
+        self.assertNotIn("ORCH_HOOK_AGENT_PID", e)
+        from test_orch_adapters import load_orch_module
+        self.assertFalse(load_orch_module().is_claude("/bin/sh", "/bin/sh -c sleep 60"))
+        # Keep the ordinary parent shell alive through hook and show.
+        script = ('export TEST_NATIVE_PID=$$; '
+                  '"$0" hook < "$1" > "$2" 2>&1; '
+                  'echo $? > "$3"; read answer')
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", script, os.path.join(PLUGIN, "scripts", "orch"),
+             payload_path, output_path, result_path],
+            cwd=self.wt, env=e, stdin=subprocess.PIPE)
+        try:
+            self.assertTrue(wait_until(lambda: os.path.exists(result_path), timeout=30))
+            self.assertEqual(read_file(result_path).strip(), "0", read_file(output_path))
+            self.assertIn(self.context_line("T-1"), read_file(output_path))
+            self.assertIsNone(proc.poll())
+            self.assertEqual(self.show("T-1")["pid"], proc.pid)
+            queries = [json.loads(line) for line in read_file(query_log).splitlines()]
+            self.assertIn(["-o", "ppid=,comm=", "-p", str(proc.pid)], queries)
+            self.assertIn(["-ww", "-o", "command=", "-p", str(proc.pid)], queries)
+        finally:
+            proc.communicate(input=b"done\n", timeout=5)
 
     def test_garbage_stdin(self):
         for raw in ("", "not json", "[1, 2]", '{"hook_event_name": "SessionStart"}'):

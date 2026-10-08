@@ -1122,6 +1122,55 @@ class IsClaudeTests(unittest.TestCase):
             self.assertTrue(self.orch.is_claude(comm, command), (comm, command))
 
 
+class WalkToAgentTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.orch = load_orch_module()
+
+    def controlled_walk(self, rows, commands):
+        """Answer every ps query from a closed, test-owned ancestry."""
+        queries = []
+
+        def fake_run(argv, **kwargs):
+            self.assertEqual(argv[0], "ps")
+            pid = int(argv[argv.index("-p") + 1])
+            field = argv[argv.index("-o") + 1]
+            queries.append((pid, field))
+            if field == "ppid=,comm=":
+                self.assertIn(pid, rows, "walk escaped controlled ancestry")
+                parent, comm = rows[pid]
+                out = "%s %s\n" % (parent, comm)
+            else:
+                self.assertEqual(field, "command=")
+                self.assertIn(pid, commands)
+                out = commands[pid] + "\n"
+            return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+        with unittest.mock.patch.object(self.orch.subprocess, "run", side_effect=fake_run):
+            result = self.orch.walk_to_agent(4203)
+        return result, queries
+
+    def test_native_versions_ancestor_with_spaces_and_non_agent_command(self):
+        command = "bash -c 'sleep 60'"
+        self.assertFalse(self.orch.is_claude("bash", command))
+        result, queries = self.controlled_walk(
+            {4203: (4202, "sh"),
+             4202: (1, "/tmp/path with spaces/claude/versions/2.1.288")},
+            {4203: "sh -c orch hook", 4202: command})
+        self.assertEqual(result, (4202, "claude"))
+        self.assertEqual(queries, [(4203, "ppid=,comm="), (4203, "command="),
+                                   (4202, "ppid=,comm="), (4202, "command=")])
+
+    def test_all_shell_ancestry_with_claude_in_command_is_not_agent(self):
+        result, queries = self.controlled_walk(
+            {4203: (4202, "sh"), 4202: (4201, "bash"), 4201: (1, "/bin/sh")},
+            {4203: "sh -c orch hook", 4202: "bash -c claude", 4201: "sh"})
+        self.assertEqual(result, (None, None))
+        self.assertEqual(queries, [(4203, "ppid=,comm="), (4203, "command="),
+                                   (4202, "ppid=,comm="), (4202, "command="),
+                                   (4201, "ppid=,comm="), (4201, "command=")])
+
+
 class ResumeRefTests(AdapterTestCase):
     def test_resume_onto_desktop_from_orca_nulls_closed_terminal_ref(self):
         self.use_orca2()
