@@ -314,6 +314,48 @@ class MigrationTests(BudgetTests):
         self.assertRegex(p.stderr.lower(), r"reconcil|unknown|history")
         self.assertEqual(self.snapshot(), before)
 
+    def test_unknown_bounce_run_refuses_without_changes(self):
+        self.legacy(incomplete=True, pre_bounces=True)
+        self.assertIsNone(self.show("t1")["bounces"])
+        for role in ("implementor", "reviewer"):
+            with self.subTest(role=role):
+                before = self.snapshot()
+                p = self.refused(3, "run", "t1", "--role", role,
+                                 "--model", CLAUDE["standard"], "--effort", "low")
+                self.assertEqual(self.snapshot(), before)
+                for advice in ("unknown", "evidence", "reconcil", "human", "block"):
+                    self.assertIn(advice, p.stderr.lower())
+
+    def test_missing_interior_phase_history_is_unknown(self):
+        self.legacy(repairs=1)
+        self.db_exec("DELETE FROM events WHERE ticket='t1' AND kind='phase' "
+                     "AND from_phase='tests' AND to_phase='implement'")
+        self.assertIsNone(self.show("t1")["ci_repairs"])
+        self.refuse_unchanged(r"unknown|history")
+
+    def test_terminal_phase_mismatch_is_unknown(self):
+        self.legacy(repairs=1)
+        self.db_exec("UPDATE tickets SET phase='mr' WHERE id='t1'")
+        self.assertIsNone(self.show("t1")["ci_repairs"])
+        self.ok("phase", "t1", "ci")
+        self.refuse_unchanged(r"unknown|history")
+
+    def test_failed_backfill_rolls_back_schema_and_data(self):
+        self.legacy(repairs=1, bounces=4)
+        self.db_exec("CREATE TRIGGER reject_backfill BEFORE UPDATE ON tickets "
+                     "BEGIN SELECT RAISE(ABORT, 'fixture backfill failure'); END")
+        with sqlite3.connect(self.db_path()) as db:
+            schema = db.execute("SELECT type,name,sql FROM sqlite_master ORDER BY name").fetchall()
+        before = self.snapshot()
+        p = self.orch("show", "t1", "--json")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("fixture backfill failure", p.stderr)
+        self.assertEqual(self.snapshot(), before)
+        with sqlite3.connect(self.db_path()) as db:
+            self.assertEqual(db.execute("SELECT type,name,sql FROM sqlite_master ORDER BY name").fetchall(), schema)
+        self.db_exec("DROP TRIGGER reject_backfill")
+        self.assertEqual(self.counts(), (4, 1, 1))
+
     def test_concurrent_legacy_opens_backfill_once(self):
         self.legacy(repairs=2, bounces=4)
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
@@ -344,5 +386,9 @@ def load_tests(loader, tests, pattern):
         "test_pre_bounces_reconstructs_successful_phase_history",
         "test_initialized_count_not_recomputed_after_history_loss",
         "test_pre_bounces_missing_history_does_not_grant_zero",
-        "test_concurrent_legacy_opens_backfill_once")))
+        "test_concurrent_legacy_opens_backfill_once",
+        "test_unknown_bounce_run_refuses_without_changes",
+        "test_missing_interior_phase_history_is_unknown",
+        "test_terminal_phase_mismatch_is_unknown",
+        "test_failed_backfill_rolls_back_schema_and_data")))
     return suite

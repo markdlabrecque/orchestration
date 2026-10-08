@@ -2607,6 +2607,11 @@ def cmd_run(args, db, sdir):
                                                           ", ".join(TIERS)))
     if args.effort is None:
         raise Refusal(EXIT_USAGE, "run needs --effort (%s)" % "|".join(EFFORTS))
+    if row["bounces"] is None:
+        raise Refusal(EXIT_GATE, "unknown bounce history for %s; cannot record a run"
+                      " snapshot until evidence-backed human reconciliation. Stop dispatch"
+                      " and orch block %s --reason '<unknown bounce history; findings link>'"
+                      % (args.ticket, args.ticket))
     need, need_effort, reasons = route_tier(db, row, args.role, **size_args(args))
     if rung(tier, args.effort) < rung(need, need_effort):
         raise Refusal(EXIT_GATE, "%s/%s is %s/%s, below the %s/%s floor for %s on %s%s" % (
