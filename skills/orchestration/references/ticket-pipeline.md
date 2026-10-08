@@ -60,13 +60,15 @@ Flags:
 - **Investigation**: `--files` with the number of touch points the question spans.
 - **`--ambiguous`**: the task's envelope is unclear (what to build, or where, is not settled by the spec and the code).
 
-A bounce is `orch phase <ticket> fix` from `review` or `verify`: run it before `route`/`run` for the fix implementor, since `orch` escalates on the bounce it records. `orch` escalates by itself: an implementor after a bounce runs a rung above the last one (higher effort within the tier first, then the next tier), the reviewer runs at most one tier below the implementor, and no stage drops more than one tier below the highest run on the ticket.
+A bounce is a successful `orch phase <ticket> fix` from `review` or `verify`: it increases `bounces`. Require that successful transition before `route`, `run` or dispatch for the fix implementor. Routing escalates only when `ticket.bounces > last_implementor.bounce_count`, not merely because the ticket is in `review` or `verify`. `orch` escalates by itself: an implementor after a bounce runs a rung above the last one (higher effort within the tier first, then the next tier), the reviewer runs at most one tier below the implementor, and no stage drops more than one tier below the highest run on the ticket.
 
 A CI repair (`ci -> fix`) is not a bounce and adds no bounce rung. It leaves `bounces` and `review_rounds` unchanged, without erasing review-entry history. Use the normal role default and applicable floors, including highest recorded tier minus one. If the highest recorded tier is `heavy`, the last implementor recorded the current bounce count, and there is no other escalation, the CI-repair implementor routes at `standard/low`. CI repair does not always mean standard and does not preserve the prior effort. Review/verification bounces still escalate effort first as described above.
 
 After each stage, `orch show <ticket>`. `model_mismatches` > 0 (a subagent ran on another model than requested) or `unrecorded_dispatches` > 0 (a stage agent ran without `orch run`) is a permitted stop: `orch block <ticket> --reason "model routing failed: <which run, requested vs resolved>"`.
 
-When `orch phase <ticket> fix` (or `orch route` for the implementor) is refused because the last implementor already ran at `frontier/high`, there is nothing higher: `orch block <ticket>` for a human with the findings as the reason.
+The ordinary last-implementor `frontier/high` refusal happens at `orch phase <ticket> fix`, after the budget check. It exits 3 with human-block advice and leaves state unchanged. A read-only implementor route remains possible in `review` after that refusal and normally returns `heavy/low` without extra flags, since no bounce was recorded. That route cannot authorize a fix dispatch. Stop, retain the findings and explicitly `orch block <ticket>` for a human with the findings as the reason.
+
+Routing's defensive frontier/high refusal applies only when the bounce count actually exceeds the last frontier/high implementor's snapshot. A last implementor at `frontier/low` still has `frontier/high` available after a successful bounce if budget remains.
 
 ## Review history and durable repair budgets
 
