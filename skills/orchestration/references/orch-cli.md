@@ -17,7 +17,7 @@ The project root also holds `.orch` (written by the `setup-project` skill). `orc
 | `briefs/<ticket>.md`, `briefs/<ticket>.resume.md` | Prompt given to the session by `spawn` / `resume` |
 | `config.json` | Optional project settings (below) |
 
-SQLite runs in WAL mode with a busy timeout. Every command is one transaction, so a killed process leaves either the old state or the new one, never half. Writes take `BEGIN IMMEDIATE`; read-only commands (`list`, `show`, `next`, `stale`, `events`, `route`, `runs`, `platform`, `watch`) use a plain deferred read. `spawn`, `resume` and `retire` are the exception: they never hold the write lock while a platform command or worktree engine runs, and hold the ticket's in-flight marker instead (see "Launching sessions"). Older databases gain new columns and tables (`bounces`, `runs`) automatically on first use.
+SQLite runs in WAL mode with a busy timeout. Every command is one transaction, so a killed process leaves either the old state or the new one, never half. Writes take `BEGIN IMMEDIATE`; read-only commands (`list`, `show`, `next`, `stale`, `events`, `route`, `runs`, `platform`, `watch`) use a plain deferred read. `spawn`, `resume`, `retire` and baseline refresh are exceptions: they never hold the write lock while a platform command or worktree engine runs, and hold the ticket's in-flight marker instead (see "Launching sessions"). Older databases gain new columns and tables (`bounces`, `runs`) automatically on first use.
 
 ### `config.json`
 
@@ -119,6 +119,69 @@ SQLite is authoritative. `orch show` exposes `bounces` and `ci_repairs` in text 
 On first addition of a missing budget column, a transactional migration counts successful `kind=phase` transitions into `fix` from the relevant origins. It requires an initial `add` event into `ready`, a continuous recorded phase chain and agreement with the current phase. Missing or detectably truncated history produces a durable unknown count. Later opens do not repeat migration or recalculate initialized counts downward. Pre-bounces databases use the same history checks for review/verify bounces. Complete history with no repairs establishes zero.
 
 These checks cannot detect every loss, such as removal of an entire round trip that leaves a continuous chain. Preserve database backups and external tracker/session evidence. If history is known or suspected to be incomplete, stop for human investigation before requesting repair; do not treat an apparently reconstructed zero as proof against that evidence. Unknown counts refuse the relevant repair until evidence-backed human reconciliation. An unknown bounce count also refuses every `orch run` with exit 3 because a dispatch snapshot cannot record unknown as zero or NULL. There is no reconciliation, reset or override CLI command. Keep the ticket blocked pending separately authorized state maintenance that recovers the actual count, never forgives attempts. Retain the recovered count, the reasoning and supporting event exports, backups, tracker links or session records in the tracker or durable evidence files; link those records in the block reason. The CLI does not itself collect or validate external reconciliation evidence.
+
+## Shared baseline failures
+
+A baseline record names one owning fix ticket, affected tickets and the `full-suite` gate. Confirmation is an explicit attestation that the failure reproduced on a base commit, not an inference from another ticket's red run. Command and output evidence must be nonempty. Retain the actual logs at the evidence paths. IDs must reference registered tickets; the base commit must exist in configured `BASE_BRANCH` history. Repeating identical confirmation is idempotent; a different finding needs a new ID.
+
+```sh
+orch baseline confirm ID --owner FIX --affected TICKET --affected OTHER \
+  --gate full-suite --base-sha BASE_SHA --command 'reproduction command' \
+  --output 'failure output and retained log path' --verified
+orch baseline show ID --json
+orch baseline gate TICKET --gate full-suite --json
+orch baseline resolve ID --fix-sha INTEGRATED_SHA
+```
+
+`show` exposes the evidence, `fix_sha` and per-ticket `refreshes`. `gate` returns `clear`, `wait`, `refresh`, `retest` or `recovery-needed`, with exit 0 even for a wait. Only the named gate waits; implementation and unrelated tickets remain runnable. The owner never waits on its own record. No phase or generic dependency graph is created. `next` puts ready owners of unresolved shared full-suite blockers before FIFO peers without changing worker limits.
+
+Main runs `resolve` once the owner is recorded `done` through `merged`, including immediately after confirmation when the fix was already merged. First update/check the configured base through the normal integration workflow. Pass the actual integrated commit from the tracker or verified merge evidence. `merged --sha` is the CI candidate, **not** necessarily the squash commit. `resolve` verifies reachability from the local configured base, records the fixing revision, and requests refresh only for stale affected worktrees. It never changes worktree Git. Repeat it after new worktrees appear; unchanged requests and events are idempotent.
+
+### Ticket-local refresh
+
+At a serial stage boundary, after the previous invocation and all its children have stopped:
+
+```sh
+orch baseline refresh ID --ticket TICKET --stage-boundary
+```
+
+Run from exactly the ticket worktree. It must be linked to `MAIN_CHECKOUT`, on its recorded branch, with no tracked, staged or untracked changes and no Git operation or index/HEAD lock in progress. `spawn` now records `worktree_branch` separately from platform `worktree_ref`. Legacy tickets without a recorded branch use their conventional ticket worktree name, never the observed current branch; a legacy custom branch requires separately authorized identity reconciliation. The configured base must still contain the fix. The command rebases onto that checked base SHA, with autostash disabled. It never force-resets, resolves conflicts or aborts a rebase.
+
+Pending `runs` are active/unknown stage evidence. A boundary flag, age, dead/idle session or handoff alone does not clear them. Existing complete `SubagentStop` evidence can establish completion. For harnesses that do not provide it, the **ticket orchestrator**, after the invocation returns, may attest one exact run:
+
+```sh
+orch complete-run TICKET --run SEQ --stopped \
+  --evidence 'returned call ID; child-process cleanup evidence; retained handoff path'
+```
+
+This requires the ticket-local linked worktree, a nonempty evidence string and explicit attestation that the invocation and all child work stopped. Known Pi child callers refuse. Completion is immutable and idempotent; it writes only `completed_at`, `completion_evidence` and an event. It does not forge `SubagentStop`, resolve the model, change routing/budgets, classify success or failure, or clear other pending runs. Failed or never-started invocations still need their own evidence before attestation. Model-routing diagnostics remain independent.
+
+Refresh commits a durable per-ticket reservation before running Git, without holding SQLite's write lock during the rebase. `run`, `spawn`, `resume`, `retire` and merge refuse while reserved. Other tickets can continue. Requested, guard-refused, refreshing, conflicted and success outcomes, plus recovery evidence, are inspectable in `show` and append-only ticket events. A guard refusal commits its event despite exit 3. Phase, bounce and CI repair counts stay unchanged.
+
+A conflict is retained for the ticket's recovery decision. An interrupt, timeout or crash leaves the reservation in place, even when the original process dies; a Git descendant may survive. No expiry clears it. After inspecting the process tree, stopping any remaining writers, and explicitly resolving or otherwise recovering Git state without discarding work:
+
+```sh
+orch baseline recover ID --ticket TICKET --stage-boundary --stopped \
+  --evidence 'process cleanup and Git recovery evidence'
+```
+
+Recovery refuses a still-live refresh process, pending stages, dirty work or unfinished Git operations. It changes only coordination state, not Git. If HEAD contains the fix, the next action is `retest`; otherwise the request remains for another refresh. It invalidates old CI and acknowledgment evidence. A malformed or uncertain reservation requires investigation, never automatic clearing.
+
+**Guard limits.** This is a cooperative serial-work protocol, not a filesystem sandbox. The CLI cannot authenticate the truth of attestation text, inspect every detached child, block an unrecorded agent or editor, or protect ignored/external files. Record every dispatch before starting it. The ticket orchestrator must exclude those writers throughout refresh and recovery, preserve ignored assets separately if needed, and leave unknown completion pending. Git hooks or unrelated terminals that bypass the protocol are outside the reservation. Do not attest merely to get past a refusal.
+
+### Fresh gates after refresh
+
+Revision-changing refresh appends invalidating CI verdicts without deleting historical results. Tests and independent review must run again against the current candidate. Keep the existing phase; redo the evidence work without inventing a backwards phase transition or spending a repair budget merely for refresh. Respect normal transitions if review actually requires a repair.
+
+After all required tests pass and a fresh independent reviewer returns, acknowledge both with retained evidence:
+
+```sh
+orch baseline ack ID --ticket TICKET --sha CURRENT_HEAD \
+  --tests 'full-suite command, green summary and log path' \
+  --review 'independent reviewer, verdict and artifact path'
+```
+
+Acknowledgment requires current clean HEAD containing the fix and no pending stages. It expires on any HEAD change. Record passing CI for that exact HEAD through `orch ci` as usual. CI alone cannot replace the acknowledgment, and acknowledgment alone cannot replace CI. Check `baseline gate` before the remote merge; `orch merged` also enforces the baseline gate and refreshed exact HEAD. The CLI records attestations, not the truth of external test/review output, so retain the artifacts. Project `local-tests` policy still omits separate browser/accessibility verification; it does not omit automated tests or independent review.
 
 ## Session health
 
@@ -247,7 +310,7 @@ Every command accepts `--json`, before or after the command name (one JSON objec
 | `orch add <ticket> --title T [--url U]` | main | New ticket in `ready`. Exit 3 if it exists. Exit 2 unless the id matches `^[A-Za-z0-9][A-Za-z0-9._-]*$` with no `..` (it names files under `logs/` and `briefs/`). |
 | `orch list` | any | All tickets: id, phase, status, platform, health, activity, last_seen_at, review_rounds, pid, alive, retired. |
 | `orch show <ticket>` | any | One ticket in full, including `alive`, `health` and `launch_ref`, plus `bounces`, `runs` (as `orch runs`), `model_mismatches` (runs with `match` 0) and `unrecorded_dispatches` (`dispatch_unrecorded` events). The text form prints the runs as a table after the fields. |
-| `orch next` | main | `ready` tickets, oldest first, limited to `max_workers` minus active tickets. Active = not `ready`/`done`/`blocked` and not retired. |
+| `orch next` | main | `ready` tickets, unresolved shared full-suite blocker owners first, then oldest first, limited to `max_workers` minus active tickets. Active = not `ready`/`done`/`blocked` and not retired. |
 | `orch spawn <ticket> [--worktree P] --brief-file F [--platform X] [--harness H]` | main | Requires `ready`. Without `--worktree`, the platform adapter creates the worktree first ([platforms.md](platforms.md)). Exit 3 if the realpath of `P` is the main checkout or contains it, lies inside the main checkout without being a linked worktree of its own (`git rev-parse --show-toplevel` there is the main checkout), or equals, contains or lies inside the worktree of another non-retired ticket that is not `ready` or `done`. Exit 3 while a launch is in progress (in-flight marker). Stores the brief, then launches per "Launching sessions" on `--platform` (default: the configured platform). Phase `dispatched`, attempt 1. |
 | `orch resume <ticket> [--note N] [--platform X] [--harness H]` | main | Exit 3 if the session is alive, a launch is in progress (in-flight marker), or the ticket is `ready`, `done` or retired. A `blocked` ticket first returns to its remembered phase (`unblock` event). Attempt + 1, then launches per "Launching sessions" on the ticket's platform, or `--platform`. |
 | `orch attach <ticket> [--ref R] [--session-id S]` | main | Record a Desktop session ref (stored as `{"desktop": R}`) and/or a session id for a session `orch` did not start. Writes an `attach` event. |
