@@ -1794,10 +1794,12 @@ def remove_worktree(platform, tid, worktree, wref, force):
         except ToolError as e:
             try:
                 reply = call_tool_json("orca", ["worktree", "list", "--json"])
-                entries = (reply.get("result") or {}).get("worktrees")
+                result = reply.get("result")
+                entries = result.get("worktrees") if isinstance(result, dict) else None
                 absent = isinstance(entries, list) and all(
-                    isinstance(entry, dict) and entry.get("path") and
-                    os.path.realpath(entry["path"]) != worktree for entry in entries)
+                    isinstance(entry, dict) and isinstance(entry.get("path"), str) and
+                    entry["path"] and os.path.realpath(entry["path"]) != worktree
+                    for entry in entries)
             except ToolError:
                 absent = False
             if not absent:
@@ -1980,13 +1982,17 @@ def platform_close(platform, ref, worktree):
         try:
             if platform == "herdr":
                 reply = call_tool_json(platform, ["workspace", "list"])
-                workspaces = (reply.get("result") or {}).get("workspaces")
-                if isinstance(workspaces, list) and all(isinstance(w, dict) and w.get("workspace_id") for w in workspaces):
+                result = reply.get("result")
+                workspaces = result.get("workspaces") if isinstance(result, dict) else None
+                if isinstance(workspaces, list) and all(
+                        isinstance(w, dict) and isinstance(w.get("workspace_id"), str) and
+                        w["workspace_id"] for w in workspaces):
                     if not any(w["workspace_id"] == ref["workspace"] for w in workspaces):
                         return True, None
             elif platform == "orca":
                 reply = call_tool_json(platform, ["terminal", "list", "--worktree", "path:" + worktree, "--json"])
-                terminals = (reply.get("result") or {}).get("terminals")
+                result = reply.get("result")
+                terminals = result.get("terminals") if isinstance(result, dict) else None
                 if isinstance(terminals, list) and not terminals:
                     return True, None
         except ToolError:

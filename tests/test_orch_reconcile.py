@@ -385,6 +385,95 @@ class ReconcileTests(OrchTestCase):
         with open(calls) as f:
             self.assertNotIn('--force', f.read())
 
+    def assert_malformed_inventory_continues(self, platform, resource, field, launch_ref):
+        path = self.completed()
+        self.db_exec("UPDATE tickets SET platform=?, launch_ref=? WHERE id='50'",
+                     (platform, json.dumps(launch_ref)))
+        # Discover a second real disposable project after the failing project.
+        other = ReconcileTests('test_standalone_completed_cleanup_and_idempotence')
+        other.setUp()
+        self.addCleanup(other.tearDown)
+        root = os.path.join(self.projects, 'zz-healthy')
+        os.rename(other.root, root)
+        other.root = root
+        other.repo = os.path.join(root, 'code', 'main')
+        other.state_dir = os.path.join(root, '.agents', 'orchestration')
+        other.env['ORCH_PROJECTS_DIR'] = self.projects
+
+        inventory = os.path.join(self.tmp, 'inventory.json')
+        calls = os.path.join(self.tmp, 'inventory-calls')
+        body = ('echo "$*" >> ' + self.quote(calls) + '\n'
+                'if [ "$1 $2" = ' + self.quote(resource + ' list') + ' ]; then\n'
+                '  cat ' + self.quote(inventory) + '\n  exit 0\nfi\n')
+        if resource == 'terminal':
+            body += ('if [ "$1 $2" = "worktree rm" ]; then\n'
+                     '  git -C ' + self.quote(self.repo) + ' worktree remove ' +
+                     self.quote(path) + ' || exit 1\n'
+                     '  echo \'{"result":{}}\'\n  exit 0\nfi\n')
+        if resource == 'worktree':
+            # An adapter may delete the checkout then lose its reply. A malformed
+            # inventory must not discharge the remaining adapter obligation.
+            body += ('if [ -d ' + self.quote(path) + ' ]; then\n'
+                     '  git -C ' + self.quote(self.repo) + ' worktree remove ' +
+                     self.quote(path) + ' || exit 1\nfi\n')
+        body += 'echo \'{"error":{"code":"offline","message":"adapter-offline"}}\'\n'
+        self.stub(platform, body)
+        replies = [{}, {'result': None}, {'result': []},
+                   {'result': ['malformed inventory']}, {'result': 'invalid'},
+                   {'result': 1}, {'result': True}, {'result': {}},
+                   *({'result': {field: value}} for value in
+                     (None, {}, 'invalid', 1, True, [None], [[]], [{}]))]
+        if field in ('workspaces', 'worktrees'):
+            key = 'workspace_id' if field == 'workspaces' else 'path'
+            replies.extend({'result': {field: [{key: value}]}}
+                           for value in (None, '', [], ['invalid'], {}, {'invalid': 1}, 1, True))
+            replies.append({'result': {field: [{key: 'disposable-workspace' if
+                                                    field == 'workspaces' else path}]}})
+        for index, reply in enumerate(replies):
+            with self.subTest(platform=platform, resource=resource, reply=reply):
+                tid = str(100 + index)
+                healthy = self.completed(tid)
+                other_path = other.completed(tid)
+                with open(inventory, 'w') as f:
+                    json.dump(reply, f)
+                p = self.orch('reconcile', '--json')
+                self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                # Check continuation before parsing output, so an uncaught adapter
+                # exception cannot masquerade as an ordinary attention result.
+                self.assert_complete(tid, healthy)
+                other.assert_complete(tid, other_path)
+                self.assertNotIn('Traceback', p.stdout + p.stderr)
+                outcomes = json.loads(p.stdout)['outcomes']
+                self.assertTrue(any(o['outcome'] == 'attention' for o in outcomes))
+                for value in (self.root, '50', path, 'adapter-offline'):
+                    self.assertIn(value, p.stderr)
+                self.assertFalse(is_retired(self.show('50')))
+                self.assertFalse(any(e['kind'] == 'retire' for e in self.events('50')))
+                if resource != 'worktree':
+                    self.assertTrue(os.path.isdir(path))
+                else:
+                    self.assertFalse(os.path.exists(path))
+                    self.git('show-ref', '--verify', 'refs/heads/ticket-50')
+        # Confirmed empty inventory, unlike malformed inventory, allows recovery.
+        with open(inventory, 'w') as f:
+            json.dump({'result': {field: []}}, f)
+        p = self.orch('reconcile', '--json')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assert_complete('50', path)
+        with open(calls) as f:
+            self.assertNotIn('--force', f.read())
+
+    def test_malformed_herdr_session_inventory_does_not_stop_reconcile(self):
+        self.assert_malformed_inventory_continues(
+            'herdr', 'workspace', 'workspaces', {'workspace': 'disposable-workspace'})
+
+    def test_malformed_orca_worktree_inventory_does_not_stop_reconcile(self):
+        self.assert_malformed_inventory_continues('orca', 'worktree', 'worktrees', {})
+
+    def test_malformed_orca_session_inventory_does_not_stop_reconcile(self):
+        self.assert_malformed_inventory_continues(
+            'orca', 'terminal', 'terminals', {'terminal': 'disposable-terminal'})
+
     def test_manual_retirement_claim_defers_concurrent_reconcile(self):
         import time
         path = self.completed()
