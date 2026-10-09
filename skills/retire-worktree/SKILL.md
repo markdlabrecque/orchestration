@@ -26,9 +26,10 @@ SKILL.md), then step out to the project root before removing anything.
 be the directory name of a linked worktree of the main checkout, wherever it
 lives on disk. `WORKTREE_ROOT` is not used by it (only by `reap-worktrees.sh`).
 
-Tears down one worktree completely: the Herdr workspace, the DDEV project
-(handed to a project's `RETIRE_HOOK` if one resolves), the directory on
-disk, and the local branch. For ticket worktrees, use `orch retire <id>`:
+Tears down the Herdr workspace, the DDEV project
+(handed to a project's `RETIRE_HOOK` if one resolves), and the directory on
+disk. Any remaining local branch is retained for manual cleanup; retirement
+stays pending until a retry verifies its absence. For ticket worktrees, use `orch retire <id>`:
 it closes the recorded platform through its adapters, calls this engine
 with its Herdr step disabled, and records completion only after teardown
 succeeds. Automatic cleanup uses that same path without `--force`.
@@ -52,7 +53,10 @@ the remaining resources, repair the named failure and retry the same id.
    (the entry whose `worktree.checkout_path` is the worktree →
    `workspace_id`), then `herdr workspace close <id>`. Without Herdr on PATH
    and without a saved workspace obligation, the engine reports a skip.
-   Valid inventories with no match report no workspace found. Failed
+   Valid inventories with no match report no workspace found. Every entry
+   must have valid identity fields and absolute paths; malformed entries,
+   including null or missing identities, cannot prove absence. A null
+   `open_workspace_id` explicitly means a closed worktree. Failed
    inspection or close refuses with exit 4 before DDEV or git teardown,
    unless both inventories confirm the workspace is already absent.
    The workspace identity is saved for retry. A `RETIRE_HOOK` does not
@@ -62,7 +66,7 @@ the remaining resources, repair the named failure and retry the same id.
    retiring the very worktree it is running in), its close is deferred:
    steps 4 and 5 run before closing it. Stdout explains the deferral.
    A failed deferred close exits 4 without reporting completion. Retry uses
-   the saved workspace identity even after the checkout and branch are gone.
+   the saved workspace identity even after the checkout is gone.
    If git removal fails first, stderr names the workspace left open and
    asks for a retry after repair. A different or unset `$HERDR_WORKSPACE_ID`
    closes in step 3 as normal.
@@ -97,10 +101,13 @@ the remaining resources, repair the named failure and retry the same id.
    exactly as if it were the delegate-shim re-entry case above.
 5. Recheck dirtiness and identity, then run `git worktree remove <worktree>`
    from the main checkout. Only explicit manual `--force` adds that flag.
-   Delete the saved branch with `git branch -D` only after confirming checkout
-   removal, unchanged branch HEAD and no other worktree using it. Any failure
-   exits 4. The recovery record survives interruption between checkout and
-   branch removal, so retry can finish without guessing from the directory name.
+   Retain any saved branch that still exists, even with `--force`, and exit 4
+   with manual recovery instructions. Git's branch ref lock does not exclude
+   another worktree claiming that branch, so neither an ownership check nor
+   an expected-old ref deletion makes automatic branch removal safe.
+   Follow [manual branch recovery](../orchestration/references/cleanup.md#manual-branch-recovery).
+   Keep the recovery record until a retry verifies branch absence. Detached
+   worktrees with no branch obligation can complete unattended.
 6. Final report: workspace id (`none closed` when there was none; marked
    "closed last: caller's own workspace" when its close was deferred per
    step 3), DDEV project name (the name the still-present
@@ -111,10 +118,11 @@ the remaining resources, repair the named failure and retry the same id.
 `--ddev-only` skips Herdr discovery and runs steps 1, 2 and 4 (lookup,
 the uncommitted-work check, then the DDEV
 delete or the retire hook) and stops with exit 0, leaving the checkout
-and its branch for the caller's platform to remove (`orch` uses it on Orca,
-then runs `orca worktree rm`). It combines with `--force`; without it a
+and its branch in place. This is partial project teardown, not permission
+for a caller to delete the branch. `orch` uses the full engine on every
+platform, including Orca. It combines with `--force`; without it a
 dirty worktree still refuses with exit 2. It rechecks dirtiness after the
-hook before handing deletion to the caller's platform. A saved workspace
+hook. A saved workspace
 obligation from an earlier direct invocation must still be closed, even when
 retrying in `--ddev-only` or orch-managed mode.
 
@@ -128,8 +136,9 @@ by default, is skipped by real-path comparison. `BASE_BRANCH` is resolved
 environment, then `.orch`, then refuses (no literal default — see the overrides
 table); `REMOTE` defaults to `origin`.
 
-Completion requires successful adapter teardown, checkout removal and branch
-deletion. Exit 0 from `--ddev-only` confirms only its partial teardown. For
+Completion requires successful adapter teardown, checkout removal and verified
+branch absence. Retained branches are a user-approved manual obligation, not
+a completed retirement. Exit 0 from `--ddev-only` confirms only its partial teardown. For
 pending `orch` retirement, use the recovery guidance in
 `../orchestration/references/cleanup.md`; retain recovery records until all
 obligations are resolved.

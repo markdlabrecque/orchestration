@@ -36,8 +36,25 @@ The service limits a pass to twenty minutes; individual retirement engines have 
 ## Repair and retry
 
 - Dirty tracked or untracked files, including hook edits, block deletion. Preserve or commit that work deliberately before retrying. Automatic cleanup never forces git or adapter removal. Existing ignored provisioning files retain the retirement engine's normal treatment.
-- Adapter, session-close, trust-config and git failures leave retirement pending. Restore the named tool or repair its reported failure, then rerun the restricted pass. Missing resources count as removed only when absence is observable.
-- Git identity and teardown progress live under the main repository's common git directory in `orch-retirement/<worktree-id>.json`. This lets a later pass finish branch deletion after checkout removal without guessing a branch name. Keep these records during recovery. A changed branch/HEAD, ambiguous worktree identity or missing checkout before confirmed adapter teardown refuses and needs human investigation. Never delete a record just to bypass that refusal.
+- Adapter, session-close, trust-config and git failures leave retirement pending. Restore the named tool or repair its reported failure, then rerun the restricted pass. Missing resources count as removed only when absence is observable. Inventory containers and every entry must have valid required identities and paths; a malformed response cannot discharge a saved obligation.
+- Git identity and teardown progress live under the main repository's common git directory in `orch-retirement/<worktree-id>.json`. The saved main checkout, path, branch and HEAD survive checkout removal. Keep these records during recovery. A changed checkout identity, ambiguous worktree identity or missing checkout before confirmed adapter teardown refuses and needs human investigation. Never delete a record just to bypass that refusal.
 - Desktop needs its session archive tool, unavailable in a user service. Automatic cleanup leaves the ticket and worktree pending and reports `orch retire <ticket>`. Run that command from a main Desktop session and execute the returned `desktop_archive` action. Retain its returned ref until archival succeeds. Repeated timer passes do not silently complete or repeatedly alert for the same pending archive.
+
+## Manual branch recovery
+
+The user-approved preservation policy replaces automatic branch deletion. Cleanup removes eligible checkouts and safe adapter resources, but retains any remaining branch as a durable manual obligation. Retirement stays pending, including for manual `orch retire --force` and direct engine calls. Detached worktrees with no branch obligation can still complete unattended. `--keep-worktree` cannot discharge a saved incomplete engine obligation.
+
+Git's ref lock does not prevent another worktree from claiming a branch between an ownership check and deletion. Even an expected-old ref transaction can delete a branch newly claimed by another checkout. Automation therefore does not attempt branch deletion.
+
+When the journal reports `MANUAL branch cleanup`, main or the operator must:
+
+1. Identify the exact project, ticket, main checkout, removed path, branch and recovery record from the attention message. Inspect the saved HEAD and the branch's current commits. Preserve any new work before removal.
+2. Establish controlled quiescence: stop repository writers, including other agents, checkouts and cleanup invocations. Inspect `git -C <main> worktree list --porcelain` and confirm that no other worktree owns the branch. A single inventory check without stopped writers is insufficient.
+3. Remove the branch manually using the exact `git -C <main> branch -d -- <branch>` command in the message. If Git refuses because commits are unmerged, preserve or land them first; the refusal is not permission to force deletion. Resume writers only after removal.
+4. Keep the recovery record and rerun `orch reconcile --project <project>` or `orch retire <ticket>` from main. A direct engine caller can retry `retire-worktree.sh <worktree-id>`. Completion requires verified branch absence and all remaining adapter obligations resolved. A successful retry records one retirement event; later passes are idempotent.
+
+Orca's worktree-removal command also deletes branches, so `orch` does not call it automatically, with or without force. After engine teardown it checks `orca worktree list --json`. If Orca still lists the resource, retirement remains pending with its exact id or path selector. Inspect and remove that resource manually under the same quiescence and preservation rules, then retry. Failed or malformed inventories leave it pending, not presumed absent.
+
+Stable pending branch messages produce one best-effort desktop notification, while every pass still reports attention in the journal. New obligations may produce a new alert.
 
 Ticket sessions and stage agents never retire themselves. Cleanup belongs to main or the explicitly enabled user timer.

@@ -9,8 +9,9 @@ set -uo pipefail
 #
 # Retire a finished worktree: close its Herdr workspace, delete its DDEV
 # project (or hand that to a project's RETIRE_HOOK, if one resolves), remove
-# the worktree, and retain its local branch for manual cleanup. The Herdr close is the engine's
-# own step (outside --ddev-only), hook or not. Failures leave teardown pending.
+# the worktree, and retain its local branch for manual cleanup. The Herdr
+# close is the engine's own step (outside --ddev-only), hook or not.
+# Failures and remaining branches leave teardown pending.
 # `orch` closes a ticket's platform itself and sets ORCH_RETIRE_MANAGED=1
 # to skip the engine's Herdr step.
 #
@@ -20,15 +21,15 @@ set -uo pipefail
 # project root, including the worktree being retired. Flags may appear in
 # any order after <id>.
 #
-# --force skips the uncommitted-work check (step 2) and lets git discard it
-# anyway.
+# --force skips the uncommitted-work check (step 2) and lets git discard it.
+# It never authorizes deleting the retained branch.
 #
 # --ddev-only skips Herdr discovery, runs steps 1, 2 and 4 (worktree lookup,
 # retire-hook resolution,
 # the uncommitted-work check, then the DDEV delete or the retire hook) and
 # stops with exit 0, leaving the worktree checkout and its branch in place
-# for the caller's platform to remove (e.g. `orca worktree rm`). Combinable
-# with --force; without it a dirty worktree still refuses with exit 2.
+# as a partial teardown only, not permission to delete a retained branch.
+# Combinable with --force; without it a dirty worktree still refuses with exit 2.
 # Saved workspace obligations from earlier direct calls must still close.
 #
 # Every step below is destructive and none of it is recoverable outside git's
@@ -46,7 +47,7 @@ set -uo pipefail
 # set to the still-existing worktree, BEFORE the worktree is removed, and
 # REPLACES this engine's own DDEV-delete step (step 4) only. The Herdr
 # close (step 3) runs before it from the engine itself either way, and the
-# git-level teardown (step 5: `git worktree remove` plus the branch delete)
+# git-level teardown (step 5: `git worktree remove` and branch absence check)
 # runs only after adapter success, since only the engine has the main checkout's
 # context once the worktree directory is gone. A project with no retire hook
 # anywhere is not required to have one -- the engine's own step 4 runs.
@@ -55,7 +56,7 @@ set -uo pipefail
 # $HERDR_WORKSPACE_ID (the agent is retiring the worktree it is running
 # in), closing it in step 3 would kill the agent's own pane -- and this
 # script with it -- before steps 4-6 ever run. In that case the close is
-# deferred until steps 4 (ddev) and 5 (git worktree + branch removal) finish.
+# deferred until steps 4 (ddev) and 5 (checkout removal) finish.
 # Step 6 reports success only after the deferred close succeeds.
 # A different or unset $HERDR_WORKSPACE_ID closes in step 3 as before. The
 # deferred workspace identity is saved outside the checkout for retry. A
@@ -112,7 +113,7 @@ main_repo="$MAIN_CHECKOUT"
 cd "$ORCH_ROOT" || exit 1
 
 # Persist exact git identity before adapters can destroy anything. The record
-# survives checkout removal, including interruption before branch deletion.
+# survives checkout removal and the wait for manual branch cleanup.
 progress="$(dirname "$ORCH_PROJECT_LIB")/retirement-progress.py"
 # On Linux, the inherited lock also covers an engine whose orch parent died.
 # Keep it in git metadata, not in the directory being removed.
@@ -353,7 +354,7 @@ fi
 if [ "$defer_own_close" -eq 1 ]; then
   close_workspace "$workspace_id" || exit $?
 fi
-branch_report="${branch:-none (detached worktree)} (removed or already absent)"
+branch_report="${branch:-none (detached worktree)} (confirmed absent)"
 if [ "$finish_rc" -ne 0 ]; then
   echo "retire-worktree:   DDEV project: $ddev_project"
   echo "retire-worktree:   path: $worktree"
