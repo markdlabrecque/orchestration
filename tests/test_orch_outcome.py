@@ -13,6 +13,88 @@ import subprocess
 from test_orch_routing import RoutingTestCase
 
 
+class OutcomeProjectionTests(RoutingTestCase):
+    """Direct writes by older clients must invalidate the committed projection."""
+
+    def git(self, *args, cwd=None):
+        return subprocess.run(
+            ['git', '-c', 'core.hooksPath=/dev/null', *args],
+            cwd=cwd or self.repo, env=self.env, check=True,
+            capture_output=True, text=True, timeout=20,
+        ).stdout.strip()
+
+    def setUp(self):
+        super().setUp()
+        self.add('t1')
+        self.run_seq = self.log_run('t1', 'implementor', 'standard')['seq']
+        # Reproduce the projection schema before repair-grant trigger migration.
+        # Its newer delete-trigger sentinels must also be absent so migration runs.
+        for name in ('state_md_run_outcomes_insert', 'state_md_run_outcomes_update',
+                     'state_md_run_outcomes_delete', 'state_md_repair_grants_delete',
+                     'state_md_second_repair_grants_delete'):
+            self.db_exec('DROP TRIGGER IF EXISTS ' + name)
+        self.assertEqual(self.outcome_triggers(), [])
+
+    def outcome_triggers(self):
+        return self.db_exec("SELECT name FROM sqlite_master WHERE type='trigger' "
+                            "AND name LIKE 'state_md_run_outcomes_%' ORDER BY name")
+
+    def migrate(self):
+        self.ok('show', 't1')
+
+    def revision(self):
+        return self.db_exec('SELECT revision FROM state_md_revision WHERE id=1')[0][0]
+
+    def insert_outcome(self, ticket, marker):
+        self.db_exec("INSERT INTO run_outcomes "
+                     "(ticket,run_seq,timestamp,revision,failure_category,"
+                     "deliverable_state,recovery_action,evidence) "
+                     "VALUES (?,?,'legacy','fixture-revision','invocation_failure',"
+                     "'none','retry',?)",
+                     (ticket, self.run_seq, json.dumps({'detail': marker})))
+
+    def test_legacy_open_installs_all_outcome_revision_triggers(self):
+        self.migrate()
+        self.assertEqual(self.outcome_triggers(), [
+            ('state_md_run_outcomes_delete',), ('state_md_run_outcomes_insert',),
+            ('state_md_run_outcomes_update',)])
+
+    def test_direct_real_outcome_mutations_each_increment_revision(self):
+        self.migrate()
+        before = self.revision()
+        self.insert_outcome('t1', 'real-outcome-64')
+        self.assertEqual(self.revision(), before + 1, 'direct INSERT')
+        before = self.revision()
+        self.db_exec("UPDATE run_outcomes SET revision='changed' WHERE ticket='t1'")
+        self.assertEqual(self.revision(), before + 1, 'direct UPDATE')
+        before = self.revision()
+        self.db_exec("DELETE FROM run_outcomes WHERE ticket='t1'")
+        self.assertEqual(self.revision(), before + 1, 'direct DELETE')
+
+    def test_selftest_outcome_mutations_do_not_invalidate_or_project(self):
+        self.migrate()
+        self.add('selftest-outcome-64')
+        self.ok('state-md', 'rebuild')
+        state = Path(self.root, 'STATE.md')
+        baseline = state.read_bytes()
+        before = self.revision()
+        self.insert_outcome('selftest-outcome-64', 'excluded-outcome-64')
+        self.assertEqual(self.revision(), before, 'selftest INSERT')
+        self.ok('state-md', 'rebuild')
+        self.assertEqual(state.read_bytes(), baseline)
+        self.assertNotIn(b'excluded-outcome-64', state.read_bytes())
+        self.db_exec("UPDATE run_outcomes SET evidence=? WHERE ticket=?",
+                     (json.dumps({'detail': 'excluded-update-64'}), 'selftest-outcome-64'))
+        self.assertEqual(self.revision(), before, 'selftest UPDATE')
+        self.ok('state-md', 'rebuild')
+        self.assertEqual(state.read_bytes(), baseline)
+        self.assertNotIn(b'excluded-update-64', state.read_bytes())
+        self.db_exec("DELETE FROM run_outcomes WHERE ticket='selftest-outcome-64'")
+        self.assertEqual(self.revision(), before, 'selftest DELETE')
+        self.ok('state-md', 'rebuild')
+        self.assertEqual(state.read_bytes(), baseline)
+
+
 class OutcomeTests(RoutingTestCase):
     def git(self, *args, cwd=None):
         return subprocess.run(
