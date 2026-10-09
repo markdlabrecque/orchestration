@@ -61,7 +61,7 @@ class BaselineTests(OrchTestCase):
     def confirm(self):
         return self.j(*self.confirm_args())
 
-    def record(self):
+    def baseline_record(self):
         return self.j("baseline", "show", "walk")
 
     def gate(self, tid="affected", gate="full-suite"):
@@ -94,7 +94,7 @@ class BaselineTests(OrchTestCase):
     def test_confirmation_persists_evidence_and_prioritizes_only_ready_owner(self):
         self.assertEqual(self.tickets("next")[0]["id"], "affected")
         self.confirm()
-        record = self.record()
+        record = self.baseline_record()
         for key, value in {"id": "walk", "owner": "fix", "affected": ["affected"],
                            "gate": "full-suite", "base_sha": self.base,
                            "command": self.command, "output": self.output}.items():
@@ -105,7 +105,7 @@ class BaselineTests(OrchTestCase):
         self.assertEqual(self.gate("fix")["action"], "clear")
         self.assertEqual(self.gate(gate="implementation")["action"], "clear")
         self.assertEqual(self.show("affected")["phase"], "ready")
-        self.ok("run", "affected", "implementor", "--model", "standard", "--effort", "low")
+        self.ok("run", "affected", "--role", "implementor", "--model", "standard", "--effort", "low")
         self.ok("block", "fix", "--reason", "needs decision")
         self.assertIn("affected", [t["id"] for t in self.tickets("next")])
         self.assertNotIn("fix", [t["id"] for t in self.tickets("next")])
@@ -113,7 +113,7 @@ class BaselineTests(OrchTestCase):
     def test_invalid_confirmation_is_atomic_and_cannot_infer_verification(self):
         # First prove the subcommand exists, so parser rejection is not a false green.
         self.confirm()
-        before = self.record()
+        before = self.baseline_record()
         cases = [("--verified", None), ("--command", " "), ("--output", ""),
                  ("--base-sha", "not-a-revision"), ("--owner", "missing"),
                  ("--affected", "missing")]
@@ -128,7 +128,7 @@ class BaselineTests(OrchTestCase):
                 p = self.orch(*args)
                 self.assertNotEqual(p.returncode, 0)
                 self.assertNotIn("Traceback", p.stderr)
-                self.assertEqual(self.record(), before)
+                self.assertEqual(self.baseline_record(), before)
 
     def test_self_owner_has_no_wait_cycle(self):
         args = self.confirm_args()
@@ -143,7 +143,7 @@ class BaselineTests(OrchTestCase):
         args = self.confirm_args() + ["--affected", "current"]
         self.ok(*args)
         self.resolve()
-        before = self.record()
+        before = self.baseline_record()
         self.assertEqual(before["fix_sha"], self.fix_sha)
         self.assertEqual(before["refreshes"]["affected"]["status"], "requested")
         self.assertNotIn("current", before["refreshes"])
@@ -153,7 +153,7 @@ class BaselineTests(OrchTestCase):
         self.assertEqual(self.gate()["action"], "refresh")
         events = self.events("affected")
         self.resolve()
-        self.assertEqual(self.record(), before)
+        self.assertEqual(self.baseline_record(), before)
         self.assertEqual(self.events("affected"), events)
 
     def test_squash_fix_revision_is_distinct_from_recorded_ci_candidate(self):
@@ -163,8 +163,8 @@ class BaselineTests(OrchTestCase):
         self.ok("ci", "fix", "--sha", self.old_head, "--passed")
         self.ok("merged", "fix", "--sha", self.old_head)
         self.resolve()
-        self.assertEqual(self.record()["fix_sha"], self.fix_sha)
-        self.assertNotEqual(self.record()["fix_sha"], self.old_head)
+        self.assertEqual(self.baseline_record()["fix_sha"], self.fix_sha)
+        self.assertNotEqual(self.baseline_record()["fix_sha"], self.old_head)
         self.assertEqual(self.gate()["action"], "refresh")
 
     def test_resolution_requires_done_owner_and_fix_reachable_from_base(self):
@@ -174,7 +174,7 @@ class BaselineTests(OrchTestCase):
         self.merged_fix()
         # Ticket-only candidate exists, but is not integrated into main.
         self.refused(3, "baseline", "resolve", "walk", "--fix-sha", self.old_head)
-        self.assertFalse(self.record().get("fix_sha"))
+        self.assertFalse(self.baseline_record().get("fix_sha"))
         self.assert_unchanged()
 
     def test_refresh_preserves_work_phase_budgets_and_invalidates_revision_evidence(self):
@@ -218,7 +218,7 @@ class BaselineTests(OrchTestCase):
                 self.assert_unchanged()
                 self.assertEqual(path.read_text(), "authorized partial work\n")
                 self.assertEqual(self.git("status", "--porcelain", cwd=self.wt), status)
-                self.assertEqual(self.record()["refreshes"]["affected"]["status"], "guard-refused")
+                self.assertEqual(self.baseline_record()["refreshes"]["affected"]["status"], "guard-refused")
                 if mode == "untracked":
                     path.unlink()
                 else:
@@ -226,11 +226,11 @@ class BaselineTests(OrchTestCase):
 
     def test_pending_stage_run_refuses_even_with_explicit_boundary(self):
         self.requested()
-        run = self.j("run", "affected", "implementor", "--model", "standard", "--effort", "low")
+        run = self.j("run", "affected", "--role", "implementor", "--model", "standard", "--effort", "low")
         self.refused(3, "baseline", "refresh", "walk", "--ticket", "affected",
                      "--stage-boundary", cwd=self.wt)
         self.assert_unchanged()
-        self.assertEqual(self.record()["refreshes"]["affected"]["status"], "guard-refused")
+        self.assertEqual(self.baseline_record()["refreshes"]["affected"]["status"], "guard-refused")
         # Existing SubagentStop completion evidence, not session health.
         self.db_exec("UPDATE runs SET agent_id='finished', model_resolved='claude-sonnet-test', "
                      "resolved_at='2026-01-01T00:00:00Z', match=1 WHERE seq=?", (run["seq"],))
@@ -297,7 +297,7 @@ class BaselineTests(OrchTestCase):
             while not entered.exists() and proc.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.02)
             self.assertTrue(entered.exists(), "refresh never reached Git rebase")
-            self.refused(3, "run", "affected", "implementor", "--model", "standard",
+            self.refused(3, "run", "affected", "--role", "implementor", "--model", "standard",
                          "--effort", "low", timeout=5)
             self.assertEqual(self.j("runs", "affected")["runs"], [])
         finally:
@@ -310,6 +310,127 @@ class BaselineTests(OrchTestCase):
                 raise
         self.assertEqual(proc.returncode, 0, (out, err))
 
+    def test_completion_attestation_is_local_exact_and_separate_from_routing(self):
+        self.requested()
+        run = self.j("run", "affected", "--role", "implementor", "--model", "standard", "--effort", "low")
+        args = ["complete-run", "affected", "--run", str(run["seq"]),
+                "--evidence", "child call returned; process tree stopped; handoff.txt"]
+        self.refused(3, *args, cwd=self.wt)
+        self.refused(3, *args, "--stopped", cwd=self.repo)
+        self.refused(3, *args, "--stopped", "--evidence", " ", cwd=self.wt)
+        self.refused(4, *args, "--stopped", "--run", "99999", cwd=self.wt)
+        self.env["PI_SUBAGENT_CHILD"] = "1"
+        try:
+            self.refused(3, *args, "--stopped", cwd=self.wt)
+        finally:
+            self.env.pop("PI_SUBAGENT_CHILD")
+        pending = self.j("runs", "affected")["runs"][0]
+        self.assertIsNone(pending["completed_at"])
+        finished = self.j(*args, "--stopped", cwd=self.wt)
+        for field in ("agent_id", "model_resolved", "resolved_at", "match"):
+            self.assertIsNone(finished[field])
+        for field in ("model_requested", "tier", "effort_requested", "bounce_count"):
+            self.assertEqual(finished[field], run[field])
+        events = self.events("affected")
+        self.assertEqual(self.j(*args, "--stopped", cwd=self.wt), finished)
+        self.assertEqual(self.events("affected"), events)
+        self.refused(3, *args, "--stopped", "--evidence", "changed", cwd=self.wt)
+        self.assertEqual(self.refresh()["status"], "success")
+
+    def test_one_completion_does_not_clear_other_pending_runs(self):
+        self.requested()
+        runs = [self.j("run", "affected", "--role", "implementor", "--model", "standard",
+                       "--effort", "low") for _ in range(2)]
+        self.ok("complete-run", "affected", "--run", str(runs[0]["seq"]), "--stopped",
+                "--evidence", "first call returned, no child work remains", cwd=self.wt)
+        self.refused(3, "baseline", "refresh", "walk", "--ticket", "affected",
+                     "--stage-boundary", cwd=self.wt)
+        self.assert_unchanged()
+
+    def test_ack_expires_when_candidate_changes_and_requires_integrated_fix(self):
+        self.requested()
+        self.refresh()
+        head = self.git("rev-parse", "HEAD", cwd=self.wt)
+        self.ok("baseline", "ack", "walk", "--ticket", "affected", "--sha", head,
+                "--tests", "passed", "--review", "independent review passed")
+        self.commit(self.wt, "more.txt", "later change\n")
+        self.assertEqual(self.gate()["action"], "retest")
+        self.git("reset", "--hard", self.old_head, cwd=self.wt)
+        self.refused(3, "baseline", "ack", "walk", "--ticket", "affected", "--sha", self.old_head,
+                     "--tests", "passed", "--review", "independent review passed")
+
+    def test_configured_base_rewind_refuses_without_mutation(self):
+        self.requested()
+        self.git("reset", "--hard", self.base)
+        self.refused(3, "baseline", "refresh", "walk", "--ticket", "affected",
+                     "--stage-boundary", cwd=self.wt)
+        self.assert_unchanged()
+        self.assertEqual(self.baseline_record()["refreshes"]["affected"]["status"], "guard-refused")
+
+    def test_interrupted_refresh_reservation_requires_explicit_recovery(self):
+        self.requested()
+        self.db_exec("UPDATE tickets SET phase='ci' WHERE id='affected'")
+        self.ok("ci", "affected", "--sha", self.old_head, "--passed")
+        real_git = shutil.which("git", path=self.env.get("PATH"))
+        shimdir = Path(self.tmp, "interrupt-git")
+        shimdir.mkdir()
+        entered, release = Path(self.tmp, "entered"), Path(self.tmp, "release")
+        finished = Path(self.tmp, "git-finished")
+        shim = shimdir / "git"
+        shim.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, subprocess, sys, time\n"
+            "if 'rebase' in sys.argv[1:]:\n"
+            "    pathlib.Path(%r).touch()\n"
+            "    deadline = time.monotonic() + 15\n"
+            "    while not pathlib.Path(%r).exists():\n"
+            "        if time.monotonic() > deadline: sys.exit(99)\n"
+            "        time.sleep(0.02)\n"
+            "    result = subprocess.run([%r] + sys.argv[1:], capture_output=True)\n"
+            "    pathlib.Path(%r).write_text(str(result.returncode))\n"
+            "    sys.exit(result.returncode)\n"
+            "os.execv(%r, [%r] + sys.argv[1:])\n"
+            % (str(entered), str(release), real_git, str(finished), real_git, real_git))
+        shim.chmod(0o755)
+        env = dict(self.env, PATH=str(shimdir) + os.pathsep + self.env["PATH"])
+        proc = subprocess.Popen(
+            [ORCH, "baseline", "refresh", "walk", "--ticket", "affected", "--stage-boundary"],
+            cwd=self.wt, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        recovery = ["baseline", "recover", "walk", "--ticket", "affected", "--stage-boundary",
+                    "--stopped", "--evidence", "Git and descendants exited; clean work inspected"]
+        try:
+            deadline = time.monotonic() + 10
+            while not entered.exists() and proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(entered.exists())
+            self.refused(3, *recovery, cwd=self.wt)
+            proc.kill()
+            proc.wait(timeout=5)
+            self.refused(3, "run", "affected", "--role", "implementor", "--model", "standard", "--effort", "low")
+            self.assertEqual(self.gate()["action"], "recovery-needed")
+        finally:
+            release.touch()
+            out, err = proc.communicate(timeout=20)
+        deadline = time.monotonic() + 10
+        while not finished.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(finished.exists(), "surviving Git child did not finish")
+        self.assertEqual(finished.read_text(), "0")
+        self.git("merge-base", "--is-ancestor", self.fix_sha, "HEAD", cwd=self.wt)
+        self.refused(3, "baseline", "refresh", "walk", "--ticket", "affected", "--stage-boundary", cwd=self.wt)
+        self.refused(3, "baseline", "recover", "walk", "--ticket", "affected",
+                     "--stage-boundary", "--evidence", "no stopped attestation", cwd=self.wt)
+        self.ok(*recovery, cwd=self.wt)
+        self.assertEqual(self.gate()["action"], "retest")
+        self.refused(3, "merged", "affected", "--sha", self.old_head)
+        head = self.git("rev-parse", "HEAD", cwd=self.wt)
+        self.ok("baseline", "ack", "walk", "--ticket", "affected", "--sha", head,
+                "--tests", "fresh green suite", "--review", "fresh independent review")
+        self.refused(3, "merged", "affected", "--sha", head)
+        self.ok("ci", "affected", "--sha", head, "--passed")
+        self.ok("merged", "affected", "--sha", head)
+        self.assertTrue(any(e["kind"] == "baseline-recovered" for e in self.events("affected")))
+
     def test_rebase_conflict_is_preserved_and_recorded_for_recovery(self):
         self.commit(self.wt, "README", "ticket edit\n")
         self.requested(conflict=True)
@@ -318,7 +439,7 @@ class BaselineTests(OrchTestCase):
         self.assertTrue(self.git("diff", "--name-only", "--diff-filter=U", cwd=self.wt))
         rebase = self.git("rev-parse", "--git-path", "rebase-merge", cwd=self.wt)
         self.assertTrue(Path(rebase).exists())
-        self.assertEqual(self.record()["refreshes"]["affected"]["status"], "conflicted")
+        self.assertEqual(self.baseline_record()["refreshes"]["affected"]["status"], "conflicted")
         self.assertEqual(self.gate()["action"], "recovery-needed")
         snapshot = Path(self.wt, "README").read_text()
         self.refused(3, "baseline", "refresh", "walk", "--ticket", "affected",

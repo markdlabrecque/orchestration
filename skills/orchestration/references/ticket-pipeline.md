@@ -53,7 +53,7 @@ Every stage dispatch (and any investigation or filing subagent) runs on the mode
 
 1. `orch route <ticket> --role <role> [--files N] [--lines N] [--ambiguous]`. Roles: `test-writer`, `implementor`, `reviewer`, `verifier`, `reporter`, `investigation`, `filer`.
 2. `orch run <ticket> --role <role> --model <tier> --effort <effort>` with the `tier` and `effort` `route` printed and the same flags. Pass the tier to preserve its identity in the run record: on Pi and Codex two tiers can share a model, and the bare model reads as the lower one. Replaying the printed tier and effort with unchanged ticket state and flags satisfies the floor; changed state or flags can still cause a refusal. On refusal (exit 3), read the reason. For a below-floor value, retry with the appropriate route output for the current ticket state and flags. For unknown-history or frontier refusals, stop routing, recording and dispatching; retain the findings and explicitly `orch block` for a human as described below. Unknown history requires evidence-backed human reconciliation, not a retry. Never work around a refusal.
-3. Dispatch using the preceding `route` output, not the tier passed to `run`. Claude: pass the printed model and `effort` to the Agent tool. Pi: pass the printed model and `thinking` on the `subagent` call. Codex: spawn the printed `agent` type where available; its file carries the model and effort. Roles without per-rung agents have no printed `agent`; do not invent an agent name.
+3. Retain the `run` sequence for this invocation. Dispatch using the preceding `route` output, not the tier passed to `run`. Claude: pass the printed model and `effort` to the Agent tool. Pi: pass the printed model and `thinking` on the `subagent` call. Codex: spawn the printed `agent` type where available; its file carries the model and effort. Roles without per-rung agents have no printed `agent`; do not invent an agent name.
 
 Flags:
 
@@ -65,7 +65,7 @@ A bounce is a successful `orch phase <ticket> fix` from `review` or `verify`: it
 
 A CI repair (`ci -> fix`) is not a bounce and adds no bounce rung. It leaves `bounces` and `review_rounds` unchanged, without erasing review-entry history. Use the normal role default and applicable floors, including highest recorded tier minus one. If the highest recorded tier is `heavy`, the last implementor recorded the current bounce count, and there is no other escalation, the CI-repair implementor routes at `standard/low`. CI repair does not always mean standard and does not preserve the prior effort. Review/verification bounces still escalate effort first as described above.
 
-After each stage, `orch show <ticket>`. `model_mismatches` > 0 (a subagent ran on another model than requested) or `unrecorded_dispatches` > 0 (a stage agent ran without `orch run`) is a permitted stop: `orch block <ticket> --reason "model routing failed: <which run, requested vs resolved>"`.
+After each stage returns and all child work has stopped, retain its return/process-cleanup evidence. Where the harness did not record completion, use `orch complete-run` for that exact sequence as described in [Shared baseline failures](orch-cli.md#shared-baseline-failures). Completion is separate from model resolution and from judging the stage's result; never forge a hook or bulk-clear pending runs. Then `orch show <ticket>`. `model_mismatches` > 0 (a subagent ran on another model than requested) or `unrecorded_dispatches` > 0 (a stage agent ran without `orch run`) is a permitted stop: `orch block <ticket> --reason "model routing failed: <which run, requested vs resolved>"`.
 
 The ordinary last-implementor `frontier/high` refusal happens at `orch phase <ticket> fix`, after the budget check. It exits 3 with human-block advice and leaves state unchanged. A read-only implementor route remains possible in `review` after that refusal and normally returns `heavy/low` without extra flags, since no bounce was recorded. That route cannot authorize a fix dispatch. Stop, retain the findings and explicitly `orch block <ticket>` for a human with the findings as the reason.
 
@@ -110,6 +110,7 @@ Borderline calls go to a follow-up ticket.
 
 Sibling tickets run in their own sessions at the same time. No file locks: merge conflicts happen, and you resolve them.
 
+- At every serial stage boundary and before declaring the full suite passed, check `orch baseline gate <ticket> --gate full-suite`. For confirmed baseline failures or refresh requests, follow [Shared baseline failures](orch-cli.md#shared-baseline-failures): wait only on that gate, finish useful implementation, then let this ticket orchestrator refresh locally after all writers stop. Preserve conflicts for recovery. Rerun the required tests and fresh independent review, acknowledge current-HEAD evidence, and rerun exact-head CI before merging. Main only records requests. A `wait` is not permission to hand off a red suite as complete.
 - Rebase onto `BASE_BRANCH` right before pushing, and again if it moved before the merge. Re-run the gates after every rebase. A green branch plus a green base does not mean a green merge.
 - Resolve conflicts by keeping both tickets' intent. Use the `resolving-merge-conflicts` skill. If a conflict needs a decision that changes what either ticket builds, that is a permitted stop.
 - Prefer additive interface changes (a new function alongside the old one) over changing a signature siblings call.
@@ -137,7 +138,7 @@ Ask once, two options max, with a recommendation. Once answered, run to the end.
 | "MR is up. Watch CI?" | Watch it to a verdict in the same turn. |
 | "A human should eyeball it" | Put "manual QA outstanding: <what>" in the MR and report, then carry on. |
 | "Wait for the other branch, or rebase?" | Rebase onto `BASE_BRANCH`, re-run gates, continue. |
-| CI red on a job your diff can't touch | Rebase and re-run. If still red, name the breaking commit in the MR, file or link the follow-up, and continue. |
+| CI red on a job your diff can't touch | Reproduce on the base and retain evidence. If confirmed shared baseline breakage, name the owning fix and use the baseline coordination flow above. Continue useful implementation, not merge or green handoff; the full-suite gate still requires passing evidence. |
 | One-line lint fix blocking green | Fix it. |
 | Visible defect in this ticket's own output | Fix it. It's the deliverable. |
 | "Reviewer found a separate bug. File it?" | File it. Report the ID. |

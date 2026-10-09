@@ -107,9 +107,11 @@ NEW_COLUMNS = (
     ("bounces", "INTEGER DEFAULT 0"),
     # NULL is a durable unknown historical count, never an unused budget.
     ("ci_repairs", "INTEGER DEFAULT 0"),
+    ("baseline_refresh", "TEXT"),
+    ("worktree_branch", "TEXT"),
 )
 # Columns added to `runs` after the first release (effort rungs).
-NEW_RUN_COLUMNS = ("effort_requested", "effort_resolved")
+NEW_RUN_COLUMNS = ("effort_requested", "effort_resolved", "completed_at", "completion_evidence")
 # Model routing (orch-cli.md "Model routing"). Tiers in order; each role's
 # default tier; per-harness dispatch values (heavy and frontier share a model
 # on Codex and Pi). Two effort rungs per tier; a rung is tier * 2 + effort.
@@ -183,6 +185,10 @@ CREATE TABLE IF NOT EXISTS ci_results (
     sha TEXT NOT NULL,
     verdict TEXT NOT NULL,
     ts TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS baselines (
+    id TEXT PRIMARY KEY,
+    record TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS selftest_runs (
     run TEXT PRIMARY KEY,
@@ -442,7 +448,7 @@ def connect(sdir, timeout=30):
         db.execute("PRAGMA journal_mode=WAL")
     have = {r[0] for r in db.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
-    if not {"tickets", "events", "ci_results", "selftest_runs", "runs"} <= have:
+    if not {"tickets", "events", "ci_results", "selftest_runs", "runs", "baselines"} <= have:
         db.executescript(SCHEMA)
     ticket_cols = {r[1] for r in db.execute("PRAGMA table_info(tickets)")}
     run_cols = {r[1] for r in db.execute("PRAGMA table_info(runs)")}
@@ -623,6 +629,8 @@ def ticket_dict(row, cfg, full=True, alive=None):
             "attempt": row["attempt"],
             "session_id": row["session_id"],
             "worktree": row["worktree"],
+            "worktree_branch": row["worktree_branch"],
+            "baseline_refresh": row["baseline_refresh"],
             "prior_phase": row["prior_phase"],
             "launch_ref": row_launch_ref(row),
             "launched_at": row["launched_at"],
@@ -682,6 +690,359 @@ def is_active(row):
     return row["phase"] not in ("ready", "done", "blocked") and row["retired_at"] is None
 
 
+# ---- shared baseline coordination --------------------------------------------
+
+
+def baseline_records(db):
+    return [json.loads(r[0]) for r in db.execute("SELECT record FROM baselines ORDER BY id")]
+
+
+def baseline_get(db, bid):
+    row = db.execute("SELECT record FROM baselines WHERE id=?", (bid,)).fetchone()
+    if row is None:
+        raise Refusal(EXIT_NOT_FOUND, "unknown baseline %s" % bid)
+    return json.loads(row[0])
+
+
+def baseline_save(db, record, tid, kind, detail=None):
+    db.execute("INSERT INTO baselines VALUES (?,?) ON CONFLICT(id) DO UPDATE SET record=excluded.record",
+               (record["id"], json.dumps(record, sort_keys=True)))
+    row = get_ticket(db, tid)
+    log_event(db, tid, "baseline-" + kind, row["phase"], row["phase"],
+              json.dumps({"baseline": record["id"], "detail": detail}, sort_keys=True))
+
+
+def baseline_git(path, *argv, timeout=20):
+    try:
+        result = subprocess.run(["git", "-C", path, *argv], text=True,
+                                capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Refusal(EXIT_GATE, "baseline Git check failed: %s" % e)
+    if result.returncode:
+        raise Refusal(EXIT_GATE, "baseline Git check failed: %s" % result.stderr.strip())
+    return result.stdout.strip()
+
+
+def baseline_commit(path, revision):
+    return baseline_git(path, "rev-parse", "--verify", "--end-of-options", revision + "^{commit}")
+
+
+def baseline_base():
+    branch, config = base_branch()
+    if not branch:
+        raise Refusal(EXIT_GATE, "set BASE_BRANCH in %s" % config)
+    main = main_checkout()
+    return main, baseline_commit(main, branch)
+
+
+def baseline_contains(path, ancestor, head):
+    return baseline_git(path, "merge-base", ancestor, head) == ancestor
+
+
+def baseline_head(row):
+    if not row["worktree"] or not os.path.isdir(row["worktree"]):
+        raise Refusal(EXIT_GATE, "ticket has no available worktree")
+    return baseline_commit(row["worktree"], "HEAD")
+
+
+def baseline_local(row):
+    path = row["worktree"]
+    if not path or not os.path.isdir(path) or os.path.realpath(os.getcwd()) != os.path.realpath(path):
+        raise Refusal(EXIT_GATE, "run from the recorded ticket worktree")
+    main = main_checkout()
+    common = baseline_git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    expected = baseline_git(main, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    linked = baseline_git(main, "worktree", "list", "--porcelain").splitlines()
+    if (os.path.realpath(common) != os.path.realpath(expected)
+            or os.path.realpath(path) == os.path.realpath(main)
+            or "worktree " + os.path.realpath(path) not in linked
+            or not os.path.isfile(os.path.join(path, ".git"))):
+        raise Refusal(EXIT_GATE, "ticket path must be a linked worktree of MAIN_CHECKOUT")
+    branch = baseline_git(path, "symbolic-ref", "--short", "HEAD")
+    # worktree_ref normally holds platform JSON, not a branch. Accept the
+    # legacy plain branch form, but never infer identity from current HEAD.
+    expected_branch = (row["worktree_branch"]
+                       or (row["worktree_ref"] if not row_worktree_ref(row) else None)
+                       or worktree_name(row["id"]))
+    if not expected_branch or branch != expected_branch:
+        raise Refusal(EXIT_GATE, "ticket worktree is on the wrong branch")
+    return path
+
+
+def refuse_if_refreshing(row):
+    if row["baseline_refresh"]:
+        raise Refusal(EXIT_GATE, "baseline refresh active or interrupted for %s; recovery needed" % row["id"])
+
+
+def baseline_idle(db, row):
+    refuse_if_launching(row)
+    pending = db.execute("SELECT seq FROM runs WHERE ticket=? AND completed_at IS NULL"
+                         " AND (resolved_at IS NULL OR agent_id IS NULL OR model_resolved IS NULL) LIMIT 1",
+                         (row["id"],)).fetchone()
+    if pending:
+        raise Refusal(EXIT_GATE, "pending stage run %s; completion evidence required" % pending[0])
+
+
+def baseline_clean(path):
+    for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge",
+                   "rebase-apply", "sequencer", "BISECT_LOG", "index.lock", "HEAD.lock"):
+        location = baseline_git(path, "rev-parse", "--path-format=absolute", "--git-path", marker)
+        if os.path.exists(location):
+            raise Refusal(EXIT_GATE, "Git operation in progress: %s" % marker)
+    if baseline_git(path, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"):
+        raise Refusal(EXIT_GATE, "dirty tracked, staged or untracked work; preserve it before refresh")
+
+
+def baseline_action(db, record, tid, gate):
+    if tid == record["owner"] or tid not in record["affected"] or gate != record["gate"]:
+        return "clear"
+    if not record.get("fix_sha"):
+        return "wait"
+    refresh = record["refreshes"].get(tid)
+    if not refresh:
+        row = get_ticket(db, tid)
+        if not row["worktree"]:
+            return "clear"
+        try:
+            return "clear" if baseline_contains(row["worktree"], record["fix_sha"], baseline_head(row)) else "refresh"
+        except Refusal:
+            return "recovery-needed"
+    row = get_ticket(db, tid)
+    if row["baseline_refresh"] or refresh["status"] == "conflicted":
+        return "recovery-needed"
+    if refresh["status"] != "success":
+        return "refresh"
+    try:
+        head = baseline_head(row)
+    except Refusal:
+        return "recovery-needed"
+    return "clear" if refresh.get("ack_sha") == head else "retest"
+
+
+def baseline_text(value, name):
+    if not value or not value.strip():
+        raise Refusal(EXIT_GATE, "%s requires nonempty evidence" % name)
+    return value
+
+
+def cmd_baseline(args, db, sdir):
+    if args.baseline_cmd == "refresh":
+        return baseline_refresh(args, db)
+    # Reads do not contend with the reservation held during Git work.
+    with transaction(db, write=args.baseline_cmd not in ("show", "gate")):
+        op = args.baseline_cmd
+        if op == "gate":
+            get_ticket(db, args.ticket)
+            actions = [baseline_action(db, b, args.ticket, args.gate) for b in baseline_records(db)]
+            action = next((a for a in ("recovery-needed", "wait", "refresh", "retest") if a in actions), "clear")
+            return emit(args, {"action": action}, action)
+        if op == "confirm":
+            if not TICKET_ID.fullmatch(args.id) or not args.verified:
+                raise Refusal(EXIT_GATE, "confirmation requires a valid id and --verified baseline reproduction")
+            get_ticket(db, args.owner)
+            affected = sorted(set(args.affected))
+            for tid in affected:
+                get_ticket(db, tid)
+            main, base = baseline_base()
+            sha = baseline_commit(main, args.base_sha)
+            if not baseline_contains(main, sha, base):
+                raise Refusal(EXIT_GATE, "verified revision must be reachable from BASE_BRANCH")
+            record = dict(id=args.id, owner=args.owner, affected=affected, gate=args.gate,
+                          base_sha=sha, command=baseline_text(args.command, "command"),
+                          output=baseline_text(args.output, "output"), fix_sha=None, refreshes={})
+            previous = db.execute("SELECT record FROM baselines WHERE id=?", (args.id,)).fetchone()
+            if previous:
+                existing = json.loads(previous[0])
+                if any(existing[k] != record[k] for k in record if k not in ("fix_sha", "refreshes")):
+                    raise Refusal(EXIT_GATE, "baseline id already confirmed; use a new id for different evidence")
+                record = existing
+            else:
+                baseline_save(db, record, args.owner, "confirmed", record)
+        else:
+            record = baseline_get(db, args.id)
+            if op == "resolve":
+                owner = get_ticket(db, record["owner"])
+                merged = db.execute("SELECT 1 FROM events WHERE ticket=? AND kind='merged' LIMIT 1",
+                                    (owner["id"],)).fetchone()
+                if owner["phase"] != "done" or not merged:
+                    raise Refusal(EXIT_GATE, "fix owner must be recorded merged/done")
+                main, base = baseline_base()
+                fix = baseline_commit(main, args.fix_sha)
+                if not baseline_contains(main, fix, base):
+                    raise Refusal(EXIT_GATE, "fix SHA is not integrated into BASE_BRANCH")
+                if record.get("fix_sha") and record["fix_sha"] != fix:
+                    raise Refusal(EXIT_GATE, "baseline already resolved to another fix")
+                if not record.get("fix_sha"):
+                    record["fix_sha"] = fix
+                    baseline_save(db, record, owner["id"], "resolved", fix)
+                for tid in record["affected"]:
+                    if tid == owner["id"] or tid in record["refreshes"]:
+                        continue
+                    row = get_ticket(db, tid)
+                    if not row["worktree"] or row["retired_at"]:
+                        continue
+                    try:
+                        head = baseline_head(row)
+                        stale = not baseline_contains(main, fix, head)
+                    except Refusal:
+                        # Unknown/missing worktrees must not look current.
+                        head, stale = None, True
+                    if stale:
+                        record["refreshes"][tid] = dict(status="requested", old_sha=head)
+                        baseline_save(db, record, tid, "requested", record["refreshes"][tid])
+            elif op == "recover":
+                row = get_ticket(db, args.ticket)
+                refresh = record["refreshes"].get(args.ticket)
+                if not refresh or not args.stopped or not args.stage_boundary:
+                    raise Refusal(EXIT_GATE, "recovery needs a request, --stopped and --stage-boundary")
+                evidence = baseline_text(args.evidence, "recovery")
+                if row["baseline_refresh"]:
+                    try:
+                        marker = json.loads(row["baseline_refresh"])
+                        if not isinstance(marker, dict) or not isinstance(marker.get("pid"), int) or not marker.get("baseline"):
+                            raise ValueError("missing reservation identity")
+                    except (ValueError, TypeError):
+                        raise Refusal(EXIT_GATE, "invalid refresh reservation; investigate retained state")
+                    if marker["baseline"] != args.id:
+                        raise Refusal(EXIT_GATE, "another baseline owns the refresh reservation")
+                    if (target_exists(marker["pid"], False)
+                            and (not marker.get("pid_start") or ps_field(marker["pid"], "lstart") == marker["pid_start"])):
+                        raise Refusal(EXIT_GATE, "refresh process still alive; wait for it to exit")
+                cleared = dict(row, baseline_refresh=None)
+                baseline_idle(db, cleared)
+                path = baseline_local(row)
+                baseline_clean(path)
+                main, base = baseline_base()
+                head = baseline_head(row)
+                if not baseline_contains(main, record["fix_sha"], base):
+                    raise Refusal(EXIT_GATE, "configured base no longer contains the fix")
+                integrated = baseline_contains(path, record["fix_sha"], head)
+                refresh.update(status="success" if integrated else "requested", new_sha=head,
+                               recovery_evidence=evidence)
+                refresh.pop("ack_sha", None)
+                baseline_invalidate_ci(db, args.ticket)
+                db.execute("UPDATE tickets SET baseline_refresh=NULL WHERE id=?", (args.ticket,))
+                baseline_save(db, record, args.ticket, "recovered", refresh)
+            elif op == "ack":
+                row = get_ticket(db, args.ticket)
+                baseline_idle(db, row)
+                refresh = record["refreshes"].get(args.ticket)
+                if not refresh or refresh["status"] != "success":
+                    raise Refusal(EXIT_GATE, "ack requires a successful refresh")
+                head = baseline_head(row)
+                baseline_clean(row["worktree"])
+                if not baseline_contains(row["worktree"], record["fix_sha"], head):
+                    raise Refusal(EXIT_GATE, "current HEAD no longer contains the baseline fix")
+                if args.sha != head:
+                    raise Refusal(EXIT_GATE, "tests and independent review must cover current HEAD")
+                refresh.update(ack_sha=head, tests=baseline_text(args.tests, "tests"),
+                               review=baseline_text(args.review, "review"))
+                baseline_save(db, record, args.ticket, "ack", refresh)
+        emit(args, record, json.dumps(record, sort_keys=True))
+
+
+cmd_baseline.own_tx = True
+
+
+def baseline_refresh(args, db):
+    failure = None
+    with transaction(db):
+        record = baseline_get(db, args.id)
+        row = get_ticket(db, args.ticket)
+        refresh = record["refreshes"].get(args.ticket)
+        if not refresh:
+            raise Refusal(EXIT_GATE, "no refresh requested for this ticket")
+        try:
+            if row["retired_at"] or row["phase"] == "done":
+                raise Refusal(EXIT_GATE, "cannot refresh a done or retired ticket")
+            if not args.stage_boundary:
+                raise Refusal(EXIT_GATE, "refresh requires --stage-boundary")
+            baseline_idle(db, row)
+            path = baseline_local(row)
+            baseline_clean(path)
+            main, base = baseline_base()
+            if not baseline_contains(main, record["fix_sha"], base):
+                raise Refusal(EXIT_GATE, "configured base no longer contains the fix")
+            head = baseline_head(row)
+            if refresh["status"] == "success" and baseline_contains(path, record["fix_sha"], head):
+                return emit(args, refresh, "success")
+        except Refusal as e:
+            failure = e
+            # Preserve conflicts and reservations, even after a second refusal.
+            if refresh["status"] not in ("conflicted", "success") and not row["baseline_refresh"]:
+                refresh["status"] = "guard-refused"
+            baseline_save(db, record, args.ticket, "guard-refused", str(e))
+        if failure is None:
+            token = json.dumps(dict(token=uuid.uuid4().hex, baseline=args.id,
+                                    pid=os.getpid(), pid_start=ps_field(os.getpid(), "lstart")))
+            db.execute("UPDATE tickets SET baseline_refresh=? WHERE id=?", (token, args.ticket))
+            refresh.update(status="refreshing", old_sha=head, base_sha=base)
+            baseline_save(db, record, args.ticket, "refreshing", refresh)
+    if failure:
+        raise failure
+    # Durable reservation blocks dispatch without holding SQLite across Git.
+    # Interruption/timeout leaves it in place: a surviving Git child is unknown.
+    try:
+        result = subprocess.run(["git", "-C", path, "-c", "rebase.autoStash=false",
+                                 "-c", "rebase.updateRefs=false", "-c", "rerere.enabled=false",
+                                 "rebase", "--no-autostash", base],
+                                capture_output=True, text=True, timeout=600)
+        new_head = baseline_head(row)
+        if not result.returncode:
+            baseline_clean(path)
+            if not baseline_contains(path, base, new_head):
+                raise Refusal(EXIT_GATE, "rebase returned without the checked base in HEAD")
+    except (OSError, subprocess.TimeoutExpired, Refusal) as e:
+        with transaction(db):
+            record = baseline_get(db, args.id)
+            baseline_save(db, record, args.ticket, "recovery-needed", str(e))
+        raise Refusal(EXIT_GATE, "refresh interrupted; reservation retained; recovery needed: %s" % e)
+    with transaction(db):
+        record = baseline_get(db, args.id)
+        refresh = record["refreshes"][args.ticket]
+        refresh.update(status="conflicted" if result.returncode else "success", new_sha=new_head,
+                       output=result.stdout + result.stderr)
+        refresh.pop("ack_sha", None)
+        if new_head != head:
+            # Keep historical results; a later verdict invalidates each prior SHA.
+            baseline_invalidate_ci(db, args.ticket)
+        db.execute("UPDATE tickets SET baseline_refresh=NULL WHERE id=? AND baseline_refresh=?",
+                   (args.ticket, token))
+        baseline_save(db, record, args.ticket, refresh["status"], refresh)
+    if result.returncode:
+        raise Refusal(EXIT_GATE, "rebase failed; preserve Git state and recover explicitly: " + result.stderr.strip())
+    emit(args, refresh, "success; rerun affected tests and independent review")
+
+
+def baseline_invalidate_ci(db, tid):
+    for ci in db.execute("SELECT DISTINCT sha FROM ci_results WHERE ticket=?", (tid,)).fetchall():
+        db.execute("INSERT INTO ci_results(ticket,sha,verdict,ts) VALUES (?,?,?,?)",
+                   (tid, ci[0], "invalidated", now()))
+
+
+def cmd_complete_run(args, db, sdir):
+    row = get_ticket(db, args.ticket)
+    refuse_if_refreshing(row)
+    baseline_local(row)
+    if os.environ.get("PI_SUBAGENT_CHILD") == "1":
+        raise Refusal(EXIT_GATE, "completion must be attested by the ticket orchestrator after the child returns")
+    if not args.stopped:
+        raise Refusal(EXIT_GATE, "completion requires --stopped attestation for invocation and all child work")
+    evidence = baseline_text(args.evidence, "completion")
+    run = db.execute("SELECT * FROM runs WHERE seq=? AND ticket=?", (args.run, args.ticket)).fetchone()
+    if run is None:
+        raise Refusal(EXIT_NOT_FOUND, "run does not belong to this ticket")
+    if run["completed_at"]:
+        if run["completion_evidence"] != evidence:
+            raise Refusal(EXIT_GATE, "run completion is immutable")
+    else:
+        db.execute("UPDATE runs SET completed_at=?, completion_evidence=? WHERE seq=?",
+                   (now(), evidence, args.run))
+        log_event(db, args.ticket, "run-completed", row["phase"], row["phase"],
+                  json.dumps({"run": args.run, "evidence": evidence}))
+    emit(args, dict(db.execute("SELECT * FROM runs WHERE seq=?", (args.run,)).fetchone()), "completed")
+
+
 # ---- in-flight marker ----------------------------------------------------------
 # spawn, resume and retire run platform commands and engines without holding
 # the write lock. The `launching` column claims the ticket meanwhile, so a
@@ -713,6 +1074,7 @@ def launch_in_progress(row):
 
 
 def refuse_if_launching(row, tid=None):
+    refuse_if_refreshing(row)
     m = launch_in_progress(row)
     if m:
         raise Refusal(EXIT_GATE, "launch in progress for %s: orch pid %s started a %s at"
@@ -1943,6 +2305,10 @@ def cmd_next(args, db, sdir):
     active = sum(1 for r in rows if is_active(r))
     slots = max(0, int(cfg.get("max_workers", 3)) - active)
     ready = [r for r in rows if r["phase"] == "ready" and r["retired_at"] is None]
+    owners = {b["owner"] for b in baseline_records(db)
+              if not b.get("fix_sha") and b["gate"] == "full-suite"
+              and any(t != b["owner"] for t in b["affected"])}
+    ready.sort(key=lambda r: r["id"] not in owners)
     emit_tickets(args, ready[:slots], cfg)
 
 
@@ -2078,9 +2444,9 @@ def spawn_claimed(db, sdir, cfg, tid, brief, platform, worktree, wref, marker,
                 "UPDATE tickets SET phase='dispatched', platform=?, pid=NULL,"
                 " pid_start=NULL, session_id=?, worktree=?, attempt=1, brief=?,"
                 " activity=NULL, session_seen=0, launch_ref=NULL, launched_at=?,"
-                " worktree_ref=?, harness=? WHERE id=?",
+                " worktree_ref=?, worktree_branch=?, harness=? WHERE id=?",
                 (platform, sid, worktree, brief, now(),
-                 json.dumps(wref) if wref else None, harness, tid))
+                 json.dumps(wref) if wref else None, git_branch_of(worktree), harness, tid))
             ev = log_event(db, tid, "spawn", "ready", "dispatched",
                            "session=%s platform=%s%s" % (
                                sid, platform,
@@ -2352,6 +2718,14 @@ def cmd_ci(args, db, sdir):
 
 def cmd_merged(args, db, sdir):
     row = get_ticket(db, args.ticket)
+    refuse_if_refreshing(row)
+    for baseline in baseline_records(db):
+        if baseline_action(db, baseline, args.ticket, baseline["gate"]) != "clear":
+            raise Refusal(EXIT_GATE, "shared baseline gate requires refresh, tests and review")
+        refresh = baseline["refreshes"].get(args.ticket)
+        if refresh and refresh.get("new_sha"):
+            if args.sha != baseline_head(row):
+                raise Refusal(EXIT_GATE, "merge SHA must be the refreshed current HEAD")
     if row["phase"] != "ci":
         raise Refusal(EXIT_GATE, "merged requires phase ci; %s is %s"
                       % (args.ticket, row["phase"]))
@@ -2644,6 +3018,7 @@ def cmd_route(args, db, sdir):
 
 def cmd_run(args, db, sdir):
     row = get_ticket(db, args.ticket)
+    refuse_if_refreshing(row)
     harness = row_harness(row)
     if args.role not in ROLE_TIERS:
         route_tier(db, row, args.role)  # raises the usage error
@@ -3908,6 +4283,39 @@ def build_parser():
             sp.add_argument(a)
         return sp
 
+    baseline = sub.add_parser("baseline", parents=[common], help="coordinate confirmed shared baseline failures")
+    commands = baseline.add_subparsers(dest="baseline_cmd", required=True)
+    for name in ("confirm", "show", "gate", "resolve", "refresh", "ack", "recover"):
+        bp = commands.add_parser(name, parents=[common])
+        bp.set_defaults(fn=cmd_baseline)
+        bp.add_argument("ticket" if name == "gate" else "id")
+        if name == "confirm":
+            bp.add_argument("--owner", required=True)
+            bp.add_argument("--affected", action="append", required=True)
+            bp.add_argument("--base-sha", required=True)
+            bp.add_argument("--command", required=True)
+            bp.add_argument("--output", required=True)
+            bp.add_argument("--verified", action="store_true")
+        if name in ("confirm", "gate"):
+            bp.add_argument("--gate", required=True, **({"choices": ("full-suite",)} if name == "confirm" else {}))
+        if name == "resolve":
+            bp.add_argument("--fix-sha", required=True)
+        if name in ("refresh", "ack", "recover"):
+            bp.add_argument("--ticket", required=True)
+        if name in ("refresh", "recover"):
+            bp.add_argument("--stage-boundary", action="store_true")
+        if name == "recover":
+            bp.add_argument("--stopped", action="store_true")
+            bp.add_argument("--evidence", required=True)
+        if name == "ack":
+            for flag in ("sha", "tests", "review"):
+                bp.add_argument("--" + flag, required=True)
+    complete = sub.add_parser("complete-run", parents=[common], help="attest a stage invocation and its children have stopped")
+    complete.set_defaults(fn=cmd_complete_run)
+    complete.add_argument("ticket")
+    complete.add_argument("--run", type=int, required=True)
+    complete.add_argument("--evidence", required=True)
+    complete.add_argument("--stopped", action="store_true")
     add("init", cmd_init)
     add("platform", cmd_platform)
     add("preflight", cmd_preflight)
