@@ -50,6 +50,65 @@ class BudgetTests(RoutingTestCase):
             self.record_route(*rung)
             self.ok("phase", "t1", "review")
 
+    def test_report_recovery_preserves_history_and_third_repair_slot(self):
+        self.to_ci("t1")
+        self.phases("t1", "fix", "ci", "fix", "review")
+        self.record_route("standard", "low")
+        for tier, effort in (("standard", "high"), ("heavy", "low")):
+            self.phases("t1", "fix")
+            self.record_route(tier, effort)
+            self.phases("t1", "review")
+        self.ok("phase", "t1", "report")
+        before = self.snapshot()
+        bounces, ci_repairs, rounds = self.counts()
+        note = "integration review findings require renewed review"
+        self.ok("phase", "t1", "review", "--note", note)
+        after = self.snapshot()
+        self.assertEqual(self.counts(), (bounces, ci_repairs, rounds + 1))
+        self.assertEqual((bounces, ci_repairs), (2, 2))
+        for table in ("runs", "ci_results"):
+            self.assertEqual(after[table], before[table])
+        self.assertEqual(after["events"][:-1], before["events"])
+        event = self.events("t1")[-1]
+        self.assertEqual((event["kind"], event["from_phase"], event["to_phase"]),
+                         ("phase", "report", "review"))
+        self.assertIn(note, str(event))
+        self.ok("phase", "t1", "fix")
+        self.assertEqual(self.counts(), (3, 2, rounds + 1))
+        self.record_route("heavy", "high")
+        self.phases("t1", "review", "report", "review")
+        self.refuse_unchanged(r"bounce.*budget")
+        self.assertEqual(self.counts(), (3, 2, rounds + 3))
+
+    def test_report_recovery_preserves_unknown_budgets(self):
+        self.to_review("t1")
+        self.ok("phase", "t1", "report")
+        # Isolated corrupt-history fixture, never a live state repair.
+        self.db_exec("UPDATE tickets SET bounces=NULL, ci_repairs=NULL WHERE id='t1'")
+        self.ok("phase", "t1", "review")
+        self.assertEqual(self.counts(), (None, None, 2))
+        self.refuse_unchanged(r"unknown.*bounces")
+
+    def test_report_recovery_preserves_frontier_refusal(self):
+        self.to_review("t1")
+        self.log_run("t1", "implementor", CLAUDE["frontier"], effort="high")
+        self.phases("t1", "report", "review")
+        self.assertEqual(self.counts(), (0, 0, 2))
+        self.refuse_unchanged(r"frontier")
+
+    def test_report_recovery_retired_guard_and_direct_fix_refusal(self):
+        self.to_review("t1")
+        self.ok("phase", "t1", "report")
+        before = self.snapshot()
+        p = self.refused(3, "phase", "t1", "fix")
+        self.assertIn("illegal transition", p.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.ok("retire", "t1", "--force", "--keep-worktree")
+        before = self.snapshot()
+        p = self.refused(3, "phase", "t1", "review")
+        self.assertIn("retired", p.stderr)
+        self.assertEqual(self.snapshot(), before)
+
     def test_new_ticket_inspection_text_and_json(self):
         self.add("t1")
         self.assertEqual(self.counts(), (0, 0, 0))

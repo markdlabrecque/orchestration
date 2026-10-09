@@ -135,12 +135,13 @@ implement  -> review
 review     -> fix | verify | report    (report = no-code or local-tests lane)
 fix        -> review | ci
 verify     -> fix | report
-report     -> mr
+report     -> mr | review             (review = recovery for new findings)
 mr         -> ci
 ci         -> fix | mr
 ```
 
 - Entering `review` adds 1 to `review_rounds`.
+- When new integration findings arise in `report`, use `orch phase <ticket> review --note "<findings link>"` to reopen review. This appends a phase event and increments `review_rounds`, preserving prior history, run snapshots and both repair budgets, including unknown counts. Before dispatching corrective work, successfully enter `fix` through the normal `review -> fix` budget and frontier gates. `report -> fix` remains illegal, and retired tickets cannot reopen.
 - CI repairs do not count as review rounds. `fix -> ci` returns straight to CI after such a repair.
 - `review -> fix` and `verify -> fix` share three successful bounces per ticket, persisted in `bounces`. A fourth exits 3 before dispatch. Budget exhaustion is checked before the last-implementor `frontier/high` gate, which may refuse earlier without consuming a bounce. Review entries have no cap.
 - `ci -> fix` consumes one of two independent repairs, persisted in `ci_repairs`; a third exits 3. It changes neither `bounces` nor `review_rounds` and is not subject to the review frontier gate. `fix -> ci` consumes nothing.

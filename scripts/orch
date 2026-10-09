@@ -46,7 +46,7 @@ TRANSITIONS = {
     "review": {"fix", "verify", "report"},
     "fix": {"review", "ci"},
     "verify": {"fix", "report"},
-    "report": {"mr"},
+    "report": {"mr", "review"},
     "mr": {"ci"},
     "ci": {"fix", "mr"},
 }
