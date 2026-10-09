@@ -49,11 +49,13 @@ Verifier findings go through the same fix-now / follow-up triage as review findi
 
 ## Model routing
 
-Every stage dispatch (and any investigation or filing subagent) runs on the model `orch` picks. Never choose one yourself, and never dispatch without a recorded run.
+Every stage dispatch (and any investigation or filing subagent) uses an `orch` routing decision or recorded replay. Record it before dispatch. For a new stage:
 
 1. `orch route <ticket> --role <role> [--files N] [--lines N] [--ambiguous]`. Roles: `test-writer`, `implementor`, `reviewer`, `verifier`, `reporter`, `investigation`, `filer`.
 2. `orch run <ticket> --role <role> --model <tier> --effort <effort>` with the `tier` and `effort` `route` printed and the same flags. Pass the tier to preserve its identity in the run record: on Pi and Codex two tiers can share a model, and the bare model reads as the lower one. Replaying the printed tier and effort with unchanged ticket state and flags satisfies the floor; changed state or flags can still cause a refusal. On refusal (exit 3), read the reason. For a below-floor value, retry with the appropriate route output for the current ticket state and flags. For unknown-history or frontier refusals, stop routing, recording and dispatching; retain the findings and explicitly `orch block` for a human as described below. Unknown history requires evidence-backed human reconciliation, not a retry. Never work around a refusal.
 3. Retain the `run` sequence for this invocation. Dispatch using the preceding `route` output, not the tier passed to `run`. Claude: pass the printed model and `effort` to the Agent tool. Pi: pass the printed model and `thinking` on the `subagent` call. Codex: spawn the printed `agent` type where available; its file carries the model and effort. Roles without per-rung agents have no printed `agent`; do not invent an agent name.
+
+For an infrastructure retry of a recorded stage, use `orch retry <ticket> --run <seq> --json` instead of the new-stage sequence. Read the fresh JSON and dispatch from `dispatch`, including its exact model and effort/thinking or Codex agent. The retry is already recorded. Keep the source run sequence when invocation fails; recomputing `route` can lose a recorded fix's higher effort. Repeated retries link to their immediate sources and spend neither repair budget. A deliberate routing change requires `--model`, `--effort` and a nonempty `--reason`; it still obeys current gates. On refusal, stop dispatch and resolve the reported context or provenance problem. See [orch-cli.md](orch-cli.md#infrastructure-retry) for the CLI/JSON contract used by recovery tooling. Failure classification is outside this command.
 
 Flags:
 
