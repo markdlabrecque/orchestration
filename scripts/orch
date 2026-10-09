@@ -4455,7 +4455,7 @@ def subagent_report(payload):
 
 
 def record_subagent(db, tid, phase, ts, role, agent_id, resolved, effort, meta_model):
-    """Attach evidence to a known agent before using the oldest pending run."""
+    """Attach evidence to a known agent, else the oldest unsuperseded pending run."""
     run = None
     if agent_id and agent_id != "unknown":
         run = db.execute("SELECT * FROM runs WHERE ticket=? AND role=? AND agent_id=?"
@@ -4483,8 +4483,15 @@ def record_subagent(db, tid, phase, ts, role, agent_id, resolved, effort, meta_m
             return
         # Late first model evidence uses the normal resolution check below.
     else:
-        run = db.execute("SELECT * FROM runs WHERE ticket=? AND role=? AND agent_id IS NULL"
-                         " ORDER BY seq LIMIT 1", (tid, role)).fetchone()
+        # A recorded retry supersedes its source for anonymous pairing, even
+        # after the retry completes. Keep the source as provenance, and let a
+        # known source agent's late evidence take the identity path above.
+        run = db.execute("SELECT pending.* FROM runs AS pending"
+                         " WHERE pending.ticket=? AND pending.role=? AND pending.agent_id IS NULL"
+                         " AND NOT EXISTS (SELECT 1 FROM runs AS retry"
+                         " WHERE retry.ticket=pending.ticket AND retry.role=pending.role"
+                         " AND retry.retry_of=pending.seq)"
+                         " ORDER BY pending.seq LIMIT 1", (tid, role)).fetchone()
     if run is None:
         log_event(db, tid, "dispatch_unrecorded", phase, phase,
                   "role=%s resolved=%s requested=%s" % (role, resolved or "-",

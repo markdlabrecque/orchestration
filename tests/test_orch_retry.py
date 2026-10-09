@@ -9,7 +9,115 @@ import json
 import os
 import sqlite3
 
-from test_orch_routing import PI, RoutingTestCase
+from test_orch_routing import PI, RoutingTestCase, assistant
+from test_orch_platforms import PlatformTestCase
+
+
+class RetryHookTests(PlatformTestCase):
+    def setUp(self):
+        super().setUp()
+        self.wt = self.git_wt("retry-hook")
+        self.spawn_on("t1", "headless", self.wt)
+        self.sid = self.show("t1")["session_id"]
+
+    def dispatch(self, model="standard"):
+        return self.j("run", "t1", "--role", "implementor", "--model", model,
+                      "--effort", "high")
+
+    def retry(self, source, *extra):
+        return self.j("retry", "t1", "--run", str(source["seq"]), *extra)
+
+    def runs(self):
+        return self.j("runs", "t1")["runs"]
+
+    def observe(self, agent_id, model="claude-sonnet-5-5"):
+        path = os.path.join(self.tmp, "retry-transcript.jsonl")
+        with open(path, "w") as stream:
+            stream.write(json.dumps(assistant(model, "high")) + "\n")
+        result = self.hook_ok("SubagentStop", self.sid, self.wt, extra={
+            "agent_type": "orchestration:implementor", "agent_id": agent_id,
+            "agent_transcript_path": path if model else None})
+        self.assertEqual((result.stdout, result.stderr), ("", ""))
+
+    def assert_completed(self, before, after, agent_id, model):
+        self.assertEqual(after, dict(before, agent_id=agent_id, model_resolved=model,
+                                    effort_resolved="high", match=1,
+                                    resolved_at=after["resolved_at"]))
+        self.assertTrue(after["resolved_at"])
+        self.assertFalse([e for e in self.events("t1") if e["kind"] == "model_mismatch"])
+
+    def test_exact_retry_completion_leaves_unlaunched_source_unchanged(self):
+        source = self.dispatch()
+        replay = self.retry(source)
+        self.observe("retry-agent")
+        rows = self.runs()
+        self.assertEqual(rows[0], source)
+        self.assert_completed(replay, rows[1], "retry-agent", "claude-sonnet-5-5")
+        self.observe("retry-agent")
+        self.assertEqual(self.runs(), rows, "duplicate completion must keep its identity")
+
+    def test_deliberate_retry_completion_leaves_unlaunched_source_unchanged(self):
+        source = self.dispatch()
+        replay = self.retry(source, "--model", "heavy", "--effort", "high",
+                            "--reason", "provider failure; approved replacement")
+        self.observe("retry-agent", "claude-opus-5-5")
+        rows = self.runs()
+        self.assertEqual(rows[0], source)
+        self.assert_completed(replay, rows[1], "retry-agent", "claude-opus-5-5")
+
+    def test_retry_chain_completion_never_falls_back_to_unlaunched_ancestors(self):
+        source = self.dispatch()
+        first = self.retry(source)
+        latest = self.retry(first)
+        self.observe("latest-agent")
+        rows = self.runs()
+        self.assertEqual(rows[:2], [source, first])
+        self.assert_completed(latest, rows[2], "latest-agent", "claude-sonnet-5-5")
+        self.observe("unrecorded-agent")
+        self.assertEqual(self.runs(), rows)
+        events = [e for e in self.events("t1") if e["kind"] == "dispatch_unrecorded"]
+        self.assertEqual(len(events), 1)
+
+    def test_known_source_agent_keeps_late_evidence_after_retry(self):
+        source = self.dispatch()
+        self.observe("source-agent", model=None)
+        source = self.runs()[0]
+        replay = self.retry(source)
+        self.observe("source-agent")
+        rows = self.runs()
+        self.assert_completed(source, rows[0], "source-agent", "claude-sonnet-5-5")
+        self.assertEqual(rows[1], replay)
+        self.observe("retry-agent")
+        completed = self.runs()
+        self.assertEqual(completed[0], rows[0])
+        self.assert_completed(replay, completed[1], "retry-agent", "claude-sonnet-5-5")
+        self.observe("source-agent")
+        self.assertEqual(self.runs(), completed)
+
+    def test_unresolved_retry_identity_receives_its_late_evidence(self):
+        source = self.dispatch()
+        replay = self.retry(source)
+        self.observe("retry-agent", model=None)
+        rows = self.runs()
+        self.assertEqual(rows, [source, dict(replay, agent_id="retry-agent")])
+        self.observe("retry-agent")
+        completed = self.runs()
+        self.assertEqual(completed[0], source)
+        self.assert_completed(replay, completed[1], "retry-agent", "claude-sonnet-5-5")
+
+    def test_retry_preserves_fifo_for_unrelated_pending_runs(self):
+        source = self.dispatch()
+        unrelated = self.dispatch()
+        replay = self.retry(source)
+        self.observe("unrelated-agent")
+        rows = self.runs()
+        self.assertEqual(rows[0], source)
+        self.assert_completed(unrelated, rows[1], "unrelated-agent", "claude-sonnet-5-5")
+        self.assertEqual(rows[2], replay)
+        self.observe("retry-agent")
+        completed = self.runs()
+        self.assertEqual(completed[:2], rows[:2])
+        self.assert_completed(replay, completed[2], "retry-agent", "claude-sonnet-5-5")
 
 
 class RetryTests(RoutingTestCase):
