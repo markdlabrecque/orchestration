@@ -26,6 +26,7 @@ SQLite is authoritative. `<project root>/STATE.md` is a deterministic projection
 ```sh
 orch state-md check --json
 orch state-md rebuild --json
+orch state-md diagnostics --json
 ```
 
 `check` returns `{"fresh": true}` and exit 0 only when the managed bytes match the current committed revision and all observed retained legacy tails. Missing, stale, tampered or malformed content returns `{"fresh": false}` and exit 3 without repairing the file. `rebuild` publishes the current committed snapshot and returns `{"fresh": true}` on success. Rebuilding unchanged data preserves identical bytes and stored timestamps.
@@ -52,7 +53,23 @@ Later `check` calls compare every retained tail with its rendered copy. A new ta
 
 Keep `.STATE.md.legacy/` with STATE.md in backups and recovery. Retention is indefinite and consumes disk space for replaced documents; there is no automatic pruning because an arbitrarily delayed old writer may still hold any replaced descriptor. Filesystems must support same-filesystem hard links and fsync. Failure to retain the old inode refuses replacement and reports synchronization failure. This protocol preserves cooperating legacy appenders; unrelated editors that replace or truncate files without the locks remain outside it. A legacy writer's own un-fsynced write can still be lost to a machine crash before any repair observes it, just as under the old helper.
 
-Ordinary successful database commands, `init` and `watch` also reconcile stale output. Hooks reconcile even when an activity update is throttled. Commands that only inspect environment/platform configuration do not open the database and do not repair the document. `check` is the explicit non-repairing inspection path.
+### Retention diagnostics and operating limits
+
+`diagnostics` reports deterministic integer metrics, or readable labels without `--json`:
+
+- `retained_inode_count`: the number of validated retained inode links, including a preparation link to the current STATE.md inode.
+- `retained_bytes`: the sum of their full logical file sizes in bytes, including the full current inode size when linked. This is not allocated disk usage, and that current inode also has its public STATE.md name.
+- `scanned_tail_bytes`: the sum of size minus recorded pre-replacement length for superseded inodes. Current-inode preparation links contribute zero. This is the tail volume the freshness collector would read, including tails already projected by earlier rebuilds.
+
+Diagnostics opens no database, reads no document contents, fsyncs no tails and performs no repair. It leaves source revisions, events, workflow decisions, retention baselines and stale or missing STATE.md unchanged. Missing or empty retention reports zeros without creating the retention directory. Malformed names, inode mismatches and truncated superseded files refuse with exit 3 rather than report incomplete totals. It takes the stable publisher lock and shared inode locks; the lock file can be created if absent. Locks can wait for cooperating writers. Writers that ignore locks are outside the protocol. Sizes are observations under each inode lock, not a simultaneous snapshot of all late appenders.
+
+Every changed publication retains the previous complete document. Unchanged rebuilds add no link. As workflow history grows, repeated changed publications can therefore accumulate much more retained data than the current document size. Each freshness check enumerates all retained names and reads all superseded tails, not entire historical documents. It also renders the current database snapshot. There is no tail cursor: already-projected tails cost work again. Diagnostics enumerates the same names and stats the files without reading their tails. Its work grows with retained inode count; timing and allocated disk usage are not JSON fields.
+
+Keep STATE.md, `.STATE.md.legacy/`, and a consistent SQLite backup together. Preserve hard-link identity and recorded device/inode baselines during recovery; copying retained bytes to new inodes or restoring on a different device does not by itself preserve the protocol and will cause validation refusals. Plan recovery before relocating this data. Publication requires STATE.md and its retention directory on the same filesystem with hard-link and fsync support.
+
+Retention has no age-based deletion or automatic cleanup. Any manual cleanup requires explicit operator authorization, a recoverable backup, and recorded evidence that every legacy writer holding a current or superseded descriptor has exited and cannot resume appending. File age, a zero tail count, a fresh check, or absence of visible activity is not evidence of writer quiescence. Preserve the retained files while quiescence is uncertain. Diagnostics does not authorize cleanup or change branch and manual-cleanup obligations.
+
+Ordinary successful database commands, `init` and `watch` also reconcile stale output. Hooks reconcile even when an activity update is throttled. Commands that only inspect environment/platform configuration do not open the database and do not repair the document. `check` inspects freshness without repair; `diagnostics` inspects retention without repair.
 
 **Commit and export are separate.** A synchronization failure reports `database commit succeeded; STATE.md is stale or synchronization failed` on stderr. It retains the database commit and does not treat an export error as a failed launch or roll back lifecycle state. The ordinary CLI exits 3 after lifecycle cleanup; hooks retain exit 0 and expose the diagnostic on stderr. SQLite snapshot failures use the same controlled diagnostic, with any open read transaction released before lifecycle work continues. After fixing the reported filesystem, ownership or database-read problem, run `rebuild`, then `check`. Inspect committed state before retrying the original mutation: it may already have succeeded despite the nonzero exit.
 
@@ -430,7 +447,7 @@ Every command accepts `--json`, before or after the command name (one JSON objec
 | Command | Who | Effect |
 |---|---|---|
 | `orch init` | main | Create the directory and database, and synchronize STATE.md. Safe to re-run. |
-| `orch state-md check` / `orch state-md rebuild` | any | Inspect freshness without repair / publish committed records. See [STATE.md synchronization](#statemd-synchronization). |
+| `orch state-md check` / `orch state-md rebuild` / `orch state-md diagnostics` | any | Inspect freshness without repair / publish committed records / account retention without repair. See [STATE.md synchronization](#statemd-synchronization). |
 | `orch platform` | any | `{"platform": ...}` per "Platforms", and `harness`, `harness_source` per "Harnesses". |
 | `orch preflight` | main | Exit 0 and print `verify_env` (`ddev`, `docker` or `local-tests`), `base_branch` and `platform`. Exit 5 listing every failure. Checks: `BASE_BRANCH` set in the environment or `.orch` (an optional `export ` prefix is allowed; a quoted value is the text inside the quotes, an unquoted value ends at the first whitespace-then-`#` comment); verification environment is `local-tests` when `verify_policy` explicitly selects it, otherwise `ddev` when the main checkout has `.ddev/config.yaml` **and** `ddev` is on `PATH`, else `docker` when `config.json` has `verify_harness` **and** `docker` is on `PATH`, else failure; the platform's binary (`orca` or `herdr`) is on `PATH` when the platform needs one. |
 | `orch add <ticket> --title T [--url U]` | main | New ticket in `ready`. Exit 3 if it exists. Exit 2 unless the id matches `^[A-Za-z0-9][A-Za-z0-9._-]*$` with no `..` (it names files under `logs/` and `briefs/`). |

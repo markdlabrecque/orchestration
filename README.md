@@ -85,7 +85,7 @@ Each project lives in its own folder under `~/Projects` (`ORCH_PROJECTS_DIR` ove
 
 Set `ACCESSIBILITY_TESTS=true` in `.orch` to have the verifier run an automated accessibility scan (axe) on every screen a ticket changes. Any other value means off.
 
-`<project root>/STATE.md` shows committed SQLite workflow records in a generated section, alongside preserved human notes and legacy activity. Use `orch state-md check` to inspect freshness and `orch state-md rebuild` to repair stale output. For section ownership, automatic publication and recovery after export failures, see [STATE.md synchronization](skills/orchestration/references/orch-cli.md#statemd-synchronization).
+`<project root>/STATE.md` shows committed SQLite workflow records in a generated section, alongside preserved human notes and legacy activity. Use `orch state-md check` to inspect freshness and `orch state-md rebuild` to repair stale output. Use `orch state-md diagnostics --json` for read-only retained inode, logical byte and scanned-tail byte accounting. Changed publications retain complete previous documents indefinitely; unchanged rebuilds retain nothing new. For metric definitions, per-check costs, same-filesystem and backup requirements, writer-quiescence requirements before authorized manual cleanup, section ownership and recovery after export failures, see [STATE.md synchronization](skills/orchestration/references/orch-cli.md#statemd-synchronization).
 
 Every `.orch` key resolves the same way: environment variable, then `.orch`, then the default. Relative paths in `.orch` resolve against the project root.
 
