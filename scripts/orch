@@ -784,6 +784,19 @@ LOCAL_TESTS_CONTEXT = (
 )
 
 
+# Persist policy separately from instructions, which may change between launches.
+LOCAL_TESTS_MARKER = "<!-- orch:verify-policy=local-tests -->"
+
+# Frozen compatibility with briefs appended by #46, before policy markers existed.
+LEGACY_LOCAL_TESTS_CONTEXT = (
+    "Verification environment: local-tests\n"
+    "Run all project-required automated tests and retain complete passing evidence. "
+    "Independent review and exact-head CI are required before merge. "
+    "After review passes, go to report without a separate verify, browser or "
+    "accessibility stage. Missing, failed or incomplete test evidence is not passing."
+)
+
+
 def verification_policy(cfg):
     policy = cfg.get("verify_policy", "auto")
     if policy not in ("auto", "local-tests"):
@@ -793,7 +806,11 @@ def verification_policy(cfg):
 
 def retained_verification_context(brief):
     """Read launch-time policy from the stored brief, never the current config."""
-    return LOCAL_TESTS_CONTEXT if LOCAL_TESTS_CONTEXT in (brief or "") else ""
+    text = (brief or "").strip()
+    marked = LOCAL_TESTS_MARKER in text.splitlines()
+    legacy = text == LEGACY_LOCAL_TESTS_CONTEXT or text.endswith(
+        "\n\n" + LEGACY_LOCAL_TESTS_CONTEXT)
+    return LOCAL_TESTS_CONTEXT if marked or legacy else ""
 
 
 def ticket_prompt(brief, harness="claude"):
@@ -2000,8 +2017,11 @@ def spawn_ticket(db, sdir, cfg, tid, brief, platform, worktree=None, wref=None,
         check_spawnable(row, tid)
         if not brief.strip():
             raise Refusal(EXIT_GATE, "brief for %s is empty" % tid)
-        if verification_policy(cfg) == "local-tests" and not retained_verification_context(brief):
-            brief += "\n\n" + LOCAL_TESTS_CONTEXT
+        if verification_policy(cfg) == "local-tests":
+            if not retained_verification_context(brief):
+                brief += "\n\n" + LOCAL_TESTS_CONTEXT
+            if LOCAL_TESTS_MARKER not in brief.splitlines():
+                brief += "\n\n" + LOCAL_TESTS_MARKER
         check_prompt_size(platform, tid, ticket_prompt(brief, harness))
         if worktree is not None:
             if not os.path.isdir(worktree):
