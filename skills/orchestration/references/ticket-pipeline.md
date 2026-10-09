@@ -6,7 +6,7 @@ You are the ticket orchestrator: the main thread for one ticket, in a worktree t
 
 1. `orch show <ticket>`. The phase is where you are, whatever you remember.
 2. Verify your worktree path, branch and working tree before any edit or test run.
-3. If the phase is `dispatched`, start at `spec`. Otherwise, check that the recorded phase's output exists (spec file, red tests, green diff, review verdict, report, MR). If it doesn't, redo that phase from its start. Do not move backwards with `orch`. Just redo the work.
+3. If the phase is `dispatched`, start at `spec`. Otherwise, inspect the recorded phase's output and required evidence. Missing or uncertain output follows "Attempt recovery" below before redispatch. Preserve existing work; do not move backwards with `orch`.
 
 ## Phases
 
@@ -55,7 +55,7 @@ Every stage dispatch (and any investigation or filing subagent) uses an `orch` r
 2. `orch run <ticket> --role <role> --model <tier> --effort <effort>` with the `tier` and `effort` `route` printed and the same flags. Pass the tier to preserve its identity in the run record: on Pi and Codex two tiers can share a model, and the bare model reads as the lower one. Replaying the printed tier and effort with unchanged ticket state and flags satisfies the floor; changed state or flags can still cause a refusal. On refusal (exit 3), read the reason. For a below-floor value, retry with the appropriate route output for the current ticket state and flags. For unknown-history or frontier refusals, stop routing, recording and dispatching; retain the findings and explicitly `orch block` for a human as described below. Unknown history requires evidence-backed human reconciliation, not a retry. Never work around a refusal.
 3. Retain the `run` sequence for this invocation. Dispatch using the preceding `route` output, not the tier passed to `run`. Claude: pass the printed model and `effort` to the Agent tool. Pi: pass the printed model and `thinking` on the `subagent` call. Codex: spawn the printed `agent` type where available; its file carries the model and effort. Roles without per-rung agents have no printed `agent`; do not invent an agent name.
 
-For an infrastructure retry of a recorded stage, use `orch retry <ticket> --run <seq> --json` instead of the new-stage sequence. Read the fresh JSON and dispatch from `dispatch`, including its exact model and effort/thinking or Codex agent. The retry is already recorded. Keep the source run sequence when invocation fails; recomputing `route` can lose a recorded fix's higher effort. Repeated retries link to their immediate sources and spend neither repair budget. A deliberate routing change requires `--model`, `--effort` and a nonempty `--reason`; it still obeys current gates. On refusal, stop dispatch and resolve the reported context or provenance problem. See [orch-cli.md](orch-cli.md#infrastructure-retry) for the CLI/JSON contract used by recovery tooling. Failure classification is outside this command.
+For an infrastructure retry of a recorded stage, use `orch retry <ticket> --run <seq> --json` instead of the new-stage sequence. Read the fresh JSON and dispatch from `dispatch`, including its exact model and effort/thinking or Codex agent. The retry is already recorded. Keep the source run sequence when invocation fails; recomputing `route` can lose a recorded fix's higher effort. Repeated retries link to their immediate sources and spend neither repair budget. A deliberate routing change requires `--model`, `--effort` and a nonempty `--reason`; it still obeys current gates. On refusal, stop dispatch and resolve the reported context or provenance problem. See [orch-cli.md](orch-cli.md#infrastructure-retry) for the CLI/JSON contract used by recovery tooling. Failure classification is outside this command. Before redispatching a failed writing stage, inspect and record its outcome as described below.
 
 Flags:
 
@@ -72,6 +72,22 @@ After each stage returns and all child work has stopped, retain its return/proce
 The ordinary last-implementor `frontier/high` refusal happens at `orch phase <ticket> fix`, after the budget check. It exits 3 with human-block advice and leaves state unchanged. A read-only implementor route remains possible in `review` after that refusal and normally returns `heavy/low` without extra flags, since no bounce was recorded. That route cannot authorize a fix dispatch. Stop, retain the findings and explicitly `orch block <ticket>` for a human with the findings as the reason.
 
 Routing's defensive frontier/high refusal applies only when the bounce count actually exceeds the last frontier/high implementor's snapshot. A last implementor at `frontier/low` still has `frontier/high` available after a successful bounce if budget remains.
+
+## Attempt recovery
+
+Invocation failure, incomplete handoff and independent rejection are different facts. An invocation can fail before writing anything, after partial work, or after a complete deliverable. An exit zero can still leave an incomplete handoff. Do not use exit status, a commit alone or an old stage verdict to decide recovery.
+
+1. Stop the invocation and all children. Retain cleanup evidence and record `complete-run` for its exact run if completion is not already recorded. Unknown completion stays pending; do not fabricate it to unlock recovery.
+2. Read fresh `orch show <ticket> --json` and `orch runs <ticket> --json`. Inspect the ticket-local worktree's actual branch, HEAD, tracked/staged/untracked status, recent commits and artifact paths. Read the stage-specific handoff and retained gate logs. HEAD identifies only the committed revision, so describe every relevant uncommitted candidate change separately.
+3. Write a JSON evidence file with nonempty strings `revision`, `branch`, `worktree_changes`, `commits`, `handoff`, `gates` and `detail`. Use an explicit `none` for no changes. Record the inspected result with [orch outcome](orch-cli.md#attempt-outcomes). Retain concrete failure evidence, not a generic failed-stage verdict. Evidence should distinguish a read-only review verdict from edits.
+4. Choose recovery from the inspected deliverable, independently of the failure category:
+   - `none` / `retry`: replay the recorded dispatch through `orch retry`.
+   - `partial` / `continue`: preserve the useful work and use `orch retry`'s original routing. Pass an explicit continuation prompt naming the checkpoint, changed files, retained artifacts, completed steps and remaining gates. Never reset, checkout over dirty work, or redispatch a blank start prompt.
+   - `complete` / `advance`: accept the handoff only for the ordinary stage gates. Test-writer red tests are complete when they fail for the intended missing behavior. Implementor handoffs require the whole suite green. Independent review and other required gates still apply; this record is not approval.
+   - uncertain or unknown / `block`: retain uncertainty and explicitly block for clarification when it cannot be resolved. Recording the action alone does not block the ticket.
+   - `review_rejection` / `complete` / `repair`: require concrete independent defect findings. Reviewers remain read-only; a reviewer crash without such findings is invocation failure or unknown, never rejection. Only a genuine rejection follows the normal `review` or `verify` to `fix` transition and spends a bounce. Then use normal fix routing. Rejection may instead be blocked; never invocation-retry it.
+
+Invocation and incomplete-handoff recovery never invent a fix transition or consume a bounce. CI repairs remain separate. The orchestrator's completion and outcome attestations cannot prove the truth of inspection, cleanup or gate evidence. Retain the underlying artifacts and do not attest merely to pass a guard.
 
 ## Review history and durable repair budgets
 
