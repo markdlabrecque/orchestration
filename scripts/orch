@@ -438,10 +438,14 @@ def load_config(sdir):
     return cfg
 
 
+class StateConnection(sqlite3.Connection):
+    """Publication state is process-local; the revision itself lives in SQLite."""
+
+
 def connect(sdir, timeout=30):
     os.makedirs(sdir, exist_ok=True)
     db = sqlite3.connect(os.path.join(sdir, "state.db"), timeout=timeout,
-                         isolation_level=None)
+                         isolation_level=None, factory=StateConnection)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA busy_timeout=%d" % int(timeout * 1000))
     if db.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
@@ -487,6 +491,8 @@ def connect(sdir, timeout=30):
             if name not in run_cols:
                 db.execute("ALTER TABLE runs ADD COLUMN %s TEXT" % name)
     state_md_schema(db)
+    db.publish_state = True
+    db.publication_error = None
     return db
 
 
@@ -499,6 +505,8 @@ def transaction(db, write=True):
         db.execute("ROLLBACK")
         raise
     db.execute("COMMIT")
+    if write and getattr(db, "publish_state", False):
+        state_md_after_commit(db)
 
 
 # ---- helpers ---------------------------------------------------------------
@@ -696,7 +704,8 @@ def state_md_snapshot(db):
              "Source revision: %s; event watermark: %s" % (revision, watermark)]
     for table, rows in records.items():
         lines.extend(["", "### " + table, "", "```json",
-                      json.dumps(rows, ensure_ascii=True, indent=2, sort_keys=True), "```"])
+                      json.dumps(rows, ensure_ascii=True, indent=2, sort_keys=True)
+                      .replace("<", "\\u003c").replace(">", "\\u003e"), "```"])
     lines.append(STATE_END.decode())
     # Escape marker-like stored text so it cannot claim document ownership.
     return ("\n".join(lines) + "\n").encode()
@@ -705,6 +714,8 @@ def state_md_snapshot(db):
 def state_md_parts(data):
     """Only a unique, correctly ordered marker pair grants ownership."""
     count = data.count(STATE_BEGIN), data.count(STATE_END)
+    if data.count(b"<!-- orch:state-md") != sum(count):
+        raise ValueError("malformed managed markers")
     if count == (0, 0):
         if b"<!-- orch:state-md" in data:
             raise ValueError("malformed managed markers")
@@ -712,7 +723,9 @@ def state_md_parts(data):
     if count != (1, 1):
         raise ValueError("ambiguous or missing managed markers")
     start, end = data.index(STATE_BEGIN), data.index(STATE_END)
-    if start > end or (start and data[start-1:start] != b"\n"):
+    if (start > end or (start and data[start-1:start] != b"\n")
+            or data[start+len(STATE_BEGIN):start+len(STATE_BEGIN)+1] != b"\n"
+            or data[end-1:end] != b"\n"):
         raise ValueError("malformed managed markers")
     end += len(STATE_END)
     if data[end:end+1] == b"\n":
@@ -729,7 +742,7 @@ def state_md_sync(db, check=False):
     transactional revision survives commit/export crashes, while equality also
     recognizes a complete replace even if the publisher died immediately after.
     """
-    root = state_md_root()
+    root = getattr(db, "state_root", None) or state_md_root()
     path = os.path.join(root, "STATE.md")
     temporary = None
     try:
@@ -752,6 +765,8 @@ def state_md_sync(db, check=False):
                 replacement = current[:parts[0]] + expected + current[parts[1]:]
             fd, temporary = tempfile.mkstemp(prefix=".STATE.md-", dir=root)
             with os.fdopen(fd, "wb") as f:
+                if os.path.exists(path):
+                    os.fchmod(f.fileno(), os.stat(path).st_mode & 0o777)
                 if f.write(replacement) != len(replacement):
                     raise OSError("short STATE.md write")
                 f.flush()
@@ -770,7 +785,21 @@ def state_md_sync(db, check=False):
         raise Refusal(EXIT_GATE, "database commit succeeded; STATE.md is stale or synchronization failed: %s" % e) from e
     finally:
         if temporary is not None:
-            os.unlink(temporary)
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
+
+
+def state_md_after_commit(db):
+    """Export failure is not transaction failure or a failed platform launch.
+
+    Let lifecycle cleanup/compensation finish, but retain a controlled failure
+    for the command boundary. Hooks report the same diagnostic and exit zero.
+    """
+    try:
+        state_md_sync(db)
+    except Refusal as e:
+        db.publication_error = e
+        print("orch: %s" % e, file=sys.stderr)
 
 
 def cmd_state_md(args, db, sdir):
@@ -2334,7 +2363,11 @@ def launch_steps(db, sdir, cfg, row, evs, platform, session, prompt_file,
 def cmd_init(args):
     sdir = state_dir()
     os.makedirs(sdir, exist_ok=True)
-    connect(sdir).close()
+    db = connect(sdir)
+    try:
+        state_md_sync(db)
+    finally:
+        db.close()
     emit(args, {"state_dir": sdir}, "initialized %s" % sdir)
 
 
@@ -2868,7 +2901,8 @@ def cmd_merged(args, db, sdir):
         raise Refusal(EXIT_GATE, "no passing CI recorded for %s at %s"
                       % (args.ticket, args.sha))
     db.execute("UPDATE tickets SET phase='done' WHERE id=?", (args.ticket,))
-    log_event(db, args.ticket, "merged", "ci", "done", args.sha)
+    log_event(db, args.ticket, "merged", "ci", "done",
+              args.sha + (" " + args.mr if args.mr else ""))
     state_md_log(args.ticket, "completed: " + (args.mr or "commit " + args.sha))
     emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
          "%s merged at %s" % (args.ticket, args.sha))
@@ -3201,6 +3235,7 @@ def watch_frame(sdir):
         cfg = load_config(sdir)
         rows = db.execute("SELECT * FROM tickets WHERE retired_at IS NULL"
                           " ORDER BY seq").fetchall()
+        state_md_sync(db)
         return [{"id": r["id"], "platform": row_platform(r), "phase": r["phase"],
                  "health": t["health"], "last_seen_at": r["last_seen_at"],
                  "review_rounds": r["review_rounds"]}
@@ -3946,7 +3981,7 @@ def cmd_selftest(args):
         if out is not None:
             save_run(db, st)
             print(json.dumps(out))
-            return 0
+            return db.publication_error.code if db.publication_error else 0
         if stop is not None:
             save_run(db, st)  # kept: the record of an interrupted run
         else:
@@ -3971,7 +4006,7 @@ def cmd_selftest(args):
                                                   "ok" if ok else "FAILED"))
         if stop is not None:
             return 143 if isinstance(stop, Terminated) else 130
-        return 0 if ok else EXIT_GATE
+        return 0 if ok and db.publication_error is None else EXIT_GATE
     finally:
         db.close()
 
@@ -4300,6 +4335,8 @@ def run_hook():
     out = None
     db = connect(sdir, timeout=2)
     try:
+        with contextlib.suppress(Refusal):
+            db.state_root = project_root(cwd)
         # Match under a plain read; most hooks end here without a write lock.
         rows = db.execute("SELECT * FROM tickets WHERE retired_at IS NULL"
                           " AND worktree IS NOT NULL").fetchall()
@@ -4369,13 +4406,16 @@ def run_hook():
                 log_event(db, tid, "session_end", phase, phase,
                           "reason=%s" % payload.get("reason"))
     finally:
-        db.close()
+        try:
+            state_md_after_commit(db)
+        finally:
+            db.close()
     if out:
         print(out)
 
 
 def cmd_hook(args):
-    """Never disturbs the session: always exit 0, silent on any error."""
+    """Always exit zero; publication failures are diagnosed by the publisher."""
     try:
         run_hook()
     except BaseException:
@@ -4545,6 +4585,8 @@ def main(argv=None):
                 with transaction(db, write=args.fn not in READ_ONLY):
                     args.fn(args, db, sdir)
             if args.fn is not cmd_state_md:
+                if db.publication_error is not None:
+                    return db.publication_error.code
                 state_md_sync(db)
         finally:
             db.close()

@@ -1,5 +1,6 @@
 """Committed STATE.md contract. All commands and fault targets use disposable roots."""
 import concurrent.futures
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,34 @@ import os, runpy, sqlite3, sys, time
 mode, target, script, *args = sys.argv[1:]
 original_replace = os.replace
 original_connect = sqlite3.connect
+original_fdopen = os.fdopen
+original_fsync = os.fsync
+original_flock = __import__('fcntl').flock
+export_fds = set()
+def fdopen(fd, *args, **kwargs):
+    file = original_fdopen(fd, *args, **kwargs)
+    if args and args[0] == 'wb':
+        export_fds.add(fd)
+        if mode == 'short-write':
+            class ShortFile:
+                def __enter__(self): return self
+                def __exit__(self, *exc): return file.__exit__(*exc)
+                def __getattr__(self, name): return getattr(file, name)
+                def write(self, data): return file.write(data[:-1])
+            return ShortFile()
+    return file
+
+def fsync(fd):
+    if mode == 'fsync-failure' and fd in export_fds:
+        raise OSError('injected STATE.md fsync failure')
+    return original_fsync(fd)
+
+def flock(fd, operation):
+    if mode == 'waiting-lock' and operation == __import__('fcntl').LOCK_EX:
+        with open(target + '.waiting', 'w') as marker:
+            marker.write('ready')
+    return original_flock(fd, operation)
+
 class Connection(sqlite3.Connection):
     def execute(self, sql, *args, **kwargs):
         result = super().execute(sql, *args, **kwargs)
@@ -50,7 +79,24 @@ def replace(src, dst, *args, **kwargs):
     return original_replace(src, dst, *args, **kwargs)
 sqlite3.connect = connect
 os.replace = replace
+os.fdopen = fdopen
+os.fsync = fsync
+__import__('fcntl').flock = flock
 sys.argv = [script, *args]
+if mode == 'paused-launch':
+    module = runpy.run_path(script)
+    original_start = module['start_session']
+    def start(*pos, **kw):
+        with open(target + '.paused', 'w') as marker:
+            marker.write('ready')
+        deadline = time.monotonic() + 15
+        while not os.path.exists(target + '.release'):
+            if time.monotonic() >= deadline:
+                raise TimeoutError('test did not release launch')
+            time.sleep(.01)
+        return original_start(*pos, **kw)
+    original_start.__globals__['start_session'] = start
+    sys.exit(module['main'](args))
 runpy.run_path(script, run_name='__main__')
 '''
 
@@ -93,6 +139,7 @@ class StateMdContractTests(OrchTestCase):
                               text=True, timeout=30)
 
     def test_baseline_internal_commit_publishes_recorded_evidence(self):
+        self.write_orch('BASE_BRANCH=main\n')
         self.add('affected')
         self.add('fix')
         sha = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=self.repo,
@@ -108,10 +155,14 @@ class StateMdContractTests(OrchTestCase):
 
     def test_run_completion_and_no_event_sibling_completion_are_rendered(self):
         self.add('T-1')
+        linked = os.path.join(self.root, 'code', 'T-1')
+        self.git('-c', 'core.hooksPath=/dev/null', 'worktree', 'add', '-q', '-b', 'T-1', linked, 'main')
+        self.db_exec('UPDATE tickets SET worktree=?, worktree_ref=? WHERE id=?',
+                     (linked, 'T-1', 'T-1'))
         self.ok('run', 'T-1', '--role', 'implementor', '--model', 'standard', '--effort', 'low')
         seq = self.db_exec("SELECT seq FROM runs WHERE ticket='T-1'")[0][0]
         self.ok('complete-run', 'T-1', '--run', str(seq), '--stopped',
-                '--evidence', 'recorded completion sentinel')
+                '--evidence', 'recorded completion sentinel', cwd=linked)
         self.assertIn(b'recorded completion sentinel', self.md())
         self.db_exec("UPDATE runs SET completion_evidence='sibling completion sentinel' WHERE seq=?", (seq,))
         self.stale()
@@ -173,6 +224,151 @@ class StateMdContractTests(OrchTestCase):
         self.assertEqual(self.rebuild(), before)
         self.assertNotIn(b'dispatched', before)
 
+
+    def wait_marker(self, suffix, process):
+        deadline = time.monotonic() + 10
+        while not Path(str(self.path) + suffix).exists():
+            self.assertIsNone(process.poll(), 'publisher exited before checkpoint')
+            self.assertLess(time.monotonic(), deadline, 'publisher never reached checkpoint')
+            time.sleep(.01)
+
+    def start_fault(self, mode, *args):
+        process = subprocess.Popen([sys.executable, '-c', FAULT_CLI, mode,
+                                    str(self.path), ORCH, *args], cwd=self.repo,
+                                   env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True)
+        def cleanup():
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=10)
+        self.addCleanup(cleanup)
+        return process
+
+    def test_internal_intent_is_published_before_platform_launch(self):
+        self.add('T-1')
+        self.env['ORCH_CLAUDE_BIN'] = '/nonexistent-provider'
+        process = self.start_fault('paused-launch', 'spawn', 'T-1', '--worktree',
+                                   self.worktree, '--brief-file', self.brief)
+        self.wait_marker('.paused', process)
+        self.assertEqual(self.db_exec("SELECT phase FROM tickets WHERE id='T-1'")[0][0], 'dispatched')
+        self.assertIn(b'"phase": "dispatched"', self.md())
+        self.fresh()
+        Path(str(self.path) + '.release').touch()
+        process.communicate(timeout=20)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertNotIn(b'dispatched', self.md())
+        self.fresh()
+
+    def test_export_failure_does_not_compensate_successful_launch(self):
+        self.add('T-1')
+        self.env['ORCH_CLAUDE_BIN'] = self.fake_claude(0)
+        process = self.fault('replace-failure', 'spawn', 'T-1', '--worktree',
+                             self.worktree, '--brief-file', self.brief)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertNotIn('Traceback', process.stderr)
+        self.assertIn('database commit succeeded', process.stderr)
+        self.wait_calls(1)
+        phase, marker = self.db_exec("SELECT phase,launching FROM tickets WHERE id='T-1'")[0]
+        self.assertEqual(phase, 'dispatched')
+        self.assertIsNone(marker)
+        self.assertTrue(self.db_exec("SELECT seq FROM events WHERE ticket='T-1' AND to_phase='dispatched'"))
+        self.stale()
+        self.rebuild()
+
+    def test_failed_resume_restores_committed_snapshot(self):
+        self.dispatched('T-1')
+        self.phases('T-1', 'spec', 'tests')
+        self.ok('block', 'T-1', '--reason', 'resume blocker')
+        before = self.db_exec("SELECT phase,prior_phase,attempt,session_id FROM tickets WHERE id='T-1'")
+        events = self.db_exec("SELECT * FROM events WHERE ticket='T-1'")
+        process = self.orch('resume', 'T-1', env={'ORCH_CLAUDE_BIN': '/nonexistent-provider'})
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(self.db_exec("SELECT phase,prior_phase,attempt,session_id FROM tickets WHERE id='T-1'"), before)
+        self.assertEqual(self.db_exec("SELECT * FROM events WHERE ticket='T-1'"), events)
+        self.fresh()
+        self.assertIn(b'"phase": "blocked"', self.md())
+
+    def test_short_write_and_fsync_failure_keep_committed_data_and_old_file(self):
+        self.rebuild()
+        for mode in ('short-write', 'fsync-failure'):
+            with self.subTest(mode=mode):
+                before = self.md()
+                process = self.fault(mode, 'add', mode, '--title', mode)
+                self.assertNotEqual(process.returncode, 0)
+                self.assertNotIn('Traceback', process.stderr)
+                self.assertIn('database commit succeeded', process.stderr)
+                self.assertEqual(self.db_exec("SELECT title FROM tickets WHERE id=?", (mode,))[0][0], mode)
+                self.assertEqual(self.md(), before)
+                self.assertFalse(list(Path(self.root).glob('.STATE.md-*')))
+                self.stale()
+                self.rebuild()
+
+    def test_post_tool_throttle_repairs_without_new_event_or_observation(self):
+        self.hook_fixture()
+        payload = json.dumps({'hook_event_name': 'PostToolUse', 'session_id': 'fixture-session',
+                              'cwd': self.worktree})
+        first = self.fault('none', 'hook', payload=payload)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        observed = self.db_exec("SELECT activity,last_seen_at FROM tickets WHERE id='T-1'")
+        events = self.db_exec('SELECT * FROM events')
+        self.fresh()
+        self.path.unlink()
+        second = self.fault('none', 'hook', payload=payload)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.db_exec("SELECT activity,last_seen_at FROM tickets WHERE id='T-1'"), observed)
+        self.assertEqual(self.db_exec('SELECT * FROM events'), events)
+        self.fresh()
+
+    def test_stored_snapshot_does_not_infer_liveness_or_subtask(self):
+        self.add('T-1')
+        self.db_exec("UPDATE tickets SET phase='tests',attempt=7,pid=99999999,activity='idle',"
+                     "last_seen_at='2001-01-01T00:00:00+00:00' WHERE id='T-1'")
+        text = self.rebuild()
+        for value in (b'"attempt": 7', b'"status": "in_progress"', b'"activity": "idle"',
+                      b'2001-01-01T00:00:00+00:00', b'"retired": false'):
+            self.assertIn(value, text)
+        for value in (b'"health":', b'"alive":', b'"subtask":', b'"activity": "dead"'):
+            self.assertNotIn(value, text)
+
+    def test_marker_values_are_escaped_and_rebuild_stays_idempotent(self):
+        self.add('T-1', '<!-- orch:state-md begin --> and <!-- orch:state-md end -->')
+        before = self.md()
+        self.assertEqual(before.count(b'<!-- orch:state-md begin -->'), 1)
+        self.assertIn(b'\\u003c!-- orch:state-md begin --\\u003e', before)
+        self.fresh()
+        self.assertEqual(self.rebuild(), before)
+
+    def test_malformed_fragments_alongside_valid_markers_refuse_replacement(self):
+        self.add('T-1')
+        original = self.md()
+        for damaged in (original + b'<!-- orch:state-md broken -->\n',
+                        original.replace(b'begin -->\n', b'begin --> garbage\n'),
+                        original.replace(b'<!-- orch:state-md end -->', b'garbage <!-- orch:state-md end -->')):
+            with self.subTest(damaged=damaged[-80:]):
+                self.path.write_bytes(damaged)
+                self.stale()
+                result = self.orch('state-md', 'rebuild')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.md(), damaged)
+
+    def test_notes_are_read_after_waiting_for_stable_publisher_lock(self):
+        self.add('T-1')
+        before = self.md()
+        self.path.chmod(0o640)
+        with open(Path(self.root, '.STATE.md.lock'), 'a+b') as lock:
+            inode = os.fstat(lock.fileno()).st_ino
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            process = self.start_fault('waiting-lock', 'add', 'T-2', '--title', 'waiting publisher')
+            self.wait_marker('.waiting', process)
+            self.path.write_bytes(b'Human note added while publisher waits\n' + before)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        stdout, stderr = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertTrue(self.md().startswith(b'Human note added while publisher waits\n'))
+        self.assertIn(b'waiting publisher', self.md())
+        self.assertEqual(Path(self.root, '.STATE.md.lock').stat().st_ino, inode)
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o640)
+        self.fresh()
 
     def test_add_publishes_snapshot_revision_and_event_watermark(self):
         self.add('T-1', 'Snapshot title')
