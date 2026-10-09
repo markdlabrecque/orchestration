@@ -236,7 +236,7 @@ class StateMdContractTests(OrchTestCase):
             self.wait_marker('.inode-contended', publisher)
             self.assertIsNone(legacy.poll(), 'legacy must still hold its write transaction')
             self.assertIsNone(publisher.poll(), 'publisher must overlap the legacy lock')
-            # Enter the blocking flock while legacy still holds both locks.
+            # The failed nonblocking acquisition proved contention; release both barriers.
             Path(str(self.path) + '.release-publisher').touch()
             Path(str(self.path) + '.release-legacy').touch()
             for process in processes:
