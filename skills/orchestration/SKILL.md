@@ -39,14 +39,14 @@ A request to start, work on, or resume tickets authorizes this whole loop. Do no
 
 1. **Check the project.** Run from the project root (`~/Projects/<project>`). If `.orch` is missing, run the `setup-project` skill first. Then check the main checkout (`MAIN_CHECKOUT` in `.orch`): branch and working tree. Surface uncommitted work before starting; preserve it.
 2. **Preflight.** `orch init`, then `orch preflight`. It reports the harness and platform you are running on; every ticket session you start runs there too (see "Platforms" below). Exit 5 is a stop: nothing gets created. Tell the user what failed. A missing `BASE_BRANCH` needs a line in `.orch`. Under the default `auto` policy, no verification environment (no DDEV, no `verify_harness` Docker harness) needs a decision on how verification should run. A project may explicitly select `verify_policy: "local-tests"` in project-root `.agents/orchestration/config.json` instead; see [references/orch-cli.md](references/orch-cli.md#configjson). Ask once, two options max, with a recommendation.
-3. **Recover first.** `orch stale` lists tickets whose session died. `orch resume <ticket>` each one. The ticket orchestrator picks up from its recorded phase.
-4. **Add tickets.** For each requested ticket: read the ticket, its comments and linked MRs; check dependencies and readiness per the project's `AGENTS.md`; assign it if the project says to; then `orch add <ticket> --title "<title>" --url <url>`.
-5. **Dispatch.** `orch next` returns what fits under `max_workers`. For each:
+3. **Recover first.** Apply [Assignment](#assignment) to active existing tickets on `orch list`, then use `orch stale` to find dead sessions and `orch resume <ticket>` each cleared ticket. The ticket orchestrator picks up from its recorded phase.
+4. **Add tickets.** For each requested ticket: read the ticket, its comments and linked MRs; check dependencies and readiness per the project's `AGENTS.md`; complete [Assignment](#assignment); then `orch add <ticket> --title "<title>" --url <url>`.
+5. **Dispatch.** `orch next` returns what fits under `max_workers`. Complete [Assignment](#assignment) for each before creating its worktree or spawning its session:
    1. Create and provision the worktree with the `create-worktree` skill. The worktree name is the ticket id alone (`19`, not `ticket-19`). It is cut from `BASE_BRANCH`.
    2. Write the brief (template below) to a temp file, using `verify_env` from preflight. For `local-tests`, require all project-required automated tests, independent review and exact-head CI; go from review to report without a separate verify, browser or accessibility stage. Accessibility tests are `on` only when `.orch` in the project root has `ACCESSIBILITY_TESTS=true` (any case). Missing, or any other value, is `off`.
    3. `orch spawn <ticket> --worktree <absolute path> --brief-file <file>`. On Desktop, carry out the printed action (below).
    A ticket whose prerequisite is not `done` stays in `ready` until it is.
-6. **Supervise until every ticket is done.** Check `orch list` on a slow cadence (a background wakeup or monitor, not a sleep loop). React by phase and `health`:
+6. **Supervise until every ticket is done.** Check `orch list` on a slow cadence (a background wakeup or monitor, not a sleep loop). Apply [Assignment](#assignment) before resuming or messaging an active ticket to carry on, and before dispatching newly unblocked tickets. React by phase and `health`:
    - `done` → `orch retire <ticket>` (on Desktop, carry out its action), then the `retire-worktree` skill for that worktree and its DDEV project. Then dispatch anything newly unblocked.
    - `dead` and not done (`orch stale`) → `orch resume <ticket>`. If the same ticket dies twice in a row at the same phase, look at why (headless: the tail of `<project root>/.agents/orchestration/logs/<ticket>.log`; Orca/Herdr/Desktop: the session itself), fix the cause if it is environmental, and resume. Otherwise, report it.
    - `idle` and not done or blocked → the session finished a turn without finishing the ticket. Headless sessions exit at that point and show `dead`, so they get resumed. On Orca, Herdr or Desktop the session stays open, so send it a message (`orca terminal send`, `herdr agent prompt`, or the Desktop session tool): "Run `orch show <ticket>` and carry on."
@@ -55,6 +55,15 @@ A request to start, work on, or resume tickets authorizes this whole loop. Do no
 7. **Report.** When the batch is done: per ticket, the MR, the merge SHA, the errors the verifier reported (listed in the MR description), the follow-up tickets filed, and anything a person still needs to look at.
 
 The main orchestrator never runs stages, edits code, or merges. If a ticket session cannot be started, report the blocker; never fall back to doing the ticket in this session.
+
+### Assignment
+
+The main orchestrator assigns every picked-up ticket to the requesting human. Run this check for new tickets and active existing tickets on the board from `orch list`, including unassigned tickets. Skip done and retired historical tickets.
+
+1. Resolve the requester's tracker identity from an explicit request or project convention first. Use the authenticated identity only when it identifies the requesting human, not an unrelated bot or service account. If unresolved, ask which tracker user to assign.
+2. Read current remote assignees. If the requester is already assigned, leave them unchanged with no mutation. Repeated checks are idempotent. Preserve all existing assignees. If the tracker permits only a single assignee and another user is assigned, stop and ask whether to replace that user.
+3. On GitHub, use `gh issue edit <url> --add-assignee <login>`. On GitLab, fetch `glab api projects/<project-id>/issues/<iid>` and resolve the requester's numeric user ID. Update with `glab api --method PUT projects/<project-id>/issues/<iid> --field 'assignee_ids=<JSON array>'`, using the union of existing assignee IDs and the requester ID, never only the requester when others are assigned. Use the ticket's repository and host for every command.
+4. Read back remote assignees after any update, using `gh issue view <url> --json assignees` or the GitLab GET above. Verify the requester and preserved assignees are present before `orch add`, and before dispatch, resume or a carry-on message. A fresh read confirming an already-assigned requester also satisfies the check. On tracker, auth, permission or read-back failure, report the error and stop that ticket's pickup or existing-ticket resume. Local orch state is not evidence of successful remote assignment.
 
 ### Ticket brief
 
@@ -89,7 +98,7 @@ The plugin's hooks report every session's activity to `orch`, whoever started it
 
 ## Recovery, in one line
 
-Sessions die; state does not. The main orchestrator continues the same session with `orch resume`. The ticket orchestrator reads `orch show`, then redoes the recorded phase from its start if that phase's output is not on disk.
+Sessions die; state does not. The main orchestrator completes [Assignment](#assignment) before continuing the same session with `orch resume`. The ticket orchestrator reads `orch show`, then redoes the recorded phase from its start if that phase's output is not on disk.
 
 ## Design background
 
