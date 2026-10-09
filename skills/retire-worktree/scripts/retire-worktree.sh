@@ -176,14 +176,6 @@ else
   : "${dirty:=git status exited $status_failed with no output}"
 fi
 
-# The conventional hook, when it is the SOURCE of the resolved hook (not an
-# env/.orch override pointing outside the worktree), is engine plumbing, not
-# work-in-progress -- its own untracked/modified status must not block
-# retirement, the same way .ddev/config.local.yaml (gitignored) never does.
-if [ -n "$retire_hook" ] && [ "$retire_hook" = "$worktree/scripts/retire-worktree.sh" ]; then
-  dirty="$(printf '%s\n' "$dirty" | grep -vE '^.. scripts/retire-worktree\.sh$' || true)"
-fi
-
 if [ -n "$dirty" ] && [ "$force" -ne 1 ]; then
   echo "retire-worktree: $worktree has uncommitted work; refusing without --force:" >&2
   printf '%s\n' "$dirty" >&2
@@ -202,7 +194,7 @@ echo "retire-worktree: retiring $id at $worktree."
 #     pushed to the very last action in the script, after step 6. ----------
 workspace_id=""
 defer_own_close=0
-if [ "$ddev_only" -ne 1 ]; then
+if [ "$ddev_only" -ne 1 ] && [ "${ORCH_RETIRE_MANAGED:-0}" != 1 ]; then
   if command -v herdr >/dev/null 2>&1; then
     wt_json="$(herdr worktree list 2>/dev/null)" || wt_json=""
     if [ -n "$wt_json" ]; then
@@ -261,7 +253,8 @@ run_own_teardown() {
       if ( cd "$worktree" && ddev delete -yO ) >/dev/null 2>&1; then
         echo "retire-worktree: DDEV project $ddev_project deleted."
       else
-        echo "retire-worktree: failed to delete DDEV project $ddev_project; continuing." >&2
+        echo "retire-worktree: failed to delete DDEV project $ddev_project; retry when DDEV is available." >&2
+        return 4
       fi
     else
       echo "retire-worktree: no .ddev directory in $worktree, skipping DDEV delete."
@@ -279,10 +272,10 @@ if [ -n "$retire_hook" ]; then
     ddev_project="(handled by $retire_hook)"
   else
     echo "retire-worktree: retire hook $retire_hook did not handle teardown (exit $hook_rc); running the engine's own DDEV step." >&2
-    run_own_teardown
+    run_own_teardown || exit $?
   fi
 else
-  run_own_teardown
+  run_own_teardown || exit $?
 fi
 
 if [ "$ddev_only" -eq 1 ]; then
@@ -293,7 +286,9 @@ if [ "$ddev_only" -eq 1 ]; then
 fi
 
 # --- Step 5: remove the worktree and branch, from the main checkout --------
-if ! git -C "$main_repo" worktree remove --force "$worktree"; then
+remove_flags=()
+if [ "$force" -eq 1 ]; then remove_flags+=(--force); fi
+if ! git -C "$main_repo" worktree remove "${remove_flags[@]}" "$worktree"; then
   echo "retire-worktree: git worktree remove failed for $worktree; branch left untouched." >&2
   if [ "$defer_own_close" -eq 1 ]; then
     echo "retire-worktree: herdr workspace $workspace_id (the caller's own) was left open — its close was deferred until after teardown, which did not complete. Fix the removal failure above, then re-run retire-worktree.sh to finish the teardown and close it." >&2
@@ -302,7 +297,7 @@ if ! git -C "$main_repo" worktree remove --force "$worktree"; then
 fi
 
 if [ -n "$branch" ] && git -C "$main_repo" show-ref --quiet --verify "refs/heads/$branch"; then
-  git -C "$main_repo" branch -D "$branch"
+  git -C "$main_repo" branch -D "$branch" || exit 4
   branch_report="$branch (deleted)"
 elif [ -n "$branch" ]; then
   branch_report="$branch (no local branch to delete)"

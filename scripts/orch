@@ -1345,13 +1345,9 @@ def launch_marker(row):
 
 
 def launch_in_progress(row):
-    """The ticket's marker while it is live: younger than LAUNCH_MARKER_S and
-    its orch process still running. Else None (no marker, or abandoned)."""
+    """A live owner keeps its claim regardless of elapsed wall-clock time."""
     m = launch_marker(row)
     if not m:
-        return None
-    age = age_s(m.get("at"))
-    if age is None or age > LAUNCH_MARKER_S:
         return None
     pid = m.get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or not target_exists(pid, False):
@@ -1366,10 +1362,9 @@ def refuse_if_launching(row, tid=None):
     m = launch_in_progress(row)
     if m:
         raise Refusal(EXIT_GATE, "launch in progress for %s: orch pid %s started a %s at"
-                      " %s; wait for it to finish (a marker older than %d minutes, or"
-                      " whose orch process is gone, is ignored)" % (
+                      " %s; wait for its owner to finish" % (
                           tid or row["id"], m.get("pid"), m.get("op", "launch"),
-                          m.get("at"), LAUNCH_MARKER_S // 60))
+                          m.get("at")))
 
 
 def claim_launch(db, row, op):
@@ -1769,14 +1764,14 @@ def remove_worktree(platform, tid, worktree, wref, force):
         args.append("--ddev-only")  # Orca removes the checkout and branch itself
     if force:
         args.append("--force")
-    rc, tail = run_engine("retire", main, args, main)
+    rc, tail = run_engine("retire", main, args, main, {"ORCH_RETIRE_MANAGED": "1"})
     if rc != 0:
         raise Refusal(EXIT_GATE, "cannot remove the worktree of %s (%s): retire-worktree"
                       " exited %d: %s" % (tid, worktree, rc, tail))
     if platform == "orca":
         try:
-            call_tool("orca", ["worktree", "rm", "--worktree", orca_selector(worktree, wref),
-                               "--force", "--json"], timeout=120)
+            call_tool("orca", ["worktree", "rm", "--worktree", orca_selector(worktree, wref)]
+                      + (["--force"] if force else []) + ["--json"], timeout=120)
         except ToolError as e:
             raise Refusal(EXIT_GATE, "cannot remove the worktree of %s (%s): %s"
                           % (tid, worktree, e))
@@ -3073,7 +3068,7 @@ def kill_session(row, bare_ok):
             return
 
 
-def retire_ticket(db, sdir, tid, force, keep_worktree=False):
+def retire_ticket(db, sdir, tid, force, keep_worktree=False, automatic=False):
     """`retire` without the printing: close, signal, remove the worktree, mark
     retired. Returns the desktop_archive action, or None."""
     with transaction(db):
@@ -3083,6 +3078,9 @@ def retire_ticket(db, sdir, tid, force, keep_worktree=False):
         if row["phase"] != "done" and not force:
             raise Refusal(EXIT_GATE, "retire requires phase done (or --force); %s is %s"
                           % (tid, row["phase"]))
+        if automatic and row_platform(row) == "desktop":
+            raise Refusal(EXIT_GATE, "Desktop archival needs a session tool; run orch retire %s"
+                          " manually and execute its desktop_archive action" % tid)
         # No resume may launch while the session is being closed and removed.
         marker = claim_launch(db, row, "retire")
     try:
@@ -3099,17 +3097,24 @@ def retire_claimed(db, tid, row, force, keep_worktree, marker):
     else:
         _, err = platform_close(platform, ref, row["worktree"])
         if err:
+            if not force:
+                raise Refusal(EXIT_GATE, "cannot close the %s session of %s: %s"
+                              % (platform, tid, err))
             print("orch: warning: could not close the %s session of %s: %s"
                   % (platform, tid, err), file=sys.stderr)
         kill_session(row, bare_ok=True)
     if not keep_worktree:
         # The worktree goes, so does the trust orch gave it.
-        unmark_ticket_trust(db, tid, row["worktree"])
+        if not unmark_ticket_trust(db, tid, row["worktree"]) and not force:
+            raise Refusal(EXIT_GATE, "cannot remove folder trust for %s; repair its trust config"
+                          % row["worktree"])
         remove_worktree(platform, tid, row["worktree"], row_worktree_ref(row), force)
     with transaction(db):
         cur = get_ticket(db, tid)
         if cur["retired_at"] is not None:
             raise Refusal(EXIT_GATE, "%s is already retired" % tid)
+        if cur["launching"] != marker or (not force and cur["phase"] != "done"):
+            raise Refusal(EXIT_GATE, "%s changed phase or retirement owner during teardown" % tid)
         db.execute("UPDATE tickets SET retired_at=?, launching=NULL WHERE id=?",
                    (now(), tid))
         log_event(db, tid, "retire", cur["phase"], cur["phase"],
@@ -3143,6 +3148,100 @@ def cmd_events(args, db, sdir):
         "%s\t%s\t%s -> %s\t%s" % (e["ts"], e["kind"], e["from_phase"],
                                   e["to_phase"], e["detail"] or "") for e in evs))
 
+
+
+# ---- deterministic cleanup -------------------------------------------------
+
+@contextlib.contextmanager
+def cleanup_project(root):
+    """Resolve each project independently of the invoking agent's overrides."""
+    saved, cwd = dict(os.environ), os.getcwd()
+    try:
+        for key in ("ORCH_HOME", "MAIN_CHECKOUT", "WORKTREE_ROOT", "PROJECT_NAME",
+                    "BASE_BRANCH", "ORCH_PLATFORM", "HERDR_WORKSPACE_ID"):
+            os.environ.pop(key, None)
+        os.environ["ORCH_PROJECTS_DIR"] = os.path.dirname(root)
+        os.chdir(root)
+        yield
+    finally:
+        os.chdir(cwd)
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+def cleanup_notice(sdir, ticket, message):
+    """Serialize delivery and durable dedup, independently of retirement events."""
+    path = os.path.join(sdir, "cleanup-notifications.json")
+    with open(path + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(path) as f:
+                sent = json.load(f)
+        except FileNotFoundError:
+            sent = {}
+        if message is None:
+            sent.pop(ticket, None)
+        elif sent.get(ticket) == message:
+            return
+        else:
+            try:
+                p = subprocess.run(["notify-send", "Orchestration cleanup needs attention", message],
+                                   capture_output=True, text=True, timeout=10)
+                if p.returncode:
+                    return  # delivery can be retried on the next tick
+            except (OSError, subprocess.SubprocessError):
+                return
+            sent[ticket] = message
+        temp = path + ".tmp"
+        with open(temp, "w") as f:
+            json.dump(sent, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, path)
+
+
+def cmd_reconcile(args):
+    roots = ([os.path.realpath(args.project)] if args.project else
+             [os.path.join(projects_dir(), name) for name in sorted(os.listdir(projects_dir()))])
+    outcomes = []
+    for root in roots:
+        sdir = os.path.join(root, ".agents", "orchestration")
+        if not (os.path.isfile(os.path.join(root, ".orch"))
+                and os.path.isfile(os.path.join(sdir, "state.db"))):
+            continue
+        db = None
+        try:
+            with cleanup_project(root):
+                main_checkout()
+                db = connect(sdir)
+                rows = db.execute("SELECT * FROM tickets WHERE phase='done' AND retired_at IS NULL"
+                                  " ORDER BY seq").fetchall()
+                for row in rows:
+                    tid, path = row["id"], row["worktree"]
+                    outcome = dict(project=root, ticket=tid, worktree=path)
+                    try:
+                        retire_ticket(db, sdir, tid, False, automatic=True)
+                        outcome.update(outcome="retired", reason="cleanup complete")
+                    except (Refusal, OSError, sqlite3.Error, subprocess.SubprocessError) as e:
+                        cur = get_ticket(db, tid)
+                        if cur["retired_at"] or cur["phase"] != "done" or launch_in_progress(cur):
+                            outcome.update(outcome="deferred", reason="eligibility changed or cleanup in progress")
+                        else:
+                            outcome.update(outcome="attention", reason=str(e))
+                    message = " ".join("{project}: ticket {ticket}, worktree {worktree}: {reason}".format(**outcome).split())
+                    print(message, file=sys.stderr)
+                    cleanup_notice(sdir, tid, message if outcome["outcome"] == "attention" else None)
+                    outcomes.append(outcome)
+        except (Refusal, OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as e:
+            outcome = dict(project=root, ticket=None, worktree=None, outcome="attention", reason=str(e))
+            print("%s: project cleanup needs attention: %s" % (root, e), file=sys.stderr)
+            outcomes.append(outcome)
+        finally:
+            if db is not None:
+                db.close()
+    emit(args, {"outcomes": outcomes}, "Cleanup: %d retired, %d deferred, %d need attention" % tuple(
+        sum(o["outcome"] == kind for o in outcomes) for kind in ("retired", "deferred", "attention")))
+    return EXIT_GATE if any(o["outcome"] == "attention" for o in outcomes) else 0
 
 
 # ---- model routing ---------------------------------------------------------
@@ -4732,6 +4831,7 @@ def build_parser():
         "runs": "list a ticket's subagent runs", "smoke-routing": "smoke-test model routing",
         "retry": "replay a recorded stage dispatch",
         "watch": "watch ticket state", "selftest": "run the end-to-end self test",
+        "reconcile": "retire completed tickets in configured projects",
     }
 
     def add(name, fn, *ticket_args):
@@ -4785,6 +4885,8 @@ def build_parser():
     sp = sub.add_parser("state-md", parents=[common], help="check or rebuild the committed STATE.md projection")
     sp.set_defaults(fn=cmd_state_md)
     sp.add_argument("operation", choices=("check", "rebuild"))
+    sp = add("reconcile", cmd_reconcile)
+    sp.add_argument("--project", help="scan only this project root")
     add("init", cmd_init)
     add("platform", cmd_platform)
     add("preflight", cmd_preflight)
@@ -4862,7 +4964,7 @@ def build_parser():
 
 
 READ_ONLY = (cmd_list, cmd_show, cmd_next, cmd_stale, cmd_events, cmd_route, cmd_runs)
-NO_DB = (cmd_init, cmd_preflight, cmd_platform, cmd_hook, cmd_watch,
+NO_DB = (cmd_reconcile, cmd_init, cmd_preflight, cmd_platform, cmd_hook, cmd_watch,
          cmd_selftest, cmd_smoke_routing)
 
 
