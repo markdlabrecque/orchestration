@@ -215,6 +215,44 @@ class ReconcileTests(OrchTestCase):
         with open(target) as f:
             self.assertEqual(f.read(), 'valuable')
 
+    def assert_teardown_identity_change_preserved(self, branch):
+        path = self.completed(branch=branch)
+        saved_head = subprocess.check_output(
+            ['git', '-C', path, 'rev-parse', 'HEAD'], text=True, env=self.env).strip()
+        changed_branch = 'renamed-ticket-50' if branch else 'new-ticket-50'
+        command = 'branch -m' if branch else 'switch -c'
+        hook = self.stub('identity-hook', 'git -C ' + self.quote(path) + ' ' +
+                         command + ' ' + changed_branch + '\n')
+        result = self.reconcile(env={'RETIRE_HOOK': hook})
+        for attempt in range(2):
+            if attempt:
+                result = self.reconcile()
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(os.path.isdir(path), 'changed checkout must be preserved')
+            self.assertTrue(os.path.isfile(os.path.join(path, 'README')))
+            self.assertEqual(subprocess.check_output(
+                ['git', '-C', path, 'symbolic-ref', 'HEAD'],
+                text=True, env=self.env).strip(), 'refs/heads/' + changed_branch)
+            self.assertEqual(subprocess.check_output(
+                ['git', '-C', path, 'rev-parse', 'HEAD'],
+                text=True, env=self.env).strip(), saved_head)
+            self.git('show-ref', '--verify', 'refs/heads/' + changed_branch)
+            self.assertIsNone(self.show('50')['retired_at'])
+            self.assertFalse(any(e['kind'] == 'retire' for e in self.events('50')))
+            with open(os.path.join(self.repo, '.git/orch-retirement/50.json')) as f:
+                record = json.load(f)
+            self.assertEqual(record['stage'], 'ready')
+            self.assertEqual(record['path'], path)
+            self.assertEqual(record['branch'], 'refs/heads/ticket-50' if branch else '')
+            self.assertEqual(record['head'], saved_head)
+            self.assertIn('changed during retirement', result.stderr)
+
+    def test_teardown_branch_rename_at_same_head_preserves_checkout_and_pending_identity(self):
+        self.assert_teardown_identity_change_preserved(branch=True)
+
+    def test_teardown_detached_to_branch_at_same_head_preserves_checkout_and_pending_identity(self):
+        self.assert_teardown_identity_change_preserved(branch=False)
+
     def test_failed_ticket_does_not_stop_healthy_ticket(self):
         dirty = self.completed('50')
         healthy = self.completed('51')

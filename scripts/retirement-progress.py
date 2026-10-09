@@ -126,8 +126,11 @@ def run(action, main, tid, expected, force=False):
         raise RuntimeError('invalid retirement progress for %s' % path)
     branch = record['branch']
     if exists:
-        if git(path, 'rev-parse', 'HEAD') != record['head']:
-            raise RuntimeError('worktree HEAD changed during retirement: %s' % path)
+        # Detect teardown identity changes, not serialize repository writers.
+        # Manual recovery still requires controlled quiescence.
+        current_branch = git(path, 'symbolic-ref', '--quiet', 'HEAD', absent=True) or ''
+        if current_branch != branch or git(path, 'rev-parse', 'HEAD') != record['head']:
+            raise RuntimeError('branch/HEAD changed during retirement of %s; inspect saved identity %s' % (path, journal))
         dirty = git(path, 'status', '--porcelain', '--untracked-files=all')
         if dirty and not force:
             raise RuntimeError('%s has uncommitted work after teardown; refusing: %s' % (path, dirty))
