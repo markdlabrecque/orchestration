@@ -143,7 +143,7 @@ ci         -> fix | mr
 - Entering `review` adds 1 to `review_rounds`.
 - When new integration findings arise in `report`, use `orch phase <ticket> review --note "<findings link>"` to reopen review. This appends a phase event and increments `review_rounds`, preserving prior history, run snapshots and both repair budgets, including unknown counts. Before dispatching corrective work, successfully enter `fix` through the normal `review -> fix` budget and frontier gates. `report -> fix` remains illegal, and retired tickets cannot reopen.
 - CI repairs do not count as review rounds. `fix -> ci` returns straight to CI after such a repair.
-- `review -> fix` and `verify -> fix` share three successful bounces per ticket, persisted in `bounces`. A fourth exits 3 before dispatch. Budget exhaustion is checked before the last-implementor `frontier/high` gate, which may refuse earlier without consuming a bounce. Review entries have no cap.
+- `review -> fix` and `verify -> fix` share three successful bounces per ticket, persisted in `bounces`. A fourth exits 3 before dispatch unless explicitly consuming the single human-approved [repair exception](#one-extra-repair-exception). Budget exhaustion is checked before the last-implementor `frontier/high` gate, which may refuse earlier without consuming a bounce. Review entries have no cap.
 - `ci -> fix` consumes one of two independent repairs, persisted in `ci_repairs`; a third exits 3. It changes neither `bounces` nor `review_rounds` and is not subject to the review frontier gate. `fix -> ci` consumes nothing.
 - A successful repair transition consumes its slot even if dispatch never happens or the agent fails. Phase, counters and one phase event commit together under `BEGIN IMMEDIATE`. Illegal or retired transitions are checked first. Refusal leaves state and successful event history unchanged; it does not automatically block.
 - After refusal, stop routing, recording and dispatching the requested fix. Retain the findings and explicitly `orch block <ticket> --reason "<budget or frontier gate>; findings: <link>"` for a human. A route read is not permission to bypass refusal. Follow-ups do not authorize declaring unresolved must-fix work complete.
@@ -156,7 +156,35 @@ SQLite is authoritative. `orch show` exposes `bounces` and `ci_repairs` in text 
 
 On first addition of a missing budget column, a transactional migration counts successful `kind=phase` transitions into `fix` from the relevant origins. It requires an initial `add` event into `ready`, a continuous recorded phase chain and agreement with the current phase. Missing or detectably truncated history produces a durable unknown count. Later opens do not repeat migration or recalculate initialized counts downward. Pre-bounces databases use the same history checks for review/verify bounces. Complete history with no repairs establishes zero.
 
-These checks cannot detect every loss, such as removal of an entire round trip that leaves a continuous chain. Preserve database backups and external tracker/session evidence. If history is known or suspected to be incomplete, stop for human investigation before requesting repair; do not treat an apparently reconstructed zero as proof against that evidence. Unknown counts refuse the relevant repair until evidence-backed human reconciliation. An unknown bounce count also refuses every `orch run` with exit 3 because a dispatch snapshot cannot record unknown as zero or NULL. There is no reconciliation, reset or override CLI command. Keep the ticket blocked pending separately authorized state maintenance that recovers the actual count, never forgives attempts. Retain the recovered count, the reasoning and supporting event exports, backups, tracker links or session records in the tracker or durable evidence files; link those records in the block reason. The CLI does not itself collect or validate external reconciliation evidence.
+These checks cannot detect every loss, such as removal of an entire round trip that leaves a continuous chain. Preserve database backups and external tracker/session evidence. If history is known or suspected to be incomplete, stop for human investigation before requesting repair; do not treat an apparently reconstructed zero as proof against that evidence. Unknown counts refuse the relevant repair until evidence-backed human reconciliation. An unknown bounce count also refuses every `orch run` with exit 3 because a dispatch snapshot cannot record unknown as zero or NULL. There is no reconciliation or reset CLI command. The one-extra-repair grant below cannot reconcile unknown history or forgive a count. Keep the ticket blocked pending separately authorized state maintenance that recovers the actual count, never forgives attempts. Retain the recovered count, the reasoning and supporting event exports, backups, tracker links or session records in the tracker or durable evidence files; link those records in the block reason. The CLI does not itself collect or validate external reconciliation evidence.
+
+## One-extra-repair exception
+
+The ordinary cap remains three review/verify bounces. Only an explicit requesting-human approval may authorize one additional repair. The parent orchestrator records that approval; stage agents never grant or consume it. Bootstrap implementation of this mechanism is separate from permission to perform the repair.
+
+After retaining the approval and findings, unblock to the original `review` or `verify` phase. Read fresh `show` and `events --json`. Use the `seq` of the latest phase-changing event, including an unblock, as `EVENT`:
+
+```sh
+orch show TICKET --json
+orch events TICKET --json
+orch repair-grant TICKET --grant-id GRANT --approved \
+  --approved-by REQUESTING_HUMAN --evidence 'tracker approval URL; durable authorization file' \
+  --scope 'one repair of the retained findings; no other gate waiver' \
+  --workflow WORKFLOW --agent AGENT --event EVENT --json
+orch phase TICKET fix --repair-grant GRANT --workflow WORKFLOW --agent AGENT
+```
+
+Choose stable workflow and agent identities from the approved invocation, not a generic role or model name. Retain their mapping to the actual child in the approval evidence. Both consumption flags must match the grant exactly. Successfully enter `fix` before routing and recording the actual repair dispatch. A scope that permits a paused bootstrap child to continue permits only that same child, not a replacement. Routing floors and the last-implementor frontier/high refusal still apply independently. Approval is not independent review, passing tests, CI, merge permission or authorization for a new ticket session.
+
+The grant requires exactly three known bounces, known CI repairs within their existing budget, an active `review` or `verify` phase and complete, agreeing phase/counter history. Earlier phases, `ci`, blocked and retired tickets refuse. Refresh reservations and active lifecycle operations refuse. Known Pi child attestations also refuse. Unknown or inconsistent history stays blocked for investigation.
+
+`repair_grants` stores one immutable row per ticket with a globally unique grant ID. The approval, evidence, scope, workflow and agent are nonempty retained strings. The context captures phase, counters, review rounds, current phase-changing event identity, session, attempt, worktree, branch, harness, and run/CI watermarks. Changed context makes consumption stale, including block/unblock or a new run after granting. Grant immediately before the explicit transition. Identical grant replay returns the original record without another event or revision increment, even after consumption; altered replay, a second ID or reuse on another ticket refuses. There is no renewal, replacement, cap increment or reset command. A stale unconsumed grant remains retained and requires a human stop, not another grant.
+
+An ordinary `phase ... fix` never uses a grant automatically. Only the matching `--repair-grant`, `--workflow` and `--agent` flags consume it, in the same `BEGIN IMMEDIATE` transaction as `bounces: 3 -> 4`, the phase change and append-only events. A failed guard or interrupted transaction consumes nothing. Successful consumption records its timestamp and phase-event sequence. Concurrent consumption has one winner; the next repair refuses. CI repairs and review rounds remain unchanged. Existing run snapshots, retry provenance, outcomes and CI evidence remain intact.
+
+`show` exposes `repair_grant`, null before any grant, and `events --json` includes event sequences. STATE.md includes detailed grant rows and grant/consumption events under the existing revision and synthetic-ticket isolation rules. On a commit/export failure, inspect state before retrying, just as for other writes.
+
+These commands record evidence attestations, not authenticated human approval or proof of the evidence's truth. They do not fetch tracker content, authenticate the requesting human, or verify an arbitrary workflow label against a running process. The parent owns that inspection and exclusion of competing writers. Environment child markers are cooperative guards, not a security boundary.
 
 ## Shared baseline failures
 
@@ -406,7 +434,8 @@ Every command accepts `--json`, before or after the command name (one JSON objec
 | `orch attach <ticket> [--ref R] [--session-id S]` | main | Record a Desktop session ref (stored as `{"desktop": R}`) and/or a session id for a session `orch` did not start. Writes an `attach` event. |
 | `orch stale` | main | Active tickets whose health is `dead`, including `dispatched` ones nobody reported in for: the recovery list. An `orca`, `herdr` or `desktop` ticket that no session has reported in for yet (no pid) is listed only once `stall_minutes` have passed since its launch, since its pid only arrives with the first hook. |
 | `orch hook` | hooks | See "Hooks". |
-| `orch phase <ticket> <phase> [--note N]` | ticket | Validated transition (table above). |
+| `orch phase <ticket> <phase> [--note N]` | ticket | Validated transition. Explicit one-extra-repair consumption additionally requires `--repair-grant ID --workflow ID --agent ID`, as described above. |
+| `orch repair-grant <ticket> ...` | parent | Record one requesting-human-approved repair grant. See [One-extra-repair exception](#one-extra-repair-exception) for required evidence and scope flags. |
 | `orch block <ticket> --reason R` | either | Phase `blocked`; remembers the prior phase. The reason is recorded in STATE.md. |
 | `orch unblock <ticket>` | either | Back to the remembered phase. Exit 3 if there is none. |
 | `orch ci <ticket> --sha S (--passed \| --failed)` | ticket | Records the CI verdict for that commit. Requires phase `ci`. |
