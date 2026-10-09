@@ -1,4 +1,4 @@
-# STATE.md retention diagnostics — ticket 60
+# STATE.md retention diagnostics: ticket 60
 
 ## Delivered
 
@@ -19,7 +19,7 @@ This is real measured evidence; wall time covers publication and unchanged check
 
 ## Test and review evidence
 
-- `python3 -m unittest discover -s tests -v` — 654 passed, 15 skipped; successful full run recorded at 810.073 seconds.
+- `python3 -m unittest discover -s tests -v` — 654 tests ran, including 15 skipped, with zero failures; successful full run recorded at 810.073 seconds.
 - `bash skills/create-worktree/tests/run-all.sh` — 412 passed, 0 failed, 0 skipped (subsuite counts: 184, 143, 55, 30).
 - `env -u ORCH_HOME -u PI_SUBAGENT_CHILD -u ORCH_PI_PARENT_SESSION node --test tests/pi/extension.test.mjs` — 10 passed, 0 failed, 0 skipped.
 - `git diff --check` — exit 0.
@@ -30,4 +30,4 @@ Independent review: **APPROVED**, round 1, bounces 0; no must-fix findings. Revi
 
 ## Integration status
 
-This candidate is based on `17ce044`, but `origin/main` has since advanced to `ccd735a`. Integration gates and a fresh independent review must be rerun against the updated base before publication. Final CI and merge are **not** claimed here.
+The initial gates and review ran atop `17ce044`. The candidate has since been successfully rebased onto `origin/main` at `ccd735a`. Integration gates and a fresh independent review on the rebased candidate are still required before publication. Final CI and merge are **not** claimed here.
