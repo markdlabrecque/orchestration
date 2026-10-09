@@ -114,6 +114,48 @@ class ReconcileTests(OrchTestCase):
         self.assertEqual(before, self.db_exec('SELECT * FROM tickets ORDER BY id'))
         self.assertFalse(os.path.exists(os.path.join(unrelated, '.agents')))
 
+    def assert_project_alias_attempted_once(self, alias_name):
+        self.addCleanup(lambda: self.assertFalse(os.path.lexists(self.tmp),
+                                                 'disposable alias fixture was not removed'))
+        path = self.completed(branch=True)
+        alias = os.path.join(self.projects, alias_name)
+        os.symlink(self.root, alias)
+        calls = os.path.join(self.tmp, 'teardown-calls')
+        hook = self.stub('failed-teardown', 'echo attempt >> ' + self.quote(calls) +
+                         '\necho fixture-teardown-failed >&2\nexit 1\n')
+        expected = None
+        commands = [(), (), ('--project', alias), ('--project', self.root)]
+        for attempt, flags in enumerate(commands, 1):
+            result = self.orch('reconcile', *flags, '--json', env={'RETIRE_HOOK': hook})
+            self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+            with open(calls) as f:
+                self.assertEqual(len(f.readlines()), attempt,
+                                 'one teardown attempt per canonical candidate per invocation')
+            outcomes = json.loads(result.stdout)['outcomes']
+            self.assertEqual(len(outcomes), 1)
+            outcome = outcomes[0]
+            self.assertEqual(outcome['project'], self.root)
+            self.assertEqual(outcome['ticket'], '50')
+            self.assertEqual(outcome['worktree'], path)
+            self.assertEqual(outcome['outcome'], 'attention')
+            self.assertIn('fixture-teardown-failed', outcome['reason'])
+            if expected is not None:
+                self.assertEqual(outcome, expected)
+            expected = outcome
+            self.assertEqual(len(self.notices()), 1)
+            self.assertIn(self.root + ': ticket 50', self.notices()[0])
+            self.assertNotIn(alias, result.stderr + self.notices()[0])
+            self.assertTrue(os.path.isfile(os.path.join(path, 'README')))
+            self.git('show-ref', '--verify', 'refs/heads/ticket-50')
+            self.assertIsNone(self.show('50')['retired_at'])
+            self.assertFalse(any(e['kind'] == 'retire' for e in self.events('50')))
+
+    def test_project_alias_sorted_after_original_attempted_once(self):
+        self.assert_project_alias_attempted_once('zz-alias')
+
+    def test_project_alias_sorted_before_original_uses_canonical_identity(self):
+        self.assert_project_alias_attempted_once('aa-alias')
+
     def test_dirty_files_and_hook_edits_preserved_with_deduplicated_attention(self):
         for relative in ('README', 'untracked', 'scripts/retire-worktree.sh'):
             with self.subTest(relative=relative):

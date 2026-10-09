@@ -3493,7 +3493,7 @@ def cmd_reconcile(args):
     outcomes = []
     roots = []
     try:
-        roots = ([os.path.realpath(args.project)] if args.project else
+        roots = ([args.project] if args.project else
                  [os.path.join(projects_dir(), name) for name in sorted(os.listdir(projects_dir()))])
     except OSError as e:
         root = projects_dir()
@@ -3501,7 +3501,12 @@ def cmd_reconcile(args):
                              outcome="attention", reason="cannot discover projects: %s" % e))
         print("%s: cannot discover projects: %s; restore the directory or correct ORCH_PROJECTS_DIR"
               % (root, e), file=sys.stderr)
+    seen = set()
     for root in roots:
+        root = os.path.realpath(root)
+        if root in seen:
+            continue
+        seen.add(root)
         sdir = os.path.join(root, ".agents", "orchestration")
         if not (os.path.isfile(os.path.join(root, ".orch"))
                 and os.path.isfile(os.path.join(sdir, "state.db"))):
