@@ -122,6 +122,72 @@ class RepairExceptionTests(RoutingTestCase):
         self.ok(*self.grant_args())
         self.refuses_unchanged(['phase', 't1', 'fix', '--repair-grant', 'approval-1'])
 
+    def test_parent_self_marker_can_grant_and_consume(self):
+        self.exhausted()
+        session = self.show('t1')['session_id']
+        self.assertTrue(session)
+        parent = {'PI_SESSION_ID': session, 'ORCH_PI_PARENT_SESSION': session}
+        self.ok(*self.grant_args(), env=parent)
+        self.ok(*self.consume_args(), env=parent)
+        state = self.show('t1')
+        self.assertEqual((state['phase'], state['bounces'], state['ci_repairs'], state['review_rounds']),
+                         ('fix', 4, 0, 4))
+        self.assertIsNotNone(state['repair_grant']['consumed_at'])
+
+    def test_child_flags_refuse_even_with_matching_self_marker(self):
+        self.exhausted()
+        session = self.show('t1')['session_id']
+        cases = []
+        for own in (session, 'different-child-session'):
+            for flags in ({'PI_SUBAGENT_CHILD': '1'}, {'PI_SUBAGENT_ID': 'child-192'},
+                          {'PI_SUBAGENT_ID': ''},
+                          {'PI_SUBAGENT_CHILD': '1', 'PI_SUBAGENT_ID': 'child-192'}):
+                cases.append(dict(PI_SESSION_ID=own, ORCH_PI_PARENT_SESSION=session, **flags))
+        for env in cases:
+            with self.subTest(operation='grant', env=env):
+                self.refuses_unchanged(self.grant_args(), env=env)
+        self.ok(*self.grant_args())
+        for env in cases:
+            with self.subTest(operation='consume', env=env):
+                self.refuses_unchanged(self.consume_args(), env=env)
+
+    def test_unknown_or_mismatched_parent_markers_refuse_without_mutation(self):
+        self.exhausted()
+        session = self.show('t1')['session_id']
+        cases = (
+            {'PI_SESSION_ID': 'different-child-session', 'ORCH_PI_PARENT_SESSION': session},
+            {'PI_SESSION_ID': session, 'ORCH_PI_PARENT_SESSION': 'different-parent'},
+            {'PI_SESSION_ID': 'other-ticket-session', 'ORCH_PI_PARENT_SESSION': 'other-ticket-session'},
+            {'ORCH_PI_PARENT_SESSION': session},
+            {'PI_SESSION_ID': '', 'ORCH_PI_PARENT_SESSION': session},
+            {'PI_SESSION_ID': ' ', 'ORCH_PI_PARENT_SESSION': ' '},
+            {'PI_SESSION_ID': session, 'ORCH_PI_PARENT_SESSION': ''},
+            {'PI_SESSION_ID': '', 'ORCH_PI_PARENT_SESSION': ''},
+        )
+        for env in cases:
+            with self.subTest(operation='grant', env=env):
+                self.refuses_unchanged(self.grant_args(), env=env)
+        self.ok(*self.grant_args())
+        for env in cases:
+            with self.subTest(operation='consume', env=env):
+                self.refuses_unchanged(self.consume_args(), env=env)
+
+    def test_parent_marker_requires_known_matching_ticket_session(self):
+        self.exhausted()
+        session = self.show('t1')['session_id']
+        parent = {'PI_SESSION_ID': session, 'ORCH_PI_PARENT_SESSION': session}
+        args = self.grant_args()
+        for recorded in (None, '', 'different-ticket-session'):
+            with self.subTest(operation='grant', recorded=recorded):
+                self.db_exec("UPDATE tickets SET session_id=? WHERE id='t1'", (recorded,))
+                self.refuses_unchanged(args, env=parent)
+        self.db_exec("UPDATE tickets SET session_id=? WHERE id='t1'", (session,))
+        self.ok(*args, env=parent)
+        for recorded in (None, '', 'different-ticket-session'):
+            with self.subTest(operation='consume', recorded=recorded):
+                self.db_exec("UPDATE tickets SET session_id=? WHERE id='t1'", (recorded,))
+                self.refuses_unchanged(self.consume_args(), env=parent)
+
     def test_known_children_cannot_grant_or_consume(self):
         self.exhausted()
         for marker in ('PI_SUBAGENT_CHILD', 'PI_SUBAGENT_ID', 'ORCH_PI_PARENT_SESSION'):

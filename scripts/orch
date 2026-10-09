@@ -3007,9 +3007,13 @@ def repair_grant(db, tid):
 def repair_grant_parent(row):
     # These are cooperative caller attestations, not an authentication boundary.
     if (os.environ.get("PI_SUBAGENT_CHILD") == "1"
-            or os.environ.get("PI_SUBAGENT_ID")
-            or os.environ.get("ORCH_PI_PARENT_SESSION")):
+            or "PI_SUBAGENT_ID" in os.environ):
         raise Refusal(EXIT_GATE, "repair grants require the parent orchestrator, not a child")
+    parent = os.environ.get("ORCH_PI_PARENT_SESSION")
+    if parent is not None:
+        own = os.environ.get("PI_SESSION_ID")
+        if not own or not own.strip() or parent != own or parent != row["session_id"]:
+            raise Refusal(EXIT_GATE, "unknown or mismatched Pi parent session for repair grant")
     if row["retired_at"] is not None:
         raise Refusal(EXIT_GATE, "retired ticket cannot use a repair grant")
     refuse_if_refreshing(row)
