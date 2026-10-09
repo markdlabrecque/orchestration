@@ -3283,6 +3283,7 @@ def cmd_reconcile(args):
             with cleanup_project(root):
                 main_checkout()
                 db = connect(sdir)
+                cleanup_notice(sdir, "__project__", None)
                 rows = db.execute("SELECT * FROM tickets WHERE phase='done' AND retired_at IS NULL"
                                   " ORDER BY seq").fetchall()
                 for row in rows:

@@ -142,11 +142,8 @@ fi
 
 # --- Resolve the optional project retire hook -------------------------------
 #
-# Resolved BEFORE the dirty check: the conventional
-# <worktree>/scripts/retire-worktree.sh may itself be a freshly-added,
-# not-yet-committed file (e.g. a worktree being retired right after adding
-# the hook), and its own untracked presence must not be what makes the
-# worktree look dirty and block retirement.
+# Resolve before checking dirtiness, but preserve hook edits just like any
+# other tracked or untracked work.
 resolve_retire_hook() { # -> prints path, rc0 if found
   local val
   val="$(orch_get "$ORCH_ROOT" RETIRE_HOOK)"
@@ -285,6 +282,16 @@ fi
 python3 "$progress" ready "$main_repo" "$id" "$worktree" || exit $?
 
 if [ "$ddev_only" -eq 1 ]; then
+  # The hook may have written new work. Check again before handing deletion
+  # to an external adapter, just as finish_git does for plain git teardown.
+  dirty="$(git -C "$worktree" status --porcelain --untracked-files=all 2>&1)" || {
+    echo "retire-worktree: git status failed after teardown in $worktree; refusing." >&2
+    exit 4
+  }
+  if [ -n "$dirty" ] && [ "$force" -ne 1 ]; then
+    echo "retire-worktree: $worktree has uncommitted work after teardown; refusing." >&2
+    exit 2
+  fi
   echo "retire-worktree: --ddev-only: left the worktree and branch in place."
   echo "retire-worktree:   DDEV project: $ddev_project"
   echo "retire-worktree:   path: $worktree"

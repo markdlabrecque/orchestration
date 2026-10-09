@@ -245,6 +245,149 @@ class ReconcileTests(OrchTestCase):
         with open(target) as f:
             self.assertEqual(f.read(), 'keep')
 
+    def notices(self):
+        if not os.path.exists(self.notifications):
+            return []
+        with open(self.notifications) as f:
+            return f.readlines()
+
+    def test_failed_notification_retries_and_concurrent_failures_deduplicate(self):
+        path = self.completed()
+        with open(os.path.join(path, 'untracked'), 'w') as f:
+            f.write('keep')
+        self.stub('notify-send', 'exit 1\n')
+        self.assertNotEqual(self.reconcile().returncode, 0)
+        self.assertFalse(self.notices())
+        self.stub('notify-send', 'echo "$*" >> ' + self.quote(self.notifications) + '\n')
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            list(pool.map(lambda _: self.reconcile(), range(3)))
+        self.assertEqual(len(self.notices()), 1)
+        self.assertFalse(is_retired(self.show('50')))
+        with open(os.path.join(path, 'second-file'), 'w') as f:
+            f.write('changed failure')
+        self.reconcile()
+        self.assertEqual(len(self.notices()), 2)
+        os.unlink(os.path.join(path, 'untracked'))
+        os.unlink(os.path.join(path, 'second-file'))
+        self.assertEqual(self.reconcile().returncode, 0)
+        with open(os.path.join(self.state_dir, 'cleanup-notifications.json')) as f:
+            self.assertNotIn('50', json.load(f))
+
+    def test_project_notification_resolution_and_recurrence(self):
+        self.init()
+        with open(os.path.join(self.root, '.orch')) as f:
+            original = f.read()
+        for count in (1, 2):
+            self.write_orch('MAIN_CHECKOUT=missing\n')
+            for _ in range(2):
+                self.assertNotEqual(self.reconcile().returncode, 0)
+            self.assertEqual(len(self.notices()), count)
+            with open(os.path.join(self.root, '.orch'), 'w') as f:
+                f.write(original)
+            self.assertEqual(self.reconcile().returncode, 0)
+
+    def test_git_status_failure_preserves_worktree(self):
+        path = self.completed()
+        real_git = shutil.which('git', path=os.environ['PATH'])
+        self.stub('git', 'case " $* " in *" status "*) echo status-unavailable >&2; exit 1;; esac\nexec ' +
+                  self.quote(real_git) + ' "$@"\n')
+        p = self.reconcile()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('status', p.stderr)
+        self.assertTrue(os.path.isdir(path))
+        self.assertFalse(is_retired(self.show('50')))
+
+    def test_trust_failure_retains_pending_cleanup(self):
+        path = self.completed()
+        self.db_exec("UPDATE tickets SET trust_marked=1 WHERE id='50'")
+        with open(self.claude_json, 'w') as f:
+            f.write('invalid config, preserve exactly')
+        p = self.reconcile()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('trust', p.stderr)
+        self.assertTrue(os.path.isdir(path))
+        self.assertFalse(is_retired(self.show('50')))
+        with open(self.claude_json) as f:
+            self.assertEqual(f.read(), 'invalid config, preserve exactly')
+        with open(self.claude_json, 'w') as f:
+            json.dump({'projects': {path: {'hasTrustDialogAccepted': True}}}, f)
+        self.assertEqual(self.reconcile().returncode, 0)
+        self.assert_complete('50', path)
+
+    def test_session_close_retry_requires_confirmed_absence(self):
+        path = self.completed()
+        self.db_exec("UPDATE tickets SET platform='herdr', launch_ref=? WHERE id='50'",
+                     (json.dumps({'workspace': 'disposable-workspace'}),))
+        calls = os.path.join(self.tmp, 'herdr-calls')
+        body = 'echo "$*" >> ' + self.quote(calls) + '\n'
+        self.stub('herdr', body + 'echo \'{"error":{"code":"offline","message":"offline"}}\'\n')
+        p = self.reconcile()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertTrue(os.path.isdir(path))
+        self.assertFalse(is_retired(self.show('50')))
+        self.stub('herdr', body + 'case "$*" in *list*) echo \'{"result":{"workspaces":[]}}\';; *) echo \'{"error":{"code":"missing","message":"already absent"}}\';; esac\n')
+        p = self.reconcile()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assert_complete('50', path)
+        with open(calls) as f:
+            self.assertNotIn('--force', f.read())
+
+    def test_manual_retirement_claim_defers_concurrent_reconcile(self):
+        import time
+        path = self.completed()
+        entered = os.path.join(self.tmp, 'entered')
+        release = os.path.join(self.tmp, 'release')
+        hook = self.stub('blocking-hook', 'touch ' + self.quote(entered) + '\nwhile [ ! -e ' +
+                         self.quote(release) + ' ]; do sleep 0.05; done\n')
+        env = dict(self.env, RETIRE_HOOK=hook)
+        process = subprocess.Popen([ORCH, 'retire', '50'], cwd=self.repo, env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 10
+            while not os.path.exists(entered) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(os.path.exists(entered))
+            p = self.reconcile()
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn('in progress', p.stderr)
+            self.assertTrue(os.path.isdir(path))
+        finally:
+            with open(release, 'w'):
+                pass
+            stdout, stderr = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.assert_complete('50', path)
+
+    def test_finalization_rechecks_phase_and_owner(self):
+        for column, value in [('phase', 'blocked'), ('launching', json.dumps({'token': 'new-owner', 'pid': os.getpid(), 'op': 'retire'}))]:
+            with self.subTest(column=column):
+                tid = '71' if column == 'phase' else '72'
+                path = self.completed(tid)
+                hook = self.stub('change-' + column, 'exec python3 -c ' + self.quote(
+                    'import sqlite3; db=sqlite3.connect(' + repr(self.db_path()) + '); db.execute(' +
+                    repr('UPDATE tickets SET ' + column + '=? WHERE id=?') + ', ' + repr((value, tid)) +
+                    '); db.commit()') + '\n')
+                p = self.reconcile(env={'RETIRE_HOOK': hook})
+                self.assertFalse(is_retired(self.show(tid)), p.stdout + p.stderr)
+                self.assertFalse(any(e['kind'] == 'retire' for e in self.events(tid)))
+                self.assertEqual(self.db_exec('SELECT ' + column + ' FROM tickets WHERE id=?', (tid,))[0][0], value)
+                self.assertFalse(os.path.exists(path), 'fixture must reach finalization after teardown')
+
+    def test_branch_moved_after_partial_removal_is_preserved(self):
+        path = self.completed()
+        real_git = shutil.which('git', path=os.environ['PATH'])
+        self.stub('git', 'case " $* " in *" branch -D "*) exit 1;; esac\nexec ' + self.quote(real_git) + ' "$@"\n')
+        self.assertNotEqual(self.reconcile().returncode, 0)
+        self.assertFalse(os.path.exists(path))
+        os.unlink(os.path.join(self.bin, 'git'))
+        self.git('commit', '--allow-empty', '-qm', 'move branch identity')
+        self.git('branch', '-f', 'ticket-50', 'HEAD')
+        p = self.reconcile()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('branch changed', p.stderr)
+        self.assertFalse(is_retired(self.show('50')))
+        self.git('show-ref', '--verify', 'refs/heads/ticket-50')
+
     def test_project_override_cannot_redirect_cleanup(self):
         path = self.completed()
         wrong = os.path.join(self.tmp, 'wrong-state')
@@ -256,3 +399,4 @@ class ReconcileTests(OrchTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
