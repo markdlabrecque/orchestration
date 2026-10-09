@@ -173,7 +173,7 @@ class ReconcileTests(OrchTestCase):
         fail = os.path.join(self.tmp, 'fail-branch')
         with open(fail, 'w'):
             pass
-        self.stub('git', 'case " $* " in\n*" branch -D "*) if [ -f ' + self.quote(fail) +
+        self.stub('git', 'case " $* " in\n*" update-ref --no-deref -d "*) if [ -f ' + self.quote(fail) +
                   ' ]; then echo branch-delete-failed >&2; exit 1; fi;;\nesac\nexec ' +
                   self.quote(real_git) + ' "$@"\n')
         p = self.reconcile()
@@ -518,7 +518,7 @@ class ReconcileTests(OrchTestCase):
     def test_branch_moved_after_partial_removal_is_preserved(self):
         path = self.completed()
         real_git = shutil.which('git', path=os.environ['PATH'])
-        self.stub('git', 'case " $* " in *" branch -D "*) exit 1;; esac\nexec ' + self.quote(real_git) + ' "$@"\n')
+        self.stub('git', 'case " $* " in *" update-ref --no-deref -d "*) exit 1;; esac\nexec ' + self.quote(real_git) + ' "$@"\n')
         self.assertNotEqual(self.reconcile().returncode, 0)
         self.assertFalse(os.path.exists(path))
         os.unlink(os.path.join(self.bin, 'git'))
@@ -529,6 +529,86 @@ class ReconcileTests(OrchTestCase):
         self.assertIn('branch changed', p.stderr)
         self.assertFalse(is_retired(self.show('50')))
         self.git('show-ref', '--verify', 'refs/heads/ticket-50')
+
+    def late_branch_move(self, retire, boundary='remove'):
+        path = self.completed()
+
+        def output(*args):
+            return subprocess.check_output(['git', '-C', self.repo, *args],
+                                           text=True, env=self.env)
+
+        saved = output('rev-parse', 'ticket-50').strip()
+        content = 'valuable commit created while retirement removes the checkout\n'
+        with open(os.path.join(self.repo, 'late-content'), 'w') as f:
+            f.write(content)
+        self.git('add', 'late-content')
+        self.git('commit', '-qm', 'concurrent work')
+        moved = output('rev-parse', 'HEAD').strip()
+        real_git = self.quote(shutil.which('git', path=os.environ['PATH']))
+        move = (real_git + ' -C ' + self.quote(self.repo) +
+                ' update-ref refs/heads/ticket-50 ' + moved + ' ' + saved + '\n')
+        if boundary == 'remove':
+            body = ('case " $* " in *" worktree remove "*)\n' + real_git +
+                    ' "$@" || exit $?\n' + move + 'exit $?;;\nesac\n')
+        else:
+            # Move after every userspace identity check, at the deletion boundary.
+            body = ('case " $* " in *" update-ref "*|*" branch -D "*)\n' +
+                    move + ';;\nesac\n')
+        self.stub('git', body + 'exec ' + real_git + ' "$@"\n')
+        p = retire()
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse(os.path.exists(path), 'must reach checkout removal')
+        os.unlink(os.path.join(self.bin, 'git'))
+        for result in (p, retire()):
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('branch', result.stderr)
+            self.assertIn('retirement', result.stderr)
+            self.assertIn('saved identity', result.stderr)
+            self.assertIn(saved, result.stderr)
+            self.assertIn('retrying', result.stderr)
+            self.assertFalse(is_retired(self.show('50')))
+            self.assertFalse(any(e['kind'] == 'retire' for e in self.events('50')))
+            self.assertEqual(output('rev-parse', 'ticket-50').strip(), moved)
+            self.assertEqual(output('show', 'ticket-50:late-content'), content)
+        # Explicit operator repair: keep the new commit on a recovery branch,
+        # then restore the saved identity using an expected-old-value update.
+        self.git('branch', 'recovered-work', moved)
+        self.git('update-ref', 'refs/heads/ticket-50', saved, moved)
+        p = retire()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assert_complete('50', path)
+        self.assertEqual(output('show', 'recovered-work:late-content'), content)
+
+    def test_branch_moved_during_checkout_removal_stays_pending_until_repaired(self):
+        self.late_branch_move(self.reconcile)
+
+    def test_manual_retire_preserves_branch_moved_during_checkout_removal(self):
+        self.late_branch_move(lambda: self.orch('retire', '50'))
+
+    def test_branch_deletion_atomically_checks_saved_head(self):
+        self.late_branch_move(self.reconcile, boundary='delete')
+
+    def test_branch_claimed_by_other_worktree_during_removal_is_preserved(self):
+        path = self.completed()
+        other = os.path.join(self.root, 'code', 'other')
+        real_git = self.quote(shutil.which('git', path=os.environ['PATH']))
+        self.stub('git', 'case " $* " in *" worktree remove "*)\n' + real_git +
+                  ' "$@" || exit $?\n' + real_git + ' -C ' + self.quote(self.repo) +
+                  ' worktree add -q ' + self.quote(other) + ' ticket-50\nexit $?;;\nesac\nexec ' +
+                  real_git + ' "$@"\n')
+        p = self.reconcile()
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse(os.path.exists(path))
+        self.assertIn('another worktree', p.stderr)
+        self.assertFalse(is_retired(self.show('50')))
+        self.git('show-ref', '--verify', 'refs/heads/ticket-50')
+        self.assertTrue(os.path.isfile(os.path.join(other, 'README')))
+        os.unlink(os.path.join(self.bin, 'git'))
+        self.assertNotEqual(self.reconcile().returncode, 0)
+        self.git('worktree', 'remove', other)
+        p = self.reconcile()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assert_complete('50', path)
 
     def test_project_override_cannot_redirect_cleanup(self):
         path = self.completed()
