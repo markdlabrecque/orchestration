@@ -3176,6 +3176,7 @@ def cmd_retry(args, db, sdir):
     if explicit and not (args.model and args.effort and args.reason and args.reason.strip()):
         raise Refusal(EXIT_USAGE, "a deliberate retry needs --model, --effort and a nonempty --reason")
     row = get_ticket(db, args.ticket)
+    refuse_if_refreshing(row)
     if row["retired_at"] is not None:
         raise Refusal(EXIT_GATE, "cannot retry a retired ticket")
     if row["phase"] in ("done", "blocked"):

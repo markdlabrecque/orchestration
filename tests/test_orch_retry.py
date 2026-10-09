@@ -8,6 +8,8 @@ The immediate-source links are sufficient to trace repeated retries.
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 
 from test_orch_routing import PI, RoutingTestCase, assistant
 from test_orch_platforms import PlatformTestCase
@@ -258,6 +260,37 @@ class RetryTests(RoutingTestCase):
         os.makedirs(directory, exist_ok=True)
         with open(os.path.join(directory, "config.json"), "w") as stream:
             json.dump({"pi_models": {"standard": "other-provider/replacement"}}, stream)
+
+    def check_baseline_refresh_refused(self, *flags):
+        source = self.repair()
+        # A refresh leaves the same reservation behind if its process dies.
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            marker = json.dumps({"token": "refresh-reservation", "baseline": "walk",
+                                 "pid": process.pid, "pid_start": None})
+            self.db_exec("UPDATE tickets SET baseline_refresh=? WHERE id='t1'", (marker,))
+            for state in ("active", "interrupted"):
+                with self.subTest(refresh=state):
+                    if state == "interrupted":
+                        process.terminate()
+                        process.wait(timeout=5)
+                    else:
+                        self.assertIsNone(process.poll())
+                    result = self.refuse(source, r"baseline refresh.*recovery", *flags)
+                    self.assertEqual(result.stdout, "")
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
+        self.db_exec("UPDATE tickets SET baseline_refresh=NULL WHERE id='t1'")
+        self.assertEqual(self.retry(source, *flags)["retry_of"], source["seq"])
+
+    def test_exact_retry_refuses_active_and_interrupted_baseline_refresh_atomically(self):
+        self.check_baseline_refresh_refused()
+
+    def test_deliberate_retry_refuses_active_and_interrupted_baseline_refresh_atomically(self):
+        self.check_baseline_refresh_refused(
+            "--model", "heavy", "--effort", "high", "--reason", "approved replacement")
 
     def test_changed_mapping_refuses_instead_of_substituting_provider(self):
         source = self.repair()
