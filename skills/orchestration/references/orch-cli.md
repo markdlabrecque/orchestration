@@ -40,7 +40,7 @@ The generated section has two ownership delimiters, each on its own line:
 
 Keep human notes outside those delimiters. Initial migration retains every byte of a legacy document, including its old activity log, and adds the managed section after it. Later replacements preserve text outside the section. Missing, duplicate, reversed or malformed delimiters refuse replacement rather than guessing which text can be removed. Retain the file and investigate the ownership damage before retrying; repeated rebuilds cannot resolve ambiguous ownership.
 
-The snapshot starts with a compact recorded-ticket table and activity history ordered by stored event sequence. Detailed JSON rows follow for tickets ordered by ID, events, stage runs, CI evidence and shared baseline records. Together these expose phase, phase-derived status, attempt, retirement, recorded activity and observation time, lifecycle reservations, and recorded recovery/completion evidence. It does not probe live health, infer a current subtask, or classify run outcomes. `selftest-*` tickets and their associated events, runs and CI rows are excluded. Synthetic-only changes do not advance the source revision.
+The snapshot starts with a compact recorded-ticket table and activity history ordered by stored event sequence. Detailed JSON rows follow for tickets ordered by ID, events, stage runs, CI evidence and shared baseline records. Together these expose phase, phase-derived status, attempt, retirement, recorded activity and observation time, lifecycle reservations, and recorded recovery/completion evidence. It does not probe live health, infer a current subtask, or infer run outcomes. Recorded `run_outcomes` include retained evidence and classifications. `selftest-*` tickets and their associated events, runs, outcomes and CI rows are excluded. Synthetic-only changes do not advance the source revision.
 
 A transactional source revision tracks inserts, updates and deletes, including changes without an event. SQLite triggers also observe writes by older sibling processes. The document records that revision and the event watermark; matching managed bytes are the publication acknowledgment. A process dying between commit and export leaves detectable stale content. A process dying after a complete replacement can leave an already-fresh file, with no second acknowledgment write required.
 
@@ -220,6 +220,38 @@ orch baseline ack ID --ticket TICKET --sha CURRENT_HEAD \
 ```
 
 Acknowledgment requires current clean HEAD containing the fix and no pending stages. It expires on any HEAD change. Record passing CI for that exact HEAD through `orch ci` as usual. CI alone cannot replace the acknowledgment, and acknowledgment alone cannot replace CI. Check `baseline gate` before the remote merge; `orch merged` also enforces the baseline gate and refreshed exact HEAD. The CLI records attestations, not the truth of external test/review output, so retain the artifacts. Project `local-tests` policy still omits separate browser/accessibility verification; it does not omit automated tests or independent review.
+
+## Attempt outcomes
+
+```sh
+orch outcome TICKET --run SEQ --failure-category invocation_failure \
+  --deliverable-state partial --recovery-action continue \
+  --evidence-file /tmp/attempt-evidence.json --json
+```
+
+Run from the recorded ticket-local linked worktree after the invocation and all children have stopped and existing completion evidence is recorded for this exact run. Known Pi child callers refuse; the ticket orchestrator owns the attestation. Unknown completion stays pending. This command never changes phase, budgets, blocked state, retry provenance, completion or model resolution. Existing `retry` callers do not need an outcome record as a CLI prerequisite; the pipeline requires inspection and recording before redispatching a failed writing stage.
+
+The evidence file must be a JSON object with nonempty string fields:
+
+| Field | Inspected evidence |
+| --- | --- |
+| `revision` | Git commit resolving to current ticket worktree HEAD |
+| `branch` | Actual branch matching the recorded ticket branch |
+| `worktree_changes` | Tracked, staged and untracked candidate changes, or explicit `none` |
+| `commits` | Relevant recent commits, or an explicit statement that there are none |
+| `handoff` | Stage-specific deliverable and artifact paths, including missing evidence |
+| `gates` | Required gate results and retained log paths, or unsatisfied gates |
+| `detail` | Concrete invocation failure, incomplete handoff, independent findings or uncertainty |
+
+Capture fresh `show`/`runs`, branch/HEAD/status/commits and artifacts before recording. A dirty deliverable is permitted: HEAD identifies its committed base, not the uncommitted candidate. Describe the observed changes rather than claiming HEAD alone identifies it. Credentials and raw log contents are not required.
+
+Categories are `invocation_failure`, `incomplete_handoff`, `review_rejection`, `unknown`. Deliverable states are independently `none`, `partial`, `complete`, `unknown`. Structural guards require `retry` with `none`, `continue` with `partial`, and `advance` with `complete`. `repair` requires `review_rejection` and `complete`. A review rejection permits only `repair` or `block`, never invocation retry. `block` permits any state, including unknown. Unknown deliverables cannot retry, continue or advance. Invalid evidence, stale revision, mismatched branch/worktree/ticket/run and inconsistent actions refuse without recording an assessment.
+
+Each call appends an assessment keyed by `seq`, `run_seq`, `ticket`, `timestamp` and the resolved `revision`, plus the category, state, action and retained `evidence` object. Even identical repetition appends; changed assessments never overwrite history. The source evidence file may disappear without losing its content. `runs` exposes an `outcomes` list on every run, `show` exposes the combined `run_outcomes`, and text output prints the records. Legacy runs have empty lists, never inferred success. STATE.md publishes deterministic detailed outcome rows, with source-revision triggers for outcome changes as for other committed data.
+
+`advance` is an attested completed handoff eligible for normal gates, not automatic approval. Red test-writer tests can be complete; implementors require the whole suite green. Reviewers remain read-only. A crash cannot establish rejection without independent concrete findings. Use `retry` for no-work retries and explicit checkpoint continuation of partial work; preserve all useful changes. Genuine rejection alone takes the existing review/verify repair transition and consumes a bounce. CI repair remains separate. See [Attempt recovery](ticket-pipeline.md#attempt-recovery).
+
+These are orchestrator attestations, not proof that the described evidence or child cleanup is true. The CLI validates identity and structural consistency, not the semantic truth of handoffs or test/review logs. Retain those artifacts for independent inspection.
 
 ## Session health
 

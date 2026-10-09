@@ -196,6 +196,17 @@ CREATE TABLE IF NOT EXISTS selftest_runs (
     state TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS run_outcomes (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket TEXT NOT NULL,
+    run_seq INTEGER NOT NULL,
+    timestamp TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    failure_category TEXT NOT NULL,
+    deliverable_state TEXT NOT NULL,
+    recovery_action TEXT NOT NULL,
+    evidence TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS runs (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     ticket TEXT NOT NULL,
@@ -453,7 +464,7 @@ def connect(sdir, timeout=30):
         db.execute("PRAGMA journal_mode=WAL")
     have = {r[0] for r in db.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
-    if not {"tickets", "events", "ci_results", "selftest_runs", "runs", "baselines"} <= have:
+    if not {"tickets", "events", "ci_results", "selftest_runs", "runs", "baselines", "run_outcomes"} <= have:
         db.executescript(SCHEMA)
     ticket_cols = {r[1] for r in db.execute("PRAGMA table_info(tickets)")}
     run_cols = {r[1] for r in db.execute("PRAGMA table_info(runs)")}
@@ -657,14 +668,14 @@ STATE_END = b"<!-- orch:state-md end -->"
 
 def state_md_schema(db):
     """Triggers also track commits made by already-running older CLI versions."""
-    if db.execute("SELECT 1 FROM sqlite_master WHERE name='state_md_revision'").fetchone():
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='state_md_run_outcomes_delete'").fetchone():
         return
     with transaction(db):
         db.execute("CREATE TABLE IF NOT EXISTS state_md_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL)")
         db.execute("INSERT OR IGNORE INTO state_md_revision VALUES (1, 0)")
         for table, key in (("tickets", "id"), ("events", "ticket"),
                            ("runs", "ticket"), ("ci_results", "ticket"),
-                           ("baselines", None)):
+                           ("run_outcomes", "ticket"), ("baselines", None)):
             for action in ("INSERT", "UPDATE", "DELETE"):
                 refs = ("OLD", "NEW") if action == "UPDATE" else ("OLD",) if action == "DELETE" else ("NEW",)
                 condition = " OR ".join("substr(%s.%s,1,9) != 'selftest-'" % (ref, key)
@@ -701,7 +712,7 @@ def state_md_snapshot(db, legacy=()):
         records = {}
         for table, key, order in (("tickets", "id", "id"), ("events", "ticket", "seq"),
                                   ("runs", "ticket", "seq"), ("ci_results", "ticket", "seq"),
-                                  ("baselines", None, "id")):
+                                  ("run_outcomes", "ticket", "seq"), ("baselines", None, "id")):
             where = " WHERE substr(%s,1,9) != 'selftest-'" % key if key else ""
             records[table] = [dict(r) for r in db.execute("SELECT * FROM %s%s ORDER BY %s" % (table, where, order))]
         for ticket in records["tickets"]:
@@ -2577,6 +2588,7 @@ def cmd_show(args, db, sdir):
     if runs:
         text += "\nruns:\n" + fmt_runs(runs)
     t["runs"] = runs
+    t["run_outcomes"] = [outcome for run in runs for outcome in run["outcomes"]]
     emit(args, t, text)
 
 
@@ -3137,6 +3149,7 @@ def cmd_events(args, db, sdir):
 
 def run_dict(row):
     result = dict(row)
+    result["outcomes"] = []
     for key in ("dispatch", "routing_context"):
         result[key] = json.loads(result[key]) if result[key] is not None else None
     if result["retry_of"] is not None:
@@ -3234,9 +3247,62 @@ def cmd_retry(args, db, sdir):
     emit(args, result, str(result["seq"]))
 
 
+def outcome_dict(row):
+    result = dict(row)
+    result["evidence"] = json.loads(result["evidence"])
+    return result
+
+
+def cmd_outcome(args, db, sdir):
+    row = get_ticket(db, args.ticket)
+    refuse_if_refreshing(row)
+    baseline_local(row)
+    if os.environ.get("PI_SUBAGENT_CHILD") == "1":
+        raise Refusal(EXIT_GATE, "outcome must be attested by the ticket orchestrator")
+    run = db.execute("SELECT * FROM runs WHERE seq=? AND ticket=?",
+                     (args.run, args.ticket)).fetchone()
+    if run is None:
+        raise Refusal(EXIT_NOT_FOUND, "run does not belong to this ticket")
+    if not run["completed_at"] or not run["completion_evidence"]:
+        raise Refusal(EXIT_GATE, "invocation and all children require completion evidence first")
+    category, state, action = args.failure_category, args.deliverable_state, args.recovery_action
+    required = {"retry": "none", "continue": "partial", "advance": "complete",
+                "repair": "complete"}
+    if ((action in required and state != required[action])
+            or (category == "review_rejection" and action not in ("repair", "block"))
+            or (action == "repair" and category != "review_rejection")):
+        raise Refusal(EXIT_GATE, "inconsistent failure category, deliverable state and recovery action")
+    try:
+        with open(args.evidence_file) as source:
+            evidence = json.load(source)
+    except (OSError, ValueError) as e:
+        raise Refusal(EXIT_GATE, "invalid outcome evidence: %s" % e)
+    fields = ("revision", "branch", "worktree_changes", "commits", "handoff", "gates", "detail")
+    if not isinstance(evidence, dict) or any(
+            not isinstance(evidence.get(key), str) or not evidence[key].strip() for key in fields):
+        raise Refusal(EXIT_GATE, "outcome evidence requires nonempty strings: " + ", ".join(fields))
+    revision = baseline_commit(row["worktree"], evidence["revision"])
+    if revision != baseline_head(row):
+        raise Refusal(EXIT_GATE, "outcome revision is stale; inspect current HEAD")
+    if evidence["branch"] != baseline_git(row["worktree"], "symbolic-ref", "--short", "HEAD"):
+        raise Refusal(EXIT_GATE, "outcome branch does not match the recorded worktree")
+    seq = db.execute(
+        "INSERT INTO run_outcomes(ticket,run_seq,timestamp,revision,failure_category,"
+        "deliverable_state,recovery_action,evidence) VALUES (?,?,?,?,?,?,?,?)",
+        (args.ticket, args.run, now(), revision, category, state, action,
+         json.dumps(evidence, sort_keys=True))).lastrowid
+    result = outcome_dict(db.execute("SELECT * FROM run_outcomes WHERE seq=?", (seq,)).fetchone())
+    emit(args, result, json.dumps(result, sort_keys=True))
+
+
 def ticket_runs(db, tid):
-    return [run_dict(r) for r in db.execute("SELECT * FROM runs WHERE ticket=? ORDER BY seq",
-                                        (tid,))]
+    runs = [run_dict(r) for r in db.execute("SELECT * FROM runs WHERE ticket=? ORDER BY seq", (tid,))]
+    outcomes = collections.defaultdict(list)
+    for row in db.execute("SELECT * FROM run_outcomes WHERE ticket=? ORDER BY seq", (tid,)):
+        outcomes[row["run_seq"]].append(outcome_dict(row))
+    for run in runs:
+        run["outcomes"] = outcomes[run["seq"]]
+    return runs
 
 
 def last_run(db, tid, role):
@@ -3260,6 +3326,8 @@ def fmt_runs(runs):
         lines.append("\t".join(str("-" if v is None else v) for v in (
             r["seq"], r["role"], r["tier"], r["model_requested"], r["effort_requested"],
             r["model_resolved"], r["effort_resolved"], r["match"], r["bounce_count"], r["agent_id"], r["requested_at"])))
+        for outcome in r.get("outcomes", []):
+            lines.append("outcome: " + json.dumps(outcome, sort_keys=True))
     return "\n".join(lines)
 
 
@@ -4706,6 +4774,14 @@ def build_parser():
     complete.add_argument("--run", type=int, required=True)
     complete.add_argument("--evidence", required=True)
     complete.add_argument("--stopped", action="store_true")
+    outcome = sub.add_parser("outcome", parents=[common], help="record inspected attempt outcome without changing workflow")
+    outcome.set_defaults(fn=cmd_outcome)
+    outcome.add_argument("ticket")
+    outcome.add_argument("--run", type=int, required=True)
+    outcome.add_argument("--failure-category", required=True, choices=("invocation_failure", "incomplete_handoff", "review_rejection", "unknown"))
+    outcome.add_argument("--deliverable-state", required=True, choices=("none", "partial", "complete", "unknown"))
+    outcome.add_argument("--recovery-action", required=True, choices=("retry", "continue", "advance", "block", "repair"))
+    outcome.add_argument("--evidence-file", required=True)
     sp = sub.add_parser("state-md", parents=[common], help="check or rebuild the committed STATE.md projection")
     sp.set_defaults(fn=cmd_state_md)
     sp.add_argument("operation", choices=("check", "rebuild"))
