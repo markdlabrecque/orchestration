@@ -9,7 +9,7 @@ set -uo pipefail
 #
 # Retire a finished worktree: close its Herdr workspace, delete its DDEV
 # project (or hand that to a project's RETIRE_HOOK, if one resolves), remove
-# the worktree, and delete its local branch. The Herdr close is the engine's
+# the worktree, and retain its local branch for manual cleanup. The Herdr close is the engine's
 # own step (outside --ddev-only), hook or not. Failures leave teardown pending.
 # `orch` closes a ticket's platform itself and sets ORCH_RETIRE_MANAGED=1
 # to skip the engine's Herdr step.
@@ -133,6 +133,8 @@ workspace_absent() {
   local target="$1" worktrees workspaces
   worktrees="$(herdr worktree list 2>/dev/null)" || return 1
   workspaces="$(herdr workspace list 2>/dev/null)" || return 1
+  printf '%s' "$worktrees" | python3 "$(dirname "$progress")/retirement_inventory.py" worktrees >/dev/null 2>&1 || return 1
+  printf '%s' "$workspaces" | python3 "$(dirname "$progress")/retirement_inventory.py" workspaces >/dev/null 2>&1 || return 1
   printf '%s' "$worktrees" | jq -e --arg id "$target" \
     '(.result.worktrees | type == "array") and ([.result.worktrees[] | select(.open_workspace_id == $id)] | length == 0)' >/dev/null 2>&1 || return 1
   printf '%s' "$workspaces" | jq -e --arg id "$target" \
@@ -150,7 +152,7 @@ close_workspace() {
 finish_git() {
   local flags=()
   if [ "$force" -eq 1 ]; then flags+=(--force); fi
-  python3 "$progress" finish "$main_repo" "$id" "$worktree" "${flags[@]}"
+  ORCH_RETIRE_PROJECT="$ORCH_ROOT" python3 "$progress" finish "$main_repo" "$id" "$worktree" "${flags[@]}"
 }
 if [ ! -e "$worktree" ]; then
   if [ -n "$saved_workspace" ]; then close_workspace "$saved_workspace" || exit $?; fi
@@ -218,7 +220,7 @@ if [ "$ddev_only" -ne 1 ] && [ "${ORCH_RETIRE_MANAGED:-0}" != 1 ]; then
       echo "retire-worktree: cannot inspect Herdr worktrees for $worktree; repair Herdr and retry." >&2
       exit 4
     }
-    if ! printf '%s' "$wt_json" | jq -e '.result.worktrees | type == "array"' >/dev/null 2>&1; then
+    if ! printf '%s' "$wt_json" | python3 "$(dirname "$progress")/retirement_inventory.py" worktrees >/dev/null 2>&1; then
       echo "retire-worktree: invalid Herdr worktree response for $worktree; repair Herdr and retry." >&2
       exit 4
     fi
@@ -232,7 +234,7 @@ if [ "$ddev_only" -ne 1 ] && [ "${ORCH_RETIRE_MANAGED:-0}" != 1 ]; then
         echo "retire-worktree: cannot inspect Herdr workspaces for $worktree; repair Herdr and retry." >&2
         exit 4
       }
-      if ! printf '%s' "$ws_json" | jq -e '.result.workspaces | type == "array"' >/dev/null 2>&1; then
+      if ! printf '%s' "$ws_json" | python3 "$(dirname "$progress")/retirement_inventory.py" workspaces >/dev/null 2>&1; then
         echo "retire-worktree: invalid Herdr workspace response for $worktree; repair Herdr and retry." >&2
         exit 4
       fi
@@ -335,20 +337,28 @@ if [ "$ddev_only" -eq 1 ]; then
   exit 0
 fi
 
-# --- Step 5: remove the worktree and branch, from the main checkout --------
-if ! finish_git; then
-  echo "retire-worktree: git worktree remove failed for $worktree; branch left untouched." >&2
+# --- Step 5: remove checkout; retain any branch as a manual obligation. ----
+finish_git
+finish_rc=$?
+if [ "$finish_rc" -ne 0 ] && [ -e "$worktree" ]; then
+  echo "retire-worktree: git teardown pending for $worktree; branch left untouched." >&2
   if [ "$defer_own_close" -eq 1 ]; then
-    echo "retire-worktree: herdr workspace $workspace_id (the caller's own) was left open — its close was deferred until after teardown, which did not complete. Fix the removal failure above, then re-run retire-worktree.sh to finish the teardown and close it." >&2
+    echo "retire-worktree: herdr workspace $workspace_id was left open; repair removal and re-run retire-worktree.sh $id." >&2
   fi
   exit 4
 fi
 
-branch_report="${branch:-none (detached worktree)} (removed or already absent)"
-
-# --- Deferred step 3: identity survives checkout deletion for retry. ---------
+# A retained branch must not prevent closing a deferred workspace. Its saved
+# obligation survives even if closing it kills this process.
 if [ "$defer_own_close" -eq 1 ]; then
   close_workspace "$workspace_id" || exit $?
+fi
+branch_report="${branch:-none (detached worktree)} (removed or already absent)"
+if [ "$finish_rc" -ne 0 ]; then
+  echo "retire-worktree:   DDEV project: $ddev_project"
+  echo "retire-worktree:   path: $worktree"
+  echo "retire-worktree:   branch: $branch (manual cleanup pending)"
+  exit 4
 fi
 
 # --- Step 6: final report ----------------------------------------------------

@@ -22,7 +22,7 @@
 #   4. `ddev delete -yO` from inside the worktree. No .ddev dir -> carry on.
 #      With .ddev present, unavailable/failing DDEV refuses before git teardown.
 #   5. From the main checkout: `git worktree remove <worktree>` then
-#      `git branch -D <branch>` (only after safe checkout removal).
+#      retain the branch for manual cleanup; exit 4 until absence is verified.
 #      Only explicit --force permits discarding dirty work.
 #   6. Final report naming workspace id, DDEV project name, path, branch —
 #      explicit when there was no workspace to close.
@@ -286,6 +286,15 @@ branch_exists() {
   git -C "$1" show-ref --quiet --verify "refs/heads/$2"
 }
 
+# Approved acceptance change: checkout teardown succeeds, but a branch is a
+# durable manual obligation, including for --force. Never normalize exit 4 to 0.
+pending_branch() {
+  [ "$CODE" -eq 4 ] && [ ! -e "$WTROOT/$1" ] &&
+    ! worktree_still_listed "$MAIN" "$WTROOT/$1" && branch_exists "$MAIN" "$1" &&
+    printf '%s' "$ERR" | grep -qF 'MANUAL branch cleanup' &&
+    jq -e '.stage == "ready" and .manual_branch == true' "$MAIN/.git/orch-retirement/$1.json" >/dev/null
+}
+
 # ===========================================================================
 # R1: no id given -> refuses, exit 1, nothing touched.
 # ===========================================================================
@@ -404,8 +413,8 @@ export DDEV_LOG="$SANDBOX_BASE/r5-ddev.log"
 HERDR_WORKTREE_LIST_JSON="$(jq -n --arg p "$WTROOT/gamma" '{result:{worktrees:[{path:$p, open_workspace_id:"ws-r5"}]}}')"
 export HERDR_WORKTREE_LIST_JSON
 run_retire "$MAIN" "$WTROOT" full gamma --force
-if [ "$CODE" -eq 0 ]; then
-  pass "R5a: --force proceeds past a dirty worktree (exit 0)"
+if pending_branch gamma; then
+  pass "R5a: --force removes dirty checkout but leaves branch pending (exit 4)"
 else
   fail "R5a: --force must let a dirty worktree through" "got exit $CODE
 stdout: $OUT
@@ -416,10 +425,10 @@ if ! worktree_still_listed "$MAIN" "$WTROOT/gamma"; then
 else
   fail "R5b: the worktree should be removed" "git worktree list: $(git -C "$MAIN" worktree list)"
 fi
-if ! branch_exists "$MAIN" gamma; then
-  pass "R5c: the branch is deleted under --force"
+if branch_exists "$MAIN" gamma; then
+  pass "R5c: --force still preserves the branch"
 else
-  fail "R5c: branch 'gamma' should be deleted"
+  fail "R5c: branch 'gamma' must be retained"
 fi
 unset HERDR_WORKTREE_LIST_JSON
 
@@ -498,8 +507,8 @@ if printf '%s' "$OUT" | grep -qi 'no.*workspace'; then
 else
   fail "R8b: expected stdout to mention no workspace found/closed" "stdout: $OUT"
 fi
-if [ "$CODE" -eq 0 ] && ! worktree_still_listed "$MAIN" "$WTROOT/zeta"; then
-  pass "R8c: git teardown still completes with no matching workspace"
+if pending_branch zeta; then
+  pass "R8c: checkout removed, branch pending with no matching workspace"
 else
   fail "R8c: teardown should still succeed" "exit $CODE; worktree list: $(git -C "$MAIN" worktree list)"
 fi
@@ -528,8 +537,8 @@ if printf '%s' "$OUT" | grep -qi herdr; then
 else
   fail "R9b: expected stdout to mention herdr being unavailable" "stdout: $OUT"
 fi
-if [ "$CODE" -eq 0 ] && ! worktree_still_listed "$MAIN" "$WTROOT/eta"; then
-  pass "R9c: git teardown still completes without herdr"
+if pending_branch eta; then
+  pass "R9c: checkout removed, branch pending without herdr"
 else
   fail "R9c: teardown should still succeed without herdr" "exit $CODE"
 fi
@@ -649,10 +658,8 @@ else
 fi
 unset DDEV_EXIT
 run_retire "$MAIN" "$WTROOT" full lambda
-if [ "$CODE" -eq 0 ] && [ ! -e "$WTROOT/lambda" ] \
-   && ! worktree_still_listed "$MAIN" "$WTROOT/lambda" && ! branch_exists "$MAIN" lambda \
-   && [ "$(wc -l < "$DDEV_LOG")" -eq 2 ]; then
-  pass "R13d: retry after DDEV recovery completes teardown"
+if pending_branch lambda && [ "$(wc -l < "$DDEV_LOG")" -eq 2 ]; then
+  pass "R13d: retry after DDEV recovery removes checkout, retains branch"
 else
   fail "R13d: repaired DDEV must allow a retry to finish" "exit $CODE; stdout: $OUT; stderr: $ERR"
 fi
@@ -696,8 +703,8 @@ unset HERDR_WORKTREE_LIST_JSON HERDR_WORKSPACE_CLOSE_EXIT
 # Simulate a close which succeeded remotely but returned failure locally.
 # Both inventories now confirm absence, so retry can safely finish.
 HERDR_WORKSPACE_CLOSE_EXIT=3 run_retire "$MAIN" "$WTROOT" full mu
-if [ "$CODE" -eq 0 ] && [ ! -e "$WTROOT/mu" ] && ! branch_exists "$MAIN" mu; then
-  pass "R14e: confirmed-absent workspace permits recovery after a close error"
+if pending_branch mu; then
+  pass "R14e: confirmed-absent workspace permits checkout removal, branch pending"
 else
   fail "R14e: observable absence must allow recovery" "exit $CODE; stdout: $OUT; stderr: $ERR"
 fi
@@ -943,8 +950,8 @@ HERDR_LOG="$SANDBOX_BASE/r20-herdr.log"
 DDEV_LOG="$SANDBOX_BASE/r20-ddev.log"
 export HERDR_LOG DDEV_LOG
 run_retire "$MAIN" "$WTROOT" full unpushed-branch
-if [ "$CODE" -eq 0 ]; then
-  pass "INTENTIONAL: a clean worktree with an unpushed, unmerged commit is retired without --force (merge-gating is reap's job, not retire's)"
+if pending_branch unpushed-branch; then
+  pass "INTENTIONAL: clean unmerged checkout removed, committed branch retained"
 else
   fail "a clean worktree holding only an unpushed commit should retire successfully without --force" "got exit $CODE
 stdout: $OUT
@@ -955,10 +962,10 @@ if ! worktree_still_listed "$MAIN" "$WTROOT/unpushed-branch"; then
 else
   fail "the worktree should be removed"
 fi
-if ! branch_exists "$MAIN" unpushed-branch; then
-  pass "INTENTIONAL: the branch (and its unpushed commit) is deleted"
+if branch_exists "$MAIN" unpushed-branch && git -C "$MAIN" show unpushed-branch:unique-work.txt | grep -qx 'unpushed, unmerged content'; then
+  pass "INTENTIONAL: the branch and its unpushed content survive"
 else
-  fail "the branch should be deleted"
+  fail "the branch and committed content must survive"
 fi
 
 # ===========================================================================
@@ -1038,8 +1045,8 @@ while IFS='|' read -r r_id r_ddev; do
   export HERDR_LOG="$SANDBOX_BASE/r23-$r_id-herdr.log"
   export DDEV_LOG="$SANDBOX_BASE/r23-$r_id-ddev.log"
   run_retire "$MAIN" "$WTROOT" full "$r_id"
-  if [ "$CODE" -eq 0 ]; then
-    pass "R23[$r_id]: retire of a multi-segment id exits 0"
+  if pending_branch "$r_id"; then
+    pass "R23[$r_id]: multi-segment branch remains a manual obligation"
   else
     fail "R23[$r_id]: retire of a multi-segment id must exit 0" "got exit $CODE
 stdout: $OUT
@@ -1255,9 +1262,8 @@ else
   fail "RD2b: ddev delete must not run when the conventional hook succeeded" "ddev: $(cat "$DDEV_LOG" 2>/dev/null)"
 fi
 
-if [ "$CODE" -eq 0 ] && [ ! -e "$WTROOT/rd2" ] \
-   && ! worktree_still_listed "$MAIN" "$WTROOT/rd2" && ! branch_exists "$MAIN" rd2; then
-  pass "RD2c: successful committed hook permits checkout and branch deletion"
+if pending_branch rd2; then
+  pass "RD2c: successful committed hook permits checkout removal, retains branch"
 else
   fail "RD2c: successful hook must complete git teardown" "exit $CODE; stdout: $OUT; stderr: $ERR"
 fi
@@ -1270,7 +1276,7 @@ add_worktree rd3
 export HERDR_LOG="$SANDBOX_BASE/rd3-herdr.log"; : > "$HERDR_LOG"
 export DDEV_LOG="$SANDBOX_BASE/rd3-ddev.log"; : > "$DDEV_LOG"
 run_retire "$MAIN" "$WTROOT" full rd3
-if [ "$CODE" -eq 0 ] && ! worktree_still_listed "$MAIN" "$WTROOT/rd3"; then
+if pending_branch rd3; then
   pass "RD3: with no retire hook anywhere, the engine's own retire behaviour still tears the worktree down"
 else
   fail "RD3: a project with no retire hook must still retire normally" "exit $CODE; stdout: $OUT; stderr: $ERR"
@@ -1290,7 +1296,9 @@ git -C "$rd4_root/code/some-other-checkout" worktree add -q -b rd4 "$rd4_root/co
 ) > "$rd4_root/stdout" 2> "$rd4_root/stderr"
 rd4_rc=$?
 
-if [ "$rd4_rc" -eq 0 ] && [ ! -e "$rd4_root/code/rd4" ] && [ -d "$rd4_root/code/some-other-checkout" ]; then
+if [ "$rd4_rc" -eq 4 ] && [ ! -e "$rd4_root/code/rd4" ] && [ -d "$rd4_root/code/some-other-checkout" ] \
+   && branch_exists "$rd4_root/code/some-other-checkout" rd4 \
+   && grep -qF 'MANUAL branch cleanup' "$rd4_root/stderr"; then
   pass "RD4: retire works from inside the worktree it retires, in the default layout"
 else
   fail "RD4: retire must work from inside the worktree it retires" \
@@ -1360,8 +1368,8 @@ export RETIRE_ENGINE="$SCRIPT_COPY"
 run_retire "$MAIN" "$WTROOT" full rd5
 unset RETIRE_ENGINE
 
-if [ "$CODE" -eq 0 ]; then
-  pass "RD5a: retiring through a delegate-shim conventional hook still exits 0"
+if pending_branch rd5; then
+  pass "RD5a: delegate shim teardown leaves branch pending"
 else
   fail "RD5a: retiring through a delegate-shim conventional hook must still exit 0" "exit $CODE
 stdout: $OUT
@@ -1388,8 +1396,8 @@ else
   fail "RD5d: report must not say 'handled by' when the hook was an ignored re-entry" "stdout: $OUT"
 fi
 
-if ! worktree_still_listed "$MAIN" "$WTROOT/rd5" && ! branch_exists "$MAIN" rd5; then
-  pass "RD5e: the worktree and branch are still torn down despite the hook not handling step 4"
+if ! worktree_still_listed "$MAIN" "$WTROOT/rd5" && branch_exists "$MAIN" rd5; then
+  pass "RD5e: checkout removed, branch retained despite delegate shim"
 else
   fail "RD5e: worktree/branch teardown (step 5) must still happen" "worktree list: $(git -C "$MAIN" worktree list 2>&1)"
 fi
@@ -1587,8 +1595,8 @@ export HERDR_CLOSE_ORDER_LOG="$RS1_EXISTS_LOG" HERDR_CLOSE_EXISTS_CHECK="$WTROOT
 HERDR_WORKSPACE_ID=ws-self-rs1 run_retire "$MAIN" "$WTROOT" full rs1
 unset HERDR_WORKTREE_LIST_JSON COMBINED_ORDER_LOG HERDR_CLOSE_ORDER_LOG HERDR_CLOSE_EXISTS_CHECK
 
-if [ "$CODE" -eq 0 ]; then
-  pass "RS1a: retiring your own workspace's worktree still exits 0"
+if pending_branch rs1; then
+  pass "RS1a: deferred workspace close leaves branch pending"
 else
   fail "RS1a: retiring your own workspace's worktree must still exit 0" "got exit $CODE
 stdout: $OUT
@@ -1626,8 +1634,8 @@ else
   fail "RS1e: expected stdout to explain the deferral" "stdout: $OUT"
 fi
 
-if ! worktree_still_listed "$MAIN" "$WTROOT/rs1" && ! branch_exists "$MAIN" rs1; then
-  pass "RS1f: the worktree and branch are torn down"
+if ! worktree_still_listed "$MAIN" "$WTROOT/rs1" && branch_exists "$MAIN" rs1; then
+  pass "RS1f: checkout removed, branch retained"
 else
   fail "RS1f: the worktree and branch must still be torn down" "worktree list: $(git -C "$MAIN" worktree list 2>&1)"
 fi
@@ -1710,8 +1718,8 @@ else
   fail "RS4b: expected a warning on stderr about the failed deferred close"
 fi
 
-if ! worktree_still_listed "$MAIN" "$WTROOT/rs4" && ! branch_exists "$MAIN" rs4; then
-  pass "RS4c: the worktree and branch are torn down despite the deferred close failing"
+if ! worktree_still_listed "$MAIN" "$WTROOT/rs4" && branch_exists "$MAIN" rs4; then
+  pass "RS4c: checkout removed, branch retained despite deferred close failure"
 else
   fail "RS4c: the worktree and branch must be torn down regardless of the deferred close's outcome" "worktree list: $(git -C "$MAIN" worktree list 2>&1)"
 fi
@@ -1725,14 +1733,17 @@ else
   fail "RS4d: recovery must retain the deferred workspace" "exit $CODE; stderr: $ERR"
 fi
 run_retire "$MAIN" "$WTROOT" full rs4
-if [ "$CODE" -eq 0 ] && [ "$(grep -cF $'workspace\x1fclose\x1fws-self-rs4' "$HERDR_LOG")" -eq 2 ]; then
-  pass "RS4e: retry closes the saved workspace after checkout removal"
+if pending_branch rs4 && [ "$(grep -cF $'workspace\x1fclose\x1fws-self-rs4' "$HERDR_LOG")" -eq 2 ]; then
+  pass "RS4e: retry closes saved workspace, branch remains pending"
 else
   fail "RS4e: recovered close must succeed" "exit $CODE; stdout: $OUT; stderr: $ERR"
 fi
+# Explicit operator cleanup in this disposable, quiescent repository.
+git -C "$MAIN" branch -d rs4 >/dev/null
 run_retire "$MAIN" "$WTROOT" full rs4
-if [ "$CODE" -eq 0 ] && [ "$(grep -cF $'workspace\x1fclose\x1fws-self-rs4' "$HERDR_LOG")" -eq 2 ]; then
-  pass "RS4f: successful recovery clears the pending close for idempotent retries"
+if [ "$CODE" -eq 0 ] && ! branch_exists "$MAIN" rs4 \
+   && [ "$(grep -cF $'workspace\x1fclose\x1fws-self-rs4' "$HERDR_LOG")" -eq 2 ]; then
+  pass "RS4f: operator branch cleanup converges without repeating workspace close"
 else
   fail "RS4f: completed close must not run again" "exit $CODE; stdout: $OUT; stderr: $ERR"
 fi

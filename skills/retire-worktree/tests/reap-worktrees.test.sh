@@ -890,8 +890,10 @@ re_outf="$(mktemp)"; re_errf="$(mktemp)"
     bash "$RE_MAIN/scripts/reap-worktrees.sh" ) >"$re_outf" 2>"$re_errf"
 re_rc=$?
 
-if [ "$re_rc" -eq 0 ] && [ ! -e "$RE_WTROOT/re-landed" ] && [ -d "$RE_MAIN/.git" ]; then
-  pass "RE1: in the default layout a landed worktree in <root>/code is reaped and the main checkout beside it is kept"
+if [ "$re_rc" -eq 1 ] && [ ! -e "$RE_WTROOT/re-landed" ] && [ -d "$RE_MAIN/.git" ] \
+   && git -C "$RE_MAIN" show-ref --verify --quiet refs/heads/re-landed \
+   && grep -qF 'MANUAL branch cleanup' "$re_errf"; then
+  pass "RE1: landed checkout removed, branch retained with manual attention, main kept"
 else
   fail "RE1: default layout must reap <root>/code/re-landed and keep the main checkout" \
 "exit $re_rc

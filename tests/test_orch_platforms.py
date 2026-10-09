@@ -48,6 +48,10 @@ class PlatformTestCase(OrchTestCase):
                 if k not in ("ORCH_CLAUDE_BIN", "ORCH_PROJECTS_DIR"):
                     del self.env[k]
         self.set_test_platform_env()
+        # Adapter wiring tests mock engine completion. Checkout removal now
+        # belongs to that engine, not Orca's branch-deleting rm command.
+        with open(self.noop_retire, 'w') as f:
+            f.write('#!/bin/sh\ngit worktree remove --force "$ORCH_RETIRE_PATH"\n')
         self._platform_records = {}
         self.init()
 
@@ -61,6 +65,8 @@ class PlatformTestCase(OrchTestCase):
         default = ORCA_CREATE_OK if name == "orca" else HERDR_CREATE_OK
         key = "terminal create" if name == "orca" else "worktree open"
         responses.setdefault(key, (0, default))
+        if name == 'orca':
+            responses.setdefault('worktree list', (0, {'result': {'worktrees': []}}))
         table = {}
         for k, (rc, out) in responses.items():
             table[k] = [rc, out if isinstance(out, str) else json.dumps(out)]
@@ -1163,10 +1169,12 @@ class AttachRetireTests(PlatformTestCase):
         self.assertTrue(self.show("T-1")["retired"])
 
     def test_retire_orca_false_success_preserves_retirement_pending(self):
-        self.use_orca({"worktree rm": (0, EMPTY_OK)})
+        self.use_orca({'worktree list': (0, {'result': {'worktrees': []}})})
+        with open(self.noop_retire, 'w') as f:
+            f.write('#!/bin/sh\nexit 0\n')  # lying engine must not imply absence
         self.spawn_on("T-1", "orca", self.wt)
         p = self.refused(3, "retire", "T-1", "--force")
-        self.assertIn("worktree still exists", p.stderr)
+        self.assertIn("MANUAL Orca cleanup", p.stderr)
         self.assertTrue(os.path.isdir(self.wt))
         self.assertFalse(self.show("T-1")["retired"])
         self.assertNotIn("retire", self.event_kinds("T-1"))

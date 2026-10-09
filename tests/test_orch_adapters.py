@@ -188,6 +188,17 @@ if cmd == "worktree create":
         sys.exit(1)
     wt = {"path": path} if OPTS.get("no_id") else {"id": "repo1::" + path, "path": path}
     print(json.dumps({"result": {"worktree": wt}}))
+elif cmd == "worktree list":
+    if OPTS.get("retrust"):
+        # Concurrent config rewrite after the engine, at the new inventory boundary.
+        with open(OPTS["claude_json"]) as f:
+            data = json.load(f)
+        wt = open(os.path.join(os.path.dirname(LOG), "orca-last-path")).read()
+        data.setdefault("projects", {})[wt] = {"hasTrustDialogAccepted": True}
+        with open(OPTS["claude_json"], "w") as f:
+            json.dump(data, f)
+    rows = [{"path": OPTS["retained_path"]}] if OPTS.get("retained_path") else []
+    print(json.dumps({"result": {"worktrees": rows}}))
 elif cmd == "worktree rm":
     sel = opt("--worktree") or ""
     path = sel.split("::", 1)[1] if "::" in sel else sel.split(":", 1)[-1]
@@ -204,6 +215,8 @@ elif cmd == "worktree rm":
     print(json.dumps({"result": {"removed": True}}))
 elif cmd == "terminal create":
     wt = (opt("--worktree") or "")[len("path:"):]
+    with open(os.path.join(os.path.dirname(LOG), "orca-last-path"), "w") as f:
+        f.write(wt)
     session_side_effects(wt, sid_in(shlex.split(opt("--command") or "")))
     if OPTS.get("no_handle"):
         print(json.dumps({"result": {"terminal": {}}}))
@@ -733,18 +746,17 @@ class RetireRemovesWorktreeTests(AdapterTestCase):
         self.assertTrue(os.path.isdir(self.wt_path("t1")))
         self.assertNotIn("retire", self.event_kinds("t1"))
 
-    def test_orca_retire_close_engine_then_orca_rm(self):
+    def test_orca_retire_close_engine_then_inventory_without_unsafe_rm(self):
         self.use_orca2()
         self.spawn_new("t1", "orca")
         wt = self.show("t1")["worktree"]
         self.ok("retire", "t1", "--force")
         i_close = self.index_of(lambda r: r["argv"][:2] == ["terminal", "close"])
         i_engine = self.index_of(lambda r: r["who"] == "retire")
-        i_rm = self.index_of(lambda r: r["argv"][:2] == ["worktree", "rm"])
+        i_list = self.index_of(lambda r: r["argv"][:2] == ["worktree", "list"])
         self.assertLess(i_close, i_engine)
-        self.assertLess(i_engine, i_rm)
-        rm = self.log()[i_rm]["argv"]
-        self.assertIn(wt, rm[rm.index("--worktree") + 1])
+        self.assertLess(i_engine, i_list)
+        self.assertNotIn(["worktree", "rm"], [r["argv"][:2] for r in self.log("orca")])
         self.assertFalse(os.path.exists(wt))
         self.assertEqual(self.branches("t1"), [])
         self.assertTrue(self.show("t1")["retired"])
@@ -805,10 +817,14 @@ class RealEnginesTests(AdapterTestCase):
         self.assertIn("t-42", self.branches())
         self.assertEqual(self.show("t-42")["worktree"], wt)
         self.wait_dead("t-42")
-        self.ok("retire", "t-42", "--force")
+        p = self.refused(3, "retire", "t-42", "--force")
+        self.assertIn('MANUAL branch cleanup', p.stderr)
         self.assertFalse(os.path.exists(wt))
         self.assertNotIn(wt, self.worktree_paths())
-        self.assertEqual(self.branches("t-42"), [])
+        self.assertEqual(self.branches("t-42"), ['t-42'])
+        self.assertFalse(self.show("t-42")["retired"])
+        self.git('branch', '-d', 't-42')  # operator action in quiescent fixture
+        self.ok("retire", "t-42", "--force")
         self.assertTrue(self.show("t-42")["retired"])
 
 
@@ -909,8 +925,16 @@ class SelftestTests(AdapterTestCase):
         os.symlink(sys.executable, os.path.join(bindir, "python3"))
         self.env["PATH"] = bindir + os.pathsep + "/usr/bin:/bin:/usr/sbin:/sbin"
         p, out = self.selftest("--timeout", "30")
-        self.assertEqual(p.returncode, 0, "stdout=%r stderr=%r" % (p.stdout, p.stderr))
-        self.assertIs(out["ok"], True)
+        self.assertEqual(p.returncode, 3, "stdout=%r stderr=%r" % (p.stdout, p.stderr))
+        self.assertIs(out["ok"], False)
+        steps = {s['name']: s for s in out['steps']}
+        self.assertEqual(steps['teardown']['status'], 'fail')
+        self.assertIn('MANUAL branch cleanup', steps['teardown']['detail'])
+        self.assertEqual(steps['clean']['status'], 'fail')
+        branches = self.branches('selftest-*')
+        self.assertEqual(len(branches), 1)
+        self.assertEqual(self.worktree_paths(), [os.path.realpath(self.repo)])
+        self.git('branch', '-d', branches[0])  # disposable operator cleanup
         self.assert_nothing_left()
 
     def test_session_that_never_reports_in_fails_and_cleans_up(self):
@@ -1473,19 +1497,23 @@ class OrcaWorktreeTests(AdapterTestCase):
                          os.path.realpath(self.repo))
         self.assertEqual(self.show("t1")["phase"], "dispatched")
 
-    def test_rm_uses_id_selector(self):
+    def test_manual_cleanup_instructions_use_id_selector(self):
         self.use_orca2()
         self.spawn_new("t1", "orca")
         wt = self.show("t1")["worktree"]
-        self.ok("retire", "t1", "--force")
-        self.assertEqual(self.rm_selector(), "id:repo1::" + wt)
+        self.use_orca2(retained_path=wt)
+        p = self.refused(3, "retire", "t1", "--force")
+        self.assertIn("id:repo1::" + wt, p.stderr)
+        self.assertNotIn(["worktree", "rm"], [r["argv"][:2] for r in self.log("orca")])
 
-    def test_rm_falls_back_to_path_selector(self):
+    def test_manual_cleanup_instructions_fall_back_to_path_selector(self):
         self.use_orca2(no_id=True)
         self.spawn_new("t1", "orca")
         wt = self.show("t1")["worktree"]
-        self.ok("retire", "t1", "--force")
-        self.assertEqual(self.rm_selector(), "path:" + wt)
+        self.use_orca2(retained_path=wt)
+        p = self.refused(3, "retire", "t1", "--force")
+        self.assertIn("path:" + wt, p.stderr)
+        self.assertNotIn(["worktree", "rm"], [r["argv"][:2] for r in self.log("orca")])
         self.assertFalse(os.path.exists(wt))
 
 
@@ -1577,7 +1605,8 @@ class SelftestCleanTests(AdapterTestCase):
         self.env["ORCH_PLATFORM"] = "orca"
         self.use_orca2(fail=["worktree list"])
         p, steps = self.selftest()
-        self.assertEqual(steps["teardown"]["status"], "pass", steps["teardown"])
+        self.assertEqual(steps["teardown"]["status"], "fail", steps["teardown"])
+        self.assertIn('cannot confirm Orca cleanup', steps['teardown']['detail'])
         self.assertEqual(steps["clean"]["status"], "fail", steps["clean"])
         self.assertIn("unknown", steps["clean"]["detail"])
 

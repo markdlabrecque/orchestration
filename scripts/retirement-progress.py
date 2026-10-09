@@ -8,6 +8,7 @@ Records live in the repository's common git directory, outside the checkout.
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -124,16 +125,6 @@ def run(action, main, tid, expected, force=False):
     if action != 'finish' or record['stage'] not in ('ready', 'complete'):
         raise RuntimeError('invalid retirement progress for %s' % path)
     branch = record['branch']
-    if branch:
-        present = git(main, 'show-ref', '--verify', '--quiet', branch, absent=True) is not None
-        head = git(main, 'show-ref', '--hash', '--verify', branch) if present else None
-        if head is not None and head != record['head']:
-            raise RuntimeError('branch changed during retirement: %s; refusing deletion. '
-                               'Preserve the new work, inspect saved identity %s, then restore '
-                               'the saved HEAD %s or remove the branch manually before retrying'
-                               % (branch, journal, record['head']))
-        if any(r.get('branch') == branch and os.path.realpath(r['worktree']) != path for r in rows):
-            raise RuntimeError('branch %s belongs to another worktree; refusing deletion' % branch)
     if exists:
         if git(path, 'rev-parse', 'HEAD') != record['head']:
             raise RuntimeError('worktree HEAD changed during retirement: %s' % path)
@@ -146,21 +137,26 @@ def run(action, main, tid, expected, force=False):
     if os.path.lexists(path) or any(os.path.realpath(r['worktree']) == path for r in remaining):
         raise RuntimeError('worktree removal did not remove %s' % path)
     if branch and git(main, 'show-ref', '--verify', '--quiet', branch, absent=True) is not None:
-        # update-ref does not enforce branch ownership as branch -D did. Refresh
-        # it after removal, which may have allowed another checkout to claim it.
-        if any(r.get('branch') == branch for r in remaining):
-            raise RuntimeError('branch %s belongs to another worktree; refusing deletion' % branch)
-        try:
-            # Compare and delete under Git's ref lock. A separate HEAD check
-            # cannot protect commits added between checkout removal and deletion.
-            git(main, 'update-ref', '--no-deref', '-d', branch, record['head'])
-        except RuntimeError as e:
-            raise RuntimeError('branch deletion pending during retirement: %s. Preserve any '
-                               'new work and inspect saved identity %s (HEAD %s); repair '
-                               'the branch identity or Git error before retrying'
-                               % (e, journal, record['head'])) from e
-    if branch and git(main, 'show-ref', '--verify', '--quiet', branch, absent=True) is not None:
-        raise RuntimeError('branch still exists: %s' % branch)
+        # Git's ref lock does not exclude a new worktree HEAD claim. Even an
+        # expected-old delete can orphan that checkout. Retain the obligation;
+        # no automated deletion, including with the manual checkout force flag.
+        record['manual_branch'] = True
+        save(journal, record)
+        raise RuntimeError(
+            'MANUAL branch cleanup pending during retirement: main %s, path %s, branch %s. '
+            'Inspect saved identity %s (HEAD %s) and preserve any new commits. '
+            'During controlled quiescence, stop all repository writers, inspect `%s`, '
+            'and ensure no other worktree owns this branch before manually running `%s`. '
+            'Keep the recovery record; resume writers only after removal, then rerun '
+            '%s or retire-worktree.sh %s. '
+            'Absence must be verified before retrying can complete.'
+            % (main, path, branch, journal, record['head'],
+               shlex.join(['git', '-C', main, 'worktree', 'list', '--porcelain']),
+               shlex.join(['git', '-C', main, 'branch', '-d', '--',
+                           branch.removeprefix('refs/heads/')]),
+               shlex.join(['orch', 'reconcile', '--project',
+                           os.environ.get('ORCH_RETIRE_PROJECT', os.path.dirname(main))]), tid))
+    record.pop('manual_branch', None)
     record['stage'] = 'complete'
     save(journal, record)
 

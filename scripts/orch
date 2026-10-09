@@ -20,6 +20,13 @@ import tempfile
 import time
 import uuid
 
+def retirement_inventory(reply, kind):
+    # Load only for teardown so standalone copies used for session recovery do
+    # not acquire an unrelated startup dependency.
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    from retirement_inventory import inventory
+    return inventory(reply, kind)
+
 EXIT_USAGE, EXIT_GATE, EXIT_NOT_FOUND, EXIT_PREFLIGHT = 2, 3, 4, 5
 
 PHASE_STATUS = {
@@ -1778,44 +1785,35 @@ def remove_worktree(platform, tid, worktree, wref, force):
         if not os.path.exists(progress) and worktree not in git_worktrees(main):
             return
     args = [os.path.basename(worktree)]
-    if platform == "orca":
-        args.append("--ddev-only")  # Orca removes the checkout and branch itself
     if force:
         args.append("--force")
     rc, tail = run_engine("retire", main, args, main,
                           {"ORCH_RETIRE_MANAGED": "1", "ORCH_RETIRE_PATH": worktree})
     if rc != 0:
+        # Stable obligation, not the preceding teardown chatter, is the durable
+        # notification identity on both the first pass and missing-path retries.
+        manual = [line for line in tail.splitlines() if line.startswith('retire-worktree: MANUAL ')]
+        if manual:
+            tail = manual[0]
         raise Refusal(EXIT_GATE, "cannot remove the worktree of %s (%s): retire-worktree"
                       " exited %d: %s" % (tid, worktree, rc, tail))
     if platform == "orca":
+        # Orca's rm also deletes branches, with no CLI keep-branch option.
+        # A userspace ownership check cannot make that safe. Only observe its
+        # inventory here; an operator must remove any retained adapter resource.
         try:
-            call_tool("orca", ["worktree", "rm", "--worktree", orca_selector(worktree, wref)]
-                      + (["--force"] if force else []) + ["--json"], timeout=120)
-        except ToolError as e:
-            try:
-                reply = call_tool_json("orca", ["worktree", "list", "--json"])
-                result = reply.get("result")
-                entries = result.get("worktrees") if isinstance(result, dict) else None
-                absent = isinstance(entries, list) and all(
-                    isinstance(entry, dict) and isinstance(entry.get("path"), str) and
-                    entry["path"] and os.path.realpath(entry["path"]) != worktree
-                    for entry in entries)
-            except ToolError:
-                absent = False
-            if not absent:
-                raise Refusal(EXIT_GATE, "cannot remove the worktree of %s (%s): %s"
-                              % (tid, worktree, e))
-        if os.path.lexists(worktree):
-            raise Refusal(EXIT_GATE, "Orca reported removal but worktree still exists: %s" % worktree)
-        common = subprocess.run(["git", "-C", main, "rev-parse", "--git-common-dir"],
-                                capture_output=True, text=True, timeout=30, check=True).stdout.strip()
-        progress = os.path.join(main, common, "orch-retirement", os.path.basename(worktree) + ".json")
-        if os.path.isfile(progress):
-            p = subprocess.run([sys.executable, os.path.join(PLUGIN_ROOT, "scripts", "retirement-progress.py"),
-                                "finish", main, os.path.basename(worktree), worktree],
-                               capture_output=True, text=True, timeout=120)
-            if p.returncode:
-                raise Refusal(EXIT_GATE, p.stderr.strip())
+            entries = retirement_inventory(
+                call_tool_json("orca", ["worktree", "list", "--json"]), "worktrees")
+            absent = all(os.path.realpath(entry["path"]) != worktree for entry in entries)
+        except (ToolError, ValueError) as e:
+            raise Refusal(EXIT_GATE, "cannot confirm Orca cleanup of %s (%s): %s; repair Orca and retry"
+                          % (tid, worktree, e))
+        if not absent or os.path.lexists(worktree):
+            raise Refusal(EXIT_GATE, "MANUAL Orca cleanup pending for ticket %s, main %s, worktree %s. "
+                          "During controlled quiescence preserve all branch commits and other worktrees, "
+                          "then remove the retained Orca resource %s manually and rerun orch retire %s. "
+                          "Automatic worktree rm is unsafe because it also deletes branches."
+                          % (tid, main, worktree, orca_selector(worktree, wref), tid))
 
 
 def row_worktree_ref(row):
@@ -1982,20 +1980,16 @@ def platform_close(platform, ref, worktree):
         try:
             if platform == "herdr":
                 reply = call_tool_json(platform, ["workspace", "list"])
-                result = reply.get("result")
-                workspaces = result.get("workspaces") if isinstance(result, dict) else None
-                if isinstance(workspaces, list) and all(
-                        isinstance(w, dict) and isinstance(w.get("workspace_id"), str) and
-                        w["workspace_id"] for w in workspaces):
-                    if not any(w["workspace_id"] == ref["workspace"] for w in workspaces):
-                        return True, None
+                workspaces = retirement_inventory(reply, "workspaces")
+                if not any(w["workspace_id"] == ref["workspace"] for w in workspaces):
+                    return True, None
             elif platform == "orca":
                 reply = call_tool_json(platform, ["terminal", "list", "--worktree", "path:" + worktree, "--json"])
                 result = reply.get("result")
                 terminals = result.get("terminals") if isinstance(result, dict) else None
                 if isinstance(terminals, list) and not terminals:
                     return True, None
-        except ToolError:
+        except (ToolError, ValueError):
             pass
         return True, str(e)
     return True, None
@@ -3188,6 +3182,22 @@ def retire_claimed(db, tid, row, force, keep_worktree, marker):
                     raise Refusal(EXIT_GATE, "%s changed retirement owner while closing session" % tid)
                 db.execute("UPDATE tickets SET launch_ref=NULL WHERE id=?", (tid,))
         kill_session(row, bare_ok=True, strict=not force)
+    if keep_worktree and row['worktree']:
+        main = main_checkout()
+        common = subprocess.run(['git', '-C', main, 'rev-parse', '--git-common-dir'],
+                                capture_output=True, text=True, timeout=30, check=True).stdout.strip()
+        progress = os.path.join(main, common, 'orch-retirement',
+                                os.path.basename(row['worktree']) + '.json')
+        try:
+            with open(progress) as f:
+                saved = json.load(f)
+        except FileNotFoundError:
+            saved = None
+        if saved and (saved.get('stage') != 'complete' or saved.get('workspace')):
+            raise Refusal(EXIT_GATE, 'saved retirement obligation for %s at %s; '
+                          '--keep-worktree cannot discharge it. Preserve the record and '
+                          'rerun orch retire %s without --keep-worktree after manual cleanup'
+                          % (row['worktree'], progress, tid))
     if not keep_worktree:
         # The worktree goes, so does the trust orch gave it.
         if not unmark_ticket_trust(db, tid, row["worktree"]) and not force:

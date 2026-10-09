@@ -50,9 +50,12 @@ class ReconcileTests(OrchTestCase):
         os.chmod(path, 0o755)
         return path
 
-    def completed(self, tid='50'):
+    def completed(self, tid='50', branch=False):
+        # Branch-free fixtures exercise unattended completion. Branch retention
+        # and operator convergence have explicit, separate coverage below.
         path = os.path.join(self.root, 'code', tid)
-        self.git('worktree', 'add', '-q', '-b', 'ticket-' + tid, path)
+        args = ['-b', 'ticket-' + tid] if branch else ['--detach']
+        self.git('worktree', 'add', '-q', *args, path)
         self.to_done(tid, worktree=path)
         return path
 
@@ -68,7 +71,7 @@ class ReconcileTests(OrchTestCase):
         self.assertEqual(sum(e['kind'] == 'retire' for e in self.events(tid)), 1)
 
     def test_standalone_completed_cleanup_and_idempotence(self):
-        path = self.completed()
+        path = self.completed(branch=True)
         adapter_log = os.path.join(self.tmp, 'adapter-log')
         self.stub('ddev', 'echo "$*" >> ' + self.quote(adapter_log) + '\nexit 0\n')
         os.makedirs(os.path.join(path, '.ddev'))
@@ -79,7 +82,10 @@ class ReconcileTests(OrchTestCase):
         subprocess.run(['git', '-C', path, 'commit', '-qm', 'ignore provisioned config'],
                        check=True, env=self.env)
         p = self.reconcile()
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assert_manual_pending(path, p)
+        self.git('branch', '-D', 'ticket-50')  # disposable operator action, writers stopped
+        self.assertEqual(self.reconcile().returncode, 0)
         self.assert_complete('50', path)
         with open(adapter_log) as f:
             calls = f.read()
@@ -167,22 +173,35 @@ class ReconcileTests(OrchTestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assert_complete('50', path)
 
-    def test_branch_delete_failure_after_checkout_removal_survives_retry(self):
-        path = self.completed()
-        real_git = shutil.which('git', path=os.environ['PATH'])
-        fail = os.path.join(self.tmp, 'fail-branch')
-        with open(fail, 'w'):
-            pass
-        self.stub('git', 'case " $* " in\n*" update-ref --no-deref -d "*) if [ -f ' + self.quote(fail) +
-                  ' ]; then echo branch-delete-failed >&2; exit 1; fi;;\nesac\nexec ' +
-                  self.quote(real_git) + ' "$@"\n')
-        p = self.reconcile()
-        self.assertNotEqual(p.returncode, 0)
+    def assert_manual_pending(self, path, result):
+        self.assertNotEqual(result.returncode, 0)
         self.assertFalse(is_retired(self.show('50')))
-        self.assertFalse(os.path.exists(path), 'fixture must reach partial checkout teardown')
-        os.unlink(fail)
-        p = self.reconcile()
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(any(e['kind'] == 'retire' for e in self.events('50')))
+        for value in (self.root, self.repo, path, 'ticket-50', 'MANUAL',
+                      'controlled quiescence', 'worktree list', 'branch -d', 'reconcile'):
+            self.assertIn(value, result.stderr)
+        self.git('show-ref', '--verify', 'refs/heads/ticket-50')
+        with open(os.path.join(self.repo, '.git/orch-retirement/50.json')) as f:
+            record = json.load(f)
+        self.assertEqual(record['stage'], 'ready')
+        self.assertTrue(record['manual_branch'])
+
+    def test_retained_branch_survives_retry_and_force_until_manual_removal(self):
+        path = self.completed(branch=True)
+        for _ in range(3):
+            self.assert_manual_pending(path, self.reconcile())
+        self.assertEqual(len(self.notices()), 1)
+        self.assert_manual_pending(path, self.orch('retire', '50', '--force'))
+        p = self.orch('retire', '50', '--force', '--keep-worktree')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('cannot discharge', p.stderr)
+        self.assertFalse(is_retired(self.show('50')))
+        self.git('branch', '-d', 'ticket-50')
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: self.reconcile(), range(2)))
+        for result in results:
+            self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_complete('50', path)
 
     def test_dirty_content_appearing_during_teardown_is_not_force_removed(self):
@@ -406,10 +425,8 @@ class ReconcileTests(OrchTestCase):
                 'if [ "$1 $2" = ' + self.quote(resource + ' list') + ' ]; then\n'
                 '  cat ' + self.quote(inventory) + '\n  exit 0\nfi\n')
         if resource == 'terminal':
-            body += ('if [ "$1 $2" = "worktree rm" ]; then\n'
-                     '  git -C ' + self.quote(self.repo) + ' worktree remove ' +
-                     self.quote(path) + ' || exit 1\n'
-                     '  echo \'{"result":{}}\'\n  exit 0\nfi\n')
+            body += ('if [ "$1 $2" = "worktree list" ]; then\n'
+                     '  echo \'{"result":{"worktrees":[]}}\'\n  exit 0\nfi\n')
         if resource == 'worktree':
             # An adapter may delete the checkout then lose its reply. A malformed
             # inventory must not discharge the remaining adapter obligation.
@@ -426,7 +443,14 @@ class ReconcileTests(OrchTestCase):
         if field in ('workspaces', 'worktrees'):
             key = 'workspace_id' if field == 'workspaces' else 'path'
             replies.extend({'result': {field: [{key: value}]}}
-                           for value in (None, '', [], ['invalid'], {}, {'invalid': 1}, 1, True))
+                           for value in (None, '', [], ['invalid'], {}, {'invalid': 1}, 1, True,
+                                         '\x00broken', '\n', '   '))
+            if field == 'worktrees':
+                replies.append({'result': {field: [{'path': 'relative/path'}]}})
+            else:
+                replies.extend({'result': {field: [{'workspace_id': 'other', 'worktree': value}]}}
+                               for value in (None, [], {}, {'checkout_path': 1}, {'checkout_path': 'relative'}))
+            replies.append({'result': {field: [{key: '/valid' if field == 'worktrees' else 'other'}, None]}})
             replies.append({'result': {field: [{key: 'disposable-workspace' if
                                                     field == 'workspaces' else path}]}})
         for index, reply in enumerate(replies):
@@ -445,7 +469,7 @@ class ReconcileTests(OrchTestCase):
                 self.assertNotIn('Traceback', p.stdout + p.stderr)
                 outcomes = json.loads(p.stdout)['outcomes']
                 self.assertTrue(any(o['outcome'] == 'attention' for o in outcomes))
-                for value in (self.root, '50', path, 'adapter-offline'):
+                for value in (self.root, '50', path):
                     self.assertIn(value, p.stderr)
                 self.assertFalse(is_retired(self.show('50')))
                 self.assertFalse(any(e['kind'] == 'retire' for e in self.events('50')))
@@ -453,7 +477,7 @@ class ReconcileTests(OrchTestCase):
                     self.assertTrue(os.path.isdir(path))
                 else:
                     self.assertFalse(os.path.exists(path))
-                    self.git('show-ref', '--verify', 'refs/heads/ticket-50')
+                    self.assertTrue(os.path.isfile(os.path.join(self.repo, '.git/orch-retirement/50.json')))
         # Confirmed empty inventory, unlike malformed inventory, allows recovery.
         with open(inventory, 'w') as f:
             json.dump({'result': {field: []}}, f)
@@ -516,7 +540,7 @@ class ReconcileTests(OrchTestCase):
                 self.assertFalse(os.path.exists(path), 'fixture must reach finalization after teardown')
 
     def test_branch_moved_after_partial_removal_is_preserved(self):
-        path = self.completed()
+        path = self.completed(branch=True)
         real_git = shutil.which('git', path=os.environ['PATH'])
         self.stub('git', 'case " $* " in *" update-ref --no-deref -d "*) exit 1;; esac\nexec ' + self.quote(real_git) + ' "$@"\n')
         self.assertNotEqual(self.reconcile().returncode, 0)
@@ -526,12 +550,12 @@ class ReconcileTests(OrchTestCase):
         self.git('branch', '-f', 'ticket-50', 'HEAD')
         p = self.reconcile()
         self.assertNotEqual(p.returncode, 0)
-        self.assertIn('branch changed', p.stderr)
+        self.assertIn('MANUAL branch cleanup', p.stderr)
         self.assertFalse(is_retired(self.show('50')))
         self.git('show-ref', '--verify', 'refs/heads/ticket-50')
 
     def late_branch_move(self, retire, boundary='remove'):
-        path = self.completed()
+        path = self.completed(branch=True)
 
         def output(*args):
             return subprocess.check_output(['git', '-C', self.repo, *args],
@@ -570,10 +594,10 @@ class ReconcileTests(OrchTestCase):
             self.assertFalse(any(e['kind'] == 'retire' for e in self.events('50')))
             self.assertEqual(output('rev-parse', 'ticket-50').strip(), moved)
             self.assertEqual(output('show', 'ticket-50:late-content'), content)
-        # Explicit operator repair: keep the new commit on a recovery branch,
-        # then restore the saved identity using an expected-old-value update.
+        # Explicit operator repair in this quiescent disposable repo: preserve
+        # the new commit, then remove the retained branch ourselves.
         self.git('branch', 'recovered-work', moved)
-        self.git('update-ref', 'refs/heads/ticket-50', saved, moved)
+        self.git('branch', '-D', 'ticket-50')
         p = retire()
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assert_complete('50', path)
@@ -585,11 +609,18 @@ class ReconcileTests(OrchTestCase):
     def test_manual_retire_preserves_branch_moved_during_checkout_removal(self):
         self.late_branch_move(lambda: self.orch('retire', '50'))
 
-    def test_branch_deletion_atomically_checks_saved_head(self):
-        self.late_branch_move(self.reconcile, boundary='delete')
+    def test_automatic_cleanup_never_invokes_branch_deletion(self):
+        path = self.completed(branch=True)
+        real_git = self.quote(shutil.which('git', path=os.environ['PATH']))
+        called = os.path.join(self.tmp, 'unsafe-delete')
+        self.stub('git', 'case " $* " in *" update-ref "*|*" branch -d "*|*" branch -D "*)\n'
+                  'touch ' + self.quote(called) + '\nexit 99;;\nesac\nexec ' + real_git + ' "$@"\n')
+        self.assert_manual_pending(path, self.reconcile())
+        self.assert_manual_pending(path, self.orch('retire', '50', '--force'))
+        self.assertFalse(os.path.exists(called))
 
     def test_branch_claimed_by_other_worktree_during_removal_is_preserved(self):
-        path = self.completed()
+        path = self.completed(branch=True)
         other = os.path.join(self.root, 'code', 'other')
         real_git = self.quote(shutil.which('git', path=os.environ['PATH']))
         self.stub('git', 'case " $* " in *" worktree remove "*)\n' + real_git +
@@ -599,13 +630,15 @@ class ReconcileTests(OrchTestCase):
         p = self.reconcile()
         self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertFalse(os.path.exists(path))
-        self.assertIn('another worktree', p.stderr)
+        self.assertIn('other worktree', p.stderr)
         self.assertFalse(is_retired(self.show('50')))
         self.git('show-ref', '--verify', 'refs/heads/ticket-50')
         self.assertTrue(os.path.isfile(os.path.join(other, 'README')))
         os.unlink(os.path.join(self.bin, 'git'))
         self.assertNotEqual(self.reconcile().returncode, 0)
         self.git('worktree', 'remove', other)
+        self.assert_manual_pending(path, self.reconcile())
+        self.git('branch', '-d', 'ticket-50')
         p = self.reconcile()
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assert_complete('50', path)
