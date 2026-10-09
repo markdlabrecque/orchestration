@@ -50,13 +50,171 @@ class RepairExceptionTests(RoutingTestCase):
     def snapshot(self):
         with contextlib.closing(sqlite3.connect(self.db_path())) as db:
             return {t: db.execute('SELECT * FROM ' + t).fetchall() for t in
-                    ('tickets', 'events', 'runs', 'ci_results', 'repair_grants', 'run_outcomes', 'state_md_revision')}
+                    ('tickets', 'events', 'runs', 'ci_results', 'repair_grants', 'second_repair_grants',
+                     'run_outcomes', 'state_md_revision')}
 
     def refuses_unchanged(self, args, **kwargs):
         before = self.snapshot()
         result = self.refused(3, *args, **kwargs)
         self.assertEqual(before, self.snapshot())
         return result
+
+    def second_ready(self):
+        self.exhausted()
+        self.ok(*self.grant_args())
+        self.ok(*self.consume_args())
+        self.phases('t1', 'review')
+
+    def second_args(self, **changes):
+        return self.grant_args(grant_id='approval-2', predecessor='approval-1', **changes)
+
+    def test_second_explicit_exception_preserves_first_and_stops_at_five(self):
+        self.second_ready()
+        first = self.show('t1')['repair_grant']
+        history = self.events('t1')
+        args = self.second_args()
+        second = self.j(*args)
+        self.assertEqual(second['predecessor'], 'approval-1')
+        self.assertEqual(second['context']['bounces'], 4)
+        self.assertEqual(self.show('t1')['repair_grant'], first)
+        self.refuses_unchanged(['phase', 't1', 'fix'])
+        self.ok(*self.consume_args(repair_grant='approval-2'))
+        state = self.show('t1')
+        self.assertEqual((state['bounces'], state['review_rounds'], state['ci_repairs']), (5, 5, 0))
+        self.assertEqual(state['repair_grant'], first)
+        self.assertIsNotNone(state['second_repair_grant']['consumed_at'])
+        self.assertEqual(self.events('t1')[:len(history)], history)
+        self.assertEqual(self.j(*args), state['second_repair_grant'])
+        self.phases('t1', 'review')
+        self.refuses_unchanged(['phase', 't1', 'fix'])
+        self.refuses_unchanged(self.consume_args(repair_grant='approval-2'))
+        self.refuses_unchanged(self.grant_args(grant_id='approval-3', predecessor='approval-2'))
+        self.assertIn('approval-2', Path(self.root, 'STATE.md').read_text())
+        self.assertTrue(self.j('state-md', 'check')['fresh'])
+
+    def test_migration_restores_first_grant_projection_triggers(self):
+        self.exhausted()
+        self.db_exec('DROP TABLE repair_grants')
+        self.ok(*self.grant_args())
+        before = self.snapshot()['state_md_revision']
+        self.db_exec("UPDATE repair_grants SET evidence='fixture migration' WHERE ticket='t1'")
+        self.assertNotEqual(before, self.snapshot()['state_md_revision'])
+        self.refused(3, 'state-md', 'check')
+
+    def test_second_grant_migration_preserves_consumed_legacy_row(self):
+        self.second_ready()
+        first = self.show('t1')['repair_grant']
+        before = self.snapshot()
+        self.db_exec('DROP TABLE second_repair_grants')
+        self.assertEqual(self.show('t1')['repair_grant'], first)
+        after = self.snapshot()
+        for table in before:
+            self.assertEqual(before[table], after[table])
+        self.ok(*self.second_args())
+        self.assertTrue(self.j('state-md', 'check')['fresh'])
+        revision = self.snapshot()['state_md_revision']
+        self.db_exec("UPDATE second_repair_grants SET evidence='changed fixture' WHERE ticket='t1'")
+        self.assertNotEqual(revision, self.snapshot()['state_md_revision'])
+        self.refused(3, 'state-md', 'check')
+        self.ok('state-md', 'rebuild')
+        self.assertIn('changed fixture', Path(self.root, 'STATE.md').read_text())
+
+    def test_second_concurrent_consumption_and_duplicate_replay(self):
+        self.second_ready()
+        args = self.second_args()
+        self.ok(*args)
+        before = self.snapshot()
+        self.ok(*args)
+        self.assertEqual(before, self.snapshot())
+        self.refuses_unchanged(self.second_args(evidence='altered'))
+        consume = self.consume_args(repair_grant='approval-2')
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: self.orch(*consume), range(2)))
+        self.assertEqual(sorted(p.returncode for p in results), [0, 3])
+        self.assertEqual(self.show('t1')['bounces'], 5)
+        before = self.snapshot()
+        self.ok(*args)
+        self.assertEqual(before, self.snapshot())
+
+    def test_second_requires_consumed_predecessor_and_complete_history(self):
+        mutations = (
+            "UPDATE repair_grants SET consumed_at=NULL",
+            "UPDATE repair_grants SET consumed_event=1",
+            "DELETE FROM events WHERE kind='repair-grant-consumed'",
+            "DELETE FROM events WHERE kind='repair-grant'",
+            "DELETE FROM events WHERE kind='add'",
+            "DELETE FROM events WHERE from_phase='tests'",
+            "UPDATE tickets SET bounces=NULL",
+            "UPDATE tickets SET bounces=3",
+            "UPDATE tickets SET bounces=5",
+            "UPDATE tickets SET ci_repairs=NULL",
+            "UPDATE tickets SET review_rounds=4",
+        )
+        for index, mutation in enumerate(mutations):
+            with self.subTest(mutation=mutation):
+                if index:
+                    self.tearDown()
+                    self.setUp()
+                self.second_ready()
+                args = self.second_args()
+                self.db_exec(mutation)
+                self.refuses_unchanged(args)
+
+    def test_second_context_and_parent_guards(self):
+        self.second_ready()
+        session = self.show('t1')['session_id']
+        parent = dict(PI_SESSION_ID=session, ORCH_PI_PARENT_SESSION=session)
+        for env in ({'PI_SUBAGENT_CHILD': '1'}, {'PI_SUBAGENT_ID': ''},
+                    dict(PI_SESSION_ID='child', ORCH_PI_PARENT_SESSION=session)):
+            self.refuses_unchanged(self.second_args(), env=env)
+        self.refuses_unchanged(self.grant_args(grant_id='approval-2', predecessor='unknown'))
+        self.ok(*self.second_args(), env=parent)
+        consume = self.consume_args(repair_grant='approval-2')
+        for env in ({'PI_SUBAGENT_CHILD': '1'}, {'PI_SUBAGENT_ID': ''},
+                    dict(PI_SESSION_ID='child', ORCH_PI_PARENT_SESSION=session)):
+            self.refuses_unchanged(consume, env=env)
+        self.ok('block', 't1', '--reason', 'pause')
+        self.ok('unblock', 't1')
+        self.refuses_unchanged(consume, env=parent)
+        self.refuses_unchanged(self.grant_args(grant_id='replacement', predecessor='approval-1'))
+
+    def test_second_preserves_retry_outcomes_and_linear_provenance(self):
+        self.test_retry_and_outcome_keep_consumed_grant_and_snapshots()
+        self.phases('t1', 'review')
+        before = self.snapshot()
+        self.ok(*self.second_args())
+        self.ok(*self.consume_args(repair_grant='approval-2'))
+        after = self.snapshot()
+        for table in ('runs', 'run_outcomes', 'ci_results', 'repair_grants'):
+            self.assertEqual(before[table], after[table])
+        run = self.log_run('t1', 'implementor', 'standard', effort='high')
+        retry = self.j('retry', 't1', '--run', str(run['seq']))
+        self.assertEqual(retry['bounce_count'], 5)
+        self.assertEqual(retry['retry_of'], run['seq'])
+        self.refuses_unchanged(['retry', 't1', '--run', str(run['seq'])])
+        self.assertEqual(len(self.show('t1')['run_outcomes']), 1)
+
+    def test_second_synthetic_projection_isolation(self):
+        self.exhausted('selftest-hidden')
+        self.ok(*self.grant_args('selftest-hidden'))
+        self.ok(*self.consume_args('selftest-hidden'))
+        self.phases('selftest-hidden', 'review')
+        path = Path(self.root, 'STATE.md')
+        before = path.read_bytes()
+        revision = self.snapshot()['state_md_revision']
+        self.ok(*self.grant_args('selftest-hidden', grant_id='approval-2', predecessor='approval-1'))
+        self.ok(*self.consume_args('selftest-hidden', repair_grant='approval-2'))
+        self.assertEqual(revision, self.snapshot()['state_md_revision'])
+        self.assertEqual(before, path.read_bytes())
+
+    def test_second_does_not_waive_frontier(self):
+        self.second_ready()
+        self.log_run('t1', 'implementor', 'frontier', effort='high')
+        self.ok(*self.second_args())
+        result = self.refuses_unchanged(self.consume_args(repair_grant='approval-2'))
+        self.assertIn('frontier', result.stderr)
+        self.assertEqual(self.show('t1')['bounces'], 4)
+        self.assertIsNone(self.show('t1')['second_repair_grant']['consumed_at'])
 
     def test_explicit_grant_and_consumption_preserve_history(self):
         self.exhausted()

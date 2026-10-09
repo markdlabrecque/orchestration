@@ -216,6 +216,20 @@ CREATE TABLE IF NOT EXISTS repair_grants (
     consumed_at TEXT,
     consumed_event INTEGER
 );
+CREATE TABLE IF NOT EXISTS second_repair_grants (
+    ticket TEXT PRIMARY KEY,
+    grant_id TEXT NOT NULL UNIQUE,
+    predecessor TEXT NOT NULL UNIQUE,
+    approved_by TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    workflow TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    context TEXT NOT NULL,
+    granted_at TEXT NOT NULL,
+    consumed_at TEXT,
+    consumed_event INTEGER
+);
 CREATE TABLE IF NOT EXISTS run_outcomes (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     ticket TEXT NOT NULL,
@@ -484,7 +498,7 @@ def connect(sdir, timeout=30):
         db.execute("PRAGMA journal_mode=WAL")
     have = {r[0] for r in db.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
-    if not {"tickets", "events", "ci_results", "selftest_runs", "runs", "baselines", "run_outcomes", "repair_grants"} <= have:
+    if not {"tickets", "events", "ci_results", "selftest_runs", "runs", "baselines", "run_outcomes", "repair_grants", "second_repair_grants"} <= have:
         db.executescript(SCHEMA)
     ticket_cols = {r[1] for r in db.execute("PRAGMA table_info(tickets)")}
     run_cols = {r[1] for r in db.execute("PRAGMA table_info(runs)")}
@@ -688,14 +702,16 @@ STATE_END = b"<!-- orch:state-md end -->"
 
 def state_md_schema(db):
     """Triggers also track commits made by already-running older CLI versions."""
-    if db.execute("SELECT 1 FROM sqlite_master WHERE name='state_md_repair_grants_delete'").fetchone():
+    if db.execute("SELECT COUNT(*) FROM sqlite_master WHERE name IN "
+                  "('state_md_repair_grants_delete', 'state_md_second_repair_grants_delete')").fetchone()[0] == 2:
         return
     with transaction(db):
         db.execute("CREATE TABLE IF NOT EXISTS state_md_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL)")
         db.execute("INSERT OR IGNORE INTO state_md_revision VALUES (1, 0)")
         for table, key in (("tickets", "id"), ("events", "ticket"),
                            ("runs", "ticket"), ("ci_results", "ticket"),
-                           ("run_outcomes", "ticket"), ("repair_grants", "ticket"), ("baselines", None)):
+                           ("run_outcomes", "ticket"), ("repair_grants", "ticket"),
+                           ("second_repair_grants", "ticket"), ("baselines", None)):
             for action in ("INSERT", "UPDATE", "DELETE"):
                 refs = ("OLD", "NEW") if action == "UPDATE" else ("OLD",) if action == "DELETE" else ("NEW",)
                 condition = " OR ".join("substr(%s.%s,1,9) != 'selftest-'" % (ref, key)
@@ -733,6 +749,7 @@ def state_md_snapshot(db, legacy=()):
         for table, key, order in (("tickets", "id", "id"), ("events", "ticket", "seq"),
                                   ("runs", "ticket", "seq"), ("ci_results", "ticket", "seq"),
                                   ("run_outcomes", "ticket", "seq"), ("repair_grants", "ticket", "ticket"),
+                                  ("second_repair_grants", "ticket", "ticket"),
                                   ("baselines", None, "id")):
             where = " WHERE substr(%s,1,9) != 'selftest-'" % key if key else ""
             records[table] = [dict(r) for r in db.execute("SELECT * FROM %s%s ORDER BY %s" % (table, where, order))]
@@ -2644,6 +2661,7 @@ def cmd_show(args, db, sdir):
     t.update({
         "bounces": row["bounces"],
         "repair_grant": repair_grant(db, args.ticket),
+        "second_repair_grant": repair_grant(db, args.ticket, second=True),
         "model_mismatches": sum(1 for r in runs if r["match"] == 0),
         "unrecorded_dispatches": db.execute(
             "SELECT COUNT(*) FROM events WHERE ticket=? AND kind='dispatch_unrecorded'",
@@ -2995,8 +3013,9 @@ def cmd_attach(args, db, sdir):
          "%s attached %s" % (args.ticket, " ".join(detail)))
 
 
-def repair_grant(db, tid):
-    row = db.execute("SELECT * FROM repair_grants WHERE ticket=?", (tid,)).fetchone()
+def repair_grant(db, tid, second=False):
+    table = "second_repair_grants" if second else "repair_grants"
+    row = db.execute("SELECT * FROM " + table + " WHERE ticket=?", (tid,)).fetchone()
     if row is None:
         return None
     result = dict(row)
@@ -3020,14 +3039,15 @@ def repair_grant_parent(row):
     refuse_if_launching(row)
 
 
-def repair_grant_context(db, row):
+def repair_grant_context(db, row, second=False):
     """Require complete, agreeing history; capture the exact exhausted context."""
     if row["phase"] not in ("review", "verify"):
         raise Refusal(EXIT_GATE, "repair grant requires active review or verify; unblock first")
-    if (type(row["bounces"]) is not int or row["bounces"] != BOUNCE_CAP
+    if (type(row["bounces"]) is not int or row["bounces"] != BOUNCE_CAP + int(second)
             or type(row["ci_repairs"]) is not int
             or not 0 <= row["ci_repairs"] <= CI_REPAIR_CAP):
-        raise Refusal(EXIT_GATE, "repair grant requires exactly three bounces and known valid CI history")
+        raise Refusal(EXIT_GATE, "repair grant requires exactly %s bounces and known valid CI history"
+                      % ("four" if second else "three"))
     events = [dict(e) for e in db.execute(
         "SELECT * FROM events WHERE ticket=? ORDER BY seq", (row["id"],))]
     complete = bool(events and events[0]["kind"] == "add"
@@ -3064,7 +3084,12 @@ def cmd_repair_grant(args, db, sdir):
         raise Refusal(EXIT_GATE, "repair grant requires --approved requesting-human attestation")
     fields = ("grant_id", "approved_by", "evidence", "scope", "workflow", "agent")
     values = {key: baseline_text(getattr(args, key), key) for key in fields}
-    existing = repair_grant(db, args.ticket)
+    second = args.predecessor is not None
+    if second:
+        values["predecessor"] = baseline_text(args.predecessor, "predecessor")
+        fields += ("predecessor",)
+    table = "second_repair_grants" if second else "repair_grants"
+    existing = repair_grant(db, args.ticket, second)
     if existing:
         if (any(existing[key] != values[key] for key in fields)
                 or existing["context"]["transition"]["seq"] != args.event):
@@ -3072,28 +3097,64 @@ def cmd_repair_grant(args, db, sdir):
         # An exact replay only returns the original record. It never renews it.
         emit(args, existing, json.dumps(existing, sort_keys=True))
         return
-    if db.execute("SELECT 1 FROM repair_grants WHERE grant_id=?", (values["grant_id"],)).fetchone():
-        raise Refusal(EXIT_GATE, "grant ID already belongs to another ticket")
-    context = repair_grant_context(db, row)
+    if any(db.execute("SELECT 1 FROM " + source + " WHERE grant_id=?",
+                      (values["grant_id"],)).fetchone()
+           for source in ("repair_grants", "second_repair_grants")):
+        raise Refusal(EXIT_GATE, "grant ID already belongs to another grant")
+    if second:
+        validate_repair_predecessor(db, row, values["predecessor"])
+    context = repair_grant_context(db, row, second)
     if args.event != context["transition"]["seq"]:
         raise Refusal(EXIT_GATE, "stale repair context event; inspect fresh events")
-    db.execute("INSERT INTO repair_grants(ticket,grant_id,approved_by,evidence,scope,workflow,agent,context,granted_at) "
-               "VALUES (?,?,?,?,?,?,?,?,?)",
+    columns = ("ticket",) + fields + ("context", "granted_at")
+    db.execute("INSERT INTO " + table + "(" + ",".join(columns) + ") VALUES ("
+               + ",".join("?" for _ in columns) + ")",
                (args.ticket, *(values[key] for key in fields), json.dumps(context, sort_keys=True), now()))
-    grant = repair_grant(db, args.ticket)
+    grant = repair_grant(db, args.ticket, second)
     log_event(db, args.ticket, "repair-grant", row["phase"], row["phase"], json.dumps(grant, sort_keys=True))
     emit(args, grant, json.dumps(grant, sort_keys=True))
+
+
+def validate_repair_predecessor(db, row, predecessor):
+    first = repair_grant(db, row["id"])
+    if (first is None or first["grant_id"] != predecessor
+            or not first["consumed_at"] or first["consumed_event"] is None):
+        raise Refusal(EXIT_GATE, "second grant requires the ticket's consumed first grant")
+    event = db.execute("SELECT * FROM events WHERE ticket=? AND seq=?",
+                       (row["id"], first["consumed_event"])).fetchone()
+    if (event is None or event["kind"] != "phase"
+            or event["from_phase"] not in ("review", "verify") or event["to_phase"] != "fix"
+            or first["context"].get("bounces") != BOUNCE_CAP):
+        raise Refusal(EXIT_GATE, "unknown or inconsistent predecessor consumption history")
+    approval = dict(first, consumed_at=None, consumed_event=None)
+    if not db.execute("SELECT 1 FROM events WHERE ticket=? AND kind='repair-grant' AND seq<? AND detail=?",
+                      (row["id"], event["seq"], json.dumps(approval, sort_keys=True))).fetchone():
+        raise Refusal(EXIT_GATE, "unknown or inconsistent predecessor approval history")
+    count = db.execute("SELECT COUNT(*) FROM events WHERE ticket=? AND seq<=? AND kind='phase' "
+                       "AND from_phase IN ('review','verify') AND to_phase='fix'",
+                       (row["id"], event["seq"])).fetchone()[0]
+    records = db.execute("SELECT detail FROM events WHERE ticket=? AND kind='repair-grant-consumed' "
+                         "AND seq>? ORDER BY seq", (row["id"], event["seq"])).fetchall()
+    expected = {"grant_id": predecessor, "workflow": first["workflow"],
+                "agent": first["agent"], "phase_event": event["seq"]}
+    if count != 4 or not any(record["detail"] == json.dumps(expected, sort_keys=True) for record in records):
+        raise Refusal(EXIT_GATE, "unknown or inconsistent predecessor consumption history")
 
 
 def matching_repair_grant(args, db, row):
     repair_grant_parent(row)
     grant = repair_grant(db, args.ticket)
+    if grant is None or grant["grant_id"] != args.repair_grant:
+        grant = repair_grant(db, args.ticket, second=True)
     if (grant is None or grant["grant_id"] != args.repair_grant
             or grant["workflow"] != args.workflow or grant["agent"] != args.agent):
         raise Refusal(EXIT_GATE, "explicit repair grant, workflow and agent must match")
     if grant["consumed_at"] is not None:
         raise Refusal(EXIT_GATE, "repair grant already consumed; block for a human")
-    if grant["context"] != repair_grant_context(db, row):
+    second = "predecessor" in grant
+    if second:
+        validate_repair_predecessor(db, row, grant["predecessor"])
+    if grant["context"] != repair_grant_context(db, row, second):
         raise Refusal(EXIT_GATE, "stale repair grant context; block for a human")
     return grant
 
@@ -3137,7 +3198,8 @@ def cmd_phase(args, db, sdir):
     log_event(db, args.ticket, "phase", cur, new, args.note)
     if grant:
         event = db.execute("SELECT MAX(seq) FROM events WHERE ticket=?", (args.ticket,)).fetchone()[0]
-        db.execute("UPDATE repair_grants SET consumed_at=?, consumed_event=? WHERE ticket=?",
+        table = "second_repair_grants" if "predecessor" in grant else "repair_grants"
+        db.execute("UPDATE " + table + " SET consumed_at=?, consumed_event=? WHERE ticket=?",
                    (now(), event, args.ticket))
         log_event(db, args.ticket, "repair-grant-consumed", new, new,
                   json.dumps({"grant_id": grant["grant_id"], "workflow": grant["workflow"],
@@ -5137,6 +5199,7 @@ def build_parser():
         grant.add_argument("--" + flag, required=True)
     grant.add_argument("--event", type=int, required=True, help="current phase-changing event sequence")
     grant.add_argument("--approved", action="store_true")
+    grant.add_argument("--predecessor", help="consumed first grant ID; explicitly approve the final fifth repair")
     sp = sub.add_parser("state-md", parents=[common], help="check or rebuild the committed STATE.md projection")
     sp.set_defaults(fn=cmd_state_md)
     sp.add_argument("operation", choices=("check", "rebuild"))
