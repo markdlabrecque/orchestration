@@ -91,6 +91,34 @@ class BaselineTests(OrchTestCase):
     def assert_unchanged(self):
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.wt), self.old_head)
 
+    def test_state_md_tracks_resolution_guard_refusal_refresh_and_ack(self):
+        state = Path(self.root, 'STATE.md')
+        def published(value):
+            # Check does not repair. Read before any ordinary command can repair.
+            self.assertIn(value.encode(), state.read_bytes())
+            self.ok('state-md', 'check')
+
+        self.confirm()
+        published(self.output)
+        self.merged_fix()
+        self.resolve()
+        published('requested')
+        Path(self.wt, 'dirty.txt').write_text('preserve local work\n')
+        self.refused(3, 'baseline', 'refresh', 'walk', '--ticket', 'affected',
+                     '--stage-boundary', cwd=self.wt)
+        published('guard-refused')
+        Path(self.wt, 'dirty.txt').unlink()
+        self.refresh()
+        published('success')
+        head = self.git('rev-parse', 'HEAD', cwd=self.wt)
+        self.ok('baseline', 'ack', 'walk', '--ticket', 'affected', '--sha', head,
+                '--tests', 'publication-tests-sentinel', '--review', 'publication-review-sentinel')
+        published('publication-tests-sentinel')
+        published('publication-review-sentinel')
+        before = state.read_bytes()
+        self.ok('state-md', 'rebuild')
+        self.assertEqual(state.read_bytes(), before)
+
     def test_confirmation_persists_evidence_and_prioritizes_only_ready_owner(self):
         self.assertEqual(self.tickets("next")[0]["id"], "affected")
         self.confirm()

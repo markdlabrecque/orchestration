@@ -1114,7 +1114,7 @@ class HardeningTests(OrchTestCase):
 
 
 class StateMdTests(OrchTestCase):
-    """STATE.md activity log in the project root (append-only)."""
+    """STATE.md lifecycle coverage and legacy append-helper safety."""
 
     LINE = re.compile(r"^- (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)Z? (#\S+) (.*)$")
 
@@ -1138,12 +1138,14 @@ class StateMdTests(OrchTestCase):
             out.append((m.group(2), m.group(3)))
         return out
 
-    def test_lifecycle_lines_in_order_and_add_writes_nothing(self):
+    def test_lifecycle_history_and_add_snapshot(self):
         self.add("T-1")
-        self.assertFalse(os.path.exists(self.state_md), "orch add must not log")
+        self.assertTrue(os.path.exists(self.state_md), "committed add must publish")
         self.spawn("T-1", sleep=0)
+        self.assertEqual(self.show("T-1")["attempt"], 1)
         self.wait_dead("T-1")
         self.ok("resume", "T-1")
+        self.assertEqual(self.show("T-1")["attempt"], 2)
         self.wait_dead("T-1")
         self.ok("block", "T-1", "--reason", "needs input")
         self.ok("unblock", "T-1")
@@ -1152,20 +1154,36 @@ class StateMdTests(OrchTestCase):
         self.ok("ci", "T-1", "--sha", "abc123", "--passed")
         self.ok("merged", "T-1", "--sha", "abc123",
                 "--mr", "https://example.com/mr/9")
-        self.assertEqual(self.events_logged(), [
-            ("#T-1", "picked up"),
-            ("#T-1", "picked up: attempt 2"),
-            ("#T-1", "blocked: needs input"),
-            ("#T-1", "completed: https://example.com/mr/9"),
-        ])
-        head = self.md().split("## Activity")[0]
-        self.assertTrue(head.startswith("# proj orchestration state\n\n## Notes\n"))
+        text = self.md()
+        for evidence in ("T-1", "needs input", "https://example.com/mr/9", "done"):
+            self.assertIn(evidence, text)
+        # Assert the exported records, not only DB events: the prior append-log
+        # test guarded pickup -> resume attempt 2 -> block -> completion order.
+        events = json.loads(re.search(r"#### events\n\n```json\n(.*?)\n```", text, re.S).group(1))
+        lifecycle = [event for event in events if event["kind"] in
+                     ("spawn", "resume", "block", "unblock", "merged")]
+        self.assertEqual([event["kind"] for event in lifecycle],
+                         ["spawn", "resume", "block", "unblock", "merged"])
+        self.assertEqual([(event["from_phase"], event["to_phase"]) for event in lifecycle[:4]],
+                         [("ready", "dispatched"), ("dispatched", "dispatched"),
+                          ("dispatched", "blocked"), ("blocked", "dispatched")])
+        self.assertIn("attempt=2", lifecycle[1]["detail"])
+        self.assertEqual([event["seq"] for event in events],
+                         sorted(event["seq"] for event in events))
+        compact = text.split("### Detailed records")[0]
+        positions = [compact.index("| %s |" % kind) for kind in
+                     ("spawn", "resume", "block", "unblock", "merged")]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("attempt=2", compact)
+        self.ok("state-md", "check")
 
     def test_merged_without_mr_logs_sha(self):
         self.to_ci("T-1")
         self.ok("ci", "T-1", "--sha", "abc123", "--passed")
         self.ok("merged", "T-1", "--sha", "abc123")
-        self.assertEqual(self.events_logged()[-1], ("#T-1", "completed: commit abc123"))
+        self.assertIn("abc123", self.md())
+        self.assertIn("done", self.md())
+        self.ok("state-md", "check")
 
     def test_json_flag_before_command(self):
         self.add("T-1")
@@ -1176,7 +1194,7 @@ class StateMdTests(OrchTestCase):
             self.fail("orch --json block did not print JSON: %r" % p.stdout)
         self.assertEqual(t["phase"], "blocked")
 
-    def test_existing_notes_preserved_and_appended_only(self):
+    def test_existing_notes_and_legacy_activity_preserved(self):
         original = ("# proj orchestration state\n\n## Notes\n\n"
                     "Hand written: keep me.\n  odd   spacing\n\nextra line\n"
                     "## Activity\n\n- 2020-01-01T00:00:00Z #OLD picked up\n")
@@ -1189,8 +1207,11 @@ class StateMdTests(OrchTestCase):
         self.ok("unblock", "T-1")
         self.ok("block", "T-1", "--reason", "r2")
         after2 = self.md()
-        self.assertTrue(after2.startswith(after1))
-        self.assertEqual(len(after2.splitlines()) - len(original.splitlines()), 2)
+        self.assertTrue(after2.startswith(original))
+        self.assertNotEqual(after2, after1)
+        self.assertIn("r1", after2)
+        self.assertIn("r2", after2)
+        self.ok("state-md", "check")
 
     def test_existing_file_without_trailing_newline(self):
         with open(self.state_md, "w", newline="") as f:
@@ -1198,8 +1219,9 @@ class StateMdTests(OrchTestCase):
         self.add("T-1")
         self.ok("block", "T-1", "--reason", "why")
         lines = self.md().splitlines()
-        self.assertEqual(lines[-2], "- old line")
-        self.assertRegex(lines[-1], r"^- \S+ #T-1 blocked: why$")
+        self.assertIn("- old line", lines)
+        self.assertIn("why", self.md())
+        self.ok("state-md", "check")
 
     SKELETON = "# proj orchestration state\n\n## Notes\n\n## Activity\n\n"
 

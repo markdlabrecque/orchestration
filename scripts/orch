@@ -438,10 +438,14 @@ def load_config(sdir):
     return cfg
 
 
+class StateConnection(sqlite3.Connection):
+    """Publication state is process-local; the revision itself lives in SQLite."""
+
+
 def connect(sdir, timeout=30):
     os.makedirs(sdir, exist_ok=True)
     db = sqlite3.connect(os.path.join(sdir, "state.db"), timeout=timeout,
-                         isolation_level=None)
+                         isolation_level=None, factory=StateConnection)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA busy_timeout=%d" % int(timeout * 1000))
     if db.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
@@ -486,6 +490,9 @@ def connect(sdir, timeout=30):
         for name in NEW_RUN_COLUMNS:
             if name not in run_cols:
                 db.execute("ALTER TABLE runs ADD COLUMN %s TEXT" % name)
+    state_md_schema(db)
+    db.publish_state = True
+    db.publication_error = None
     return db
 
 
@@ -498,6 +505,8 @@ def transaction(db, write=True):
         db.execute("ROLLBACK")
         raise
     db.execute("COMMIT")
+    if write and getattr(db, "publish_state", False):
+        state_md_after_commit(db)
 
 
 # ---- helpers ---------------------------------------------------------------
@@ -639,7 +648,286 @@ def ticket_dict(row, cfg, full=True, alive=None):
     return d
 
 
-# ---- STATE.md activity log --------------------------------------------------
+# ---- committed STATE.md projection ------------------------------------------
+
+STATE_BEGIN = b"<!-- orch:state-md begin -->"
+STATE_END = b"<!-- orch:state-md end -->"
+
+
+def state_md_schema(db):
+    """Triggers also track commits made by already-running older CLI versions."""
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='state_md_revision'").fetchone():
+        return
+    with transaction(db):
+        db.execute("CREATE TABLE IF NOT EXISTS state_md_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL)")
+        db.execute("INSERT OR IGNORE INTO state_md_revision VALUES (1, 0)")
+        for table, key in (("tickets", "id"), ("events", "ticket"),
+                           ("runs", "ticket"), ("ci_results", "ticket"),
+                           ("baselines", None)):
+            for action in ("INSERT", "UPDATE", "DELETE"):
+                refs = ("OLD", "NEW") if action == "UPDATE" else ("OLD",) if action == "DELETE" else ("NEW",)
+                condition = " OR ".join("substr(%s.%s,1,9) != 'selftest-'" % (ref, key)
+                                        for ref in refs) if key else "1"
+                db.execute("CREATE TRIGGER IF NOT EXISTS state_md_%s_%s AFTER %s ON %s WHEN %s "
+                           "BEGIN UPDATE state_md_revision SET revision=revision+1 WHERE id=1; END"
+                           % (table, action.lower(), action, table, condition))
+
+
+def state_md_root():
+    try:
+        return project_root()
+    except Refusal:
+        root = os.environ.get("ORCH_HOME")
+        if not root:
+            raise
+        return root
+
+
+def state_md_cell(value):
+    """A single Markdown table cell, with no stored text claiming ownership."""
+    if value is None:
+        return ""
+    return (str(value).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace("|", "&#124;")
+            .replace("\r", "&#13;").replace("\n", "<br>"))
+
+
+def state_md_snapshot(db, legacy=()):
+    """One committed read snapshot. No health probes or inferred activity."""
+    db.execute("BEGIN")
+    try:
+        revision = db.execute("SELECT revision FROM state_md_revision WHERE id=1").fetchone()[0]
+        records = {}
+        for table, key, order in (("tickets", "id", "id"), ("events", "ticket", "seq"),
+                                  ("runs", "ticket", "seq"), ("ci_results", "ticket", "seq"),
+                                  ("baselines", None, "id")):
+            where = " WHERE substr(%s,1,9) != 'selftest-'" % key if key else ""
+            records[table] = [dict(r) for r in db.execute("SELECT * FROM %s%s ORDER BY %s" % (table, where, order))]
+        for ticket in records["tickets"]:
+            ticket["status"] = PHASE_STATUS.get(ticket["phase"], ticket["phase"])
+            ticket["retired"] = ticket["retired_at"] is not None
+        watermark = max((r["seq"] for r in records["events"]), default=0)
+        db.execute("COMMIT")
+    except BaseException:
+        # A failed read/export must not leave a transaction around for the next
+        # lifecycle commit, nor turn a successful launch into compensation.
+        if db.in_transaction:
+            with contextlib.suppress(sqlite3.Error):
+                db.execute("ROLLBACK")
+        raise
+    lines = [STATE_BEGIN.decode(), "## Committed workflow", "",
+             "Source revision: %s; event watermark: %s" % (revision, watermark),
+             "", "### Recorded tickets", "",
+             "| Ticket | Title | Phase | Status | Attempt | Retired | Activity | Observed at |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for row in records["tickets"]:
+        values = [row[key] for key in ("id", "title", "phase", "status", "attempt")]
+        values += ["yes" if row["retired"] else "no", row["activity"], row["last_seen_at"]]
+        lines.append("| " + " | ".join(map(state_md_cell, values)) + " |")
+    lines.extend(["", "### Recorded activity", "",
+                  "| Sequence | Recorded at | Ticket | Event | From | To | Detail |",
+                  "| --- | --- | --- | --- | --- | --- | --- |"])
+    for row in records["events"]:
+        lines.append("| " + " | ".join(state_md_cell(row[key]) for key in
+                     ("seq", "ts", "ticket", "kind", "from_phase", "to_phase", "detail")) + " |")
+    if legacy:
+        lines.extend(["", "### Retained legacy appends", "",
+                      "Late writes to replaced files, retained verbatim in `.STATE.md.legacy/`."])
+        for name, tail in legacy:
+            # JSON strings keep arbitrary bytes reversible via surrogateescape;
+            # escaping angle brackets prevents legacy text claiming ownership.
+            lines.extend(["", "#### " + name, "", "```json",
+                          json.dumps(tail.decode("utf-8", "surrogateescape"), ensure_ascii=True)
+                          .replace("<", "\\u003c").replace(">", "\\u003e"), "```"])
+    lines.extend(["", "### Detailed records"])
+    for table, rows in records.items():
+        lines.extend(["", "#### " + table, "", "```json",
+                      json.dumps(rows, ensure_ascii=True, indent=2, sort_keys=True)
+                      .replace("<", "\\u003c").replace(">", "\\u003e"), "```"])
+    lines.append(STATE_END.decode())
+    # Escape marker-like stored text so it cannot claim document ownership.
+    return ("\n".join(lines) + "\n").encode()
+
+
+def state_md_parts(data):
+    """Only a unique, correctly ordered marker pair grants ownership."""
+    count = data.count(STATE_BEGIN), data.count(STATE_END)
+    if data.count(b"<!-- orch:state-md") != sum(count):
+        raise ValueError("malformed managed markers")
+    if count == (0, 0):
+        if b"<!-- orch:state-md" in data:
+            raise ValueError("malformed managed markers")
+        return None
+    if count != (1, 1):
+        raise ValueError("ambiguous or missing managed markers")
+    start, end = data.index(STATE_BEGIN), data.index(STATE_END)
+    if (start > end or (start and data[start-1:start] != b"\n")
+            or data[start+len(STATE_BEGIN):start+len(STATE_BEGIN)+1] != b"\n"
+            or data[end-1:end] != b"\n"):
+        raise ValueError("malformed managed markers")
+    end += len(STATE_END)
+    if data[end:end+1] == b"\n":
+        end += 1
+    elif end != len(data):
+        raise ValueError("malformed managed markers")
+    return start, end
+
+
+def state_md_fsync_directory(path):
+    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def state_md_legacy(root, current_file):
+    """Read tails from every superseded inode. No cursor/ack crash window.
+
+    A retained filename is device-inode-original_length. The original length
+    was read under the old appenders' inode flock, before replacement. Links
+    stay forever: an old process may still hold any of these file descriptors.
+    A link to the CURRENT inode is an interrupted preparation, not a late tail;
+    its bytes are already in the current document and its baseline is reset on
+    the next replacement. Never infer that an old writer has finished.
+    """
+    directory = os.path.join(root, ".STATE.md.legacy")
+    identity = None
+    if current_file is not None:
+        stat = os.fstat(current_file.fileno())
+        identity = (stat.st_dev, stat.st_ino)
+    try:
+        names = sorted(os.listdir(directory))
+    except FileNotFoundError:
+        return []
+    tails = []
+    for name in names:
+        if not re.fullmatch(r"\d+-\d+-\d+", name):
+            raise ValueError("unexpected legacy retention entry: " + name)
+        device, inode, length = map(int, name.split("-"))
+        with open(os.path.join(directory, name), "rb") as retained:
+            stat = os.fstat(retained.fileno())
+            if (stat.st_dev, stat.st_ino) != (device, inode):
+                raise ValueError("legacy retention inode changed: " + name)
+            if (device, inode) == identity:
+                continue
+            fcntl.flock(retained, fcntl.LOCK_SH)
+            if os.fstat(retained.fileno()).st_size < length:
+                raise ValueError("legacy retention file truncated: " + name)
+            retained.seek(length)
+            tail = retained.read()
+            if tail:
+                # Old helpers flush but do not fsync. Persist observed tails
+                # before acknowledging their projection in a durable new file.
+                os.fsync(retained.fileno())
+                tails.append((name, tail))
+    return tails
+
+
+def state_md_retain(root, path, current_file, length):
+    """Durably link the locked old inode BEFORE replacing its last public name."""
+    directory = os.path.join(root, ".STATE.md.legacy")
+    os.makedirs(directory, exist_ok=True)
+    stat = os.fstat(current_file.fileno())
+    prefix = "%s-%s-" % (stat.st_dev, stat.st_ino)
+    name = prefix + str(length)
+    previous = [entry for entry in os.listdir(directory) if entry.startswith(prefix)]
+    if len(previous) > 1:
+        raise ValueError("ambiguous legacy retention baseline")
+    if previous:
+        # A crash before replace can leave the current inode linked. Its later
+        # appends are already outside managed ownership in the current file.
+        if previous[0] != name:
+            os.rename(os.path.join(directory, previous[0]), os.path.join(directory, name))
+    else:
+        os.link(path, os.path.join(directory, name))
+    os.fsync(current_file.fileno())
+    state_md_fsync_directory(directory)
+    state_md_fsync_directory(root)
+
+
+def state_md_sync(db, check=False):
+    """Lock before snapshot and notes read; never hold a DB write lock here.
+
+    Exact managed-byte equivalence is the publication acknowledgement. The
+    transactional revision survives commit/export crashes, while equality also
+    recognizes a complete replace even if the publisher died immediately after.
+    """
+    root = getattr(db, "state_root", None) or state_md_root()
+    path = os.path.join(root, "STATE.md")
+    temporary = None
+    try:
+        with contextlib.ExitStack() as stack:
+            lock = stack.enter_context(open(os.path.join(root, ".STATE.md.lock"), "a+b"))
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            current_file = None
+            try:
+                current_file = stack.enter_context(open(path, "rb"))
+                # Old processes lock this inode, not the stable publisher lock.
+                # Hold it through durable retention and replacement. A writer
+                # that already opened it can safely append after we release it.
+                fcntl.flock(current_file, fcntl.LOCK_EX)
+                current = current_file.read()
+            except FileNotFoundError:
+                current = b""
+            expected = state_md_snapshot(db, state_md_legacy(root, current_file))
+            parts = state_md_parts(current)
+            fresh = parts is not None and current[parts[0]:parts[1]] == expected
+            if check or fresh:
+                return fresh
+            if parts is None:
+                prefix = current or b"# Orchestration state\n\n## Notes\n"
+                replacement = prefix + (b"\n" if not prefix.endswith(b"\n") else b"") + b"\n" + expected
+            else:
+                replacement = current[:parts[0]] + expected + current[parts[1]:]
+            fd, temporary = tempfile.mkstemp(prefix=".STATE.md-", dir=root)
+            with os.fdopen(fd, "wb") as f:
+                if os.path.exists(path):
+                    os.fchmod(f.fileno(), os.stat(path).st_mode & 0o777)
+                if f.write(replacement) != len(replacement):
+                    raise OSError("short STATE.md write")
+                f.flush()
+                os.fsync(f.fileno())
+            if current_file is not None:
+                state_md_retain(root, path, current_file, len(current))
+            os.replace(temporary, path)
+            temporary = None
+            state_md_fsync_directory(root)
+            return True
+    except (OSError, ValueError, sqlite3.Error) as e:
+        if check:
+            return False
+        raise Refusal(EXIT_GATE, "database commit succeeded; STATE.md is stale or synchronization failed: %s" % e) from e
+    finally:
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
+
+
+def state_md_after_commit(db):
+    """Export failure is not transaction failure or a failed platform launch.
+
+    Let lifecycle cleanup/compensation finish, but retain a controlled failure
+    for the command boundary. Hooks report the same diagnostic and exit zero.
+    """
+    try:
+        state_md_sync(db)
+    except Refusal as e:
+        db.publication_error = e
+        print("orch: %s" % e, file=sys.stderr)
+
+
+def cmd_state_md(args, db, sdir):
+    fresh = state_md_sync(db, check=args.operation == "check")
+    emit(args, {"fresh": fresh}, "STATE.md is " + ("fresh" if fresh else "stale"))
+    if not fresh:
+        raise Refusal(EXIT_GATE, "STATE.md is stale; run orch state-md rebuild")
+
+
+cmd_state_md.own_tx = True
+
+
+# Legacy helper retained for external callers; CLI writes use committed snapshots.
 
 def state_md_append(root, line):
     """Append one activity line to <root>/STATE.md (append-only, flock'd);
@@ -662,20 +950,8 @@ def state_md_append(root, line):
 
 
 def state_md_log(tid, event):
-    """Log `event` for ticket `tid`; a failure only warns."""
-    if str(tid).startswith("selftest-"):
-        return
-    try:
-        try:
-            root = project_root()
-        except Refusal:
-            root = os.environ.get("ORCH_HOME")
-            if not root:
-                raise
-        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        state_md_append(root, "- %s #%s %s" % (ts, tid, " ".join(event.split())))
-    except (OSError, Refusal, subprocess.SubprocessError) as e:
-        print("orch: warning: could not write STATE.md: %s" % e, file=sys.stderr)
+    """Compatibility shim: transaction completion publishes the stored event."""
+    return
 
 
 def log_event(db, tid, kind, from_phase, to_phase, detail=None):
@@ -2202,7 +2478,11 @@ def launch_steps(db, sdir, cfg, row, evs, platform, session, prompt_file,
 def cmd_init(args):
     sdir = state_dir()
     os.makedirs(sdir, exist_ok=True)
-    connect(sdir).close()
+    db = connect(sdir)
+    try:
+        state_md_sync(db)
+    finally:
+        db.close()
     emit(args, {"state_dir": sdir}, "initialized %s" % sdir)
 
 
@@ -2736,7 +3016,8 @@ def cmd_merged(args, db, sdir):
         raise Refusal(EXIT_GATE, "no passing CI recorded for %s at %s"
                       % (args.ticket, args.sha))
     db.execute("UPDATE tickets SET phase='done' WHERE id=?", (args.ticket,))
-    log_event(db, args.ticket, "merged", "ci", "done", args.sha)
+    log_event(db, args.ticket, "merged", "ci", "done",
+              args.sha + (" " + args.mr if args.mr else ""))
     state_md_log(args.ticket, "completed: " + (args.mr or "commit " + args.sha))
     emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
          "%s merged at %s" % (args.ticket, args.sha))
@@ -3069,6 +3350,7 @@ def watch_frame(sdir):
         cfg = load_config(sdir)
         rows = db.execute("SELECT * FROM tickets WHERE retired_at IS NULL"
                           " ORDER BY seq").fetchall()
+        state_md_sync(db)
         return [{"id": r["id"], "platform": row_platform(r), "phase": r["phase"],
                  "health": t["health"], "last_seen_at": r["last_seen_at"],
                  "review_rounds": r["review_rounds"]}
@@ -3814,7 +4096,7 @@ def cmd_selftest(args):
         if out is not None:
             save_run(db, st)
             print(json.dumps(out))
-            return 0
+            return db.publication_error.code if db.publication_error else 0
         if stop is not None:
             save_run(db, st)  # kept: the record of an interrupted run
         else:
@@ -3839,7 +4121,7 @@ def cmd_selftest(args):
                                                   "ok" if ok else "FAILED"))
         if stop is not None:
             return 143 if isinstance(stop, Terminated) else 130
-        return 0 if ok else EXIT_GATE
+        return 0 if ok and db.publication_error is None else EXIT_GATE
     finally:
         db.close()
 
@@ -4168,6 +4450,8 @@ def run_hook():
     out = None
     db = connect(sdir, timeout=2)
     try:
+        with contextlib.suppress(Refusal):
+            db.state_root = project_root(cwd)
         # Match under a plain read; most hooks end here without a write lock.
         rows = db.execute("SELECT * FROM tickets WHERE retired_at IS NULL"
                           " AND worktree IS NOT NULL").fetchall()
@@ -4237,13 +4521,16 @@ def run_hook():
                 log_event(db, tid, "session_end", phase, phase,
                           "reason=%s" % payload.get("reason"))
     finally:
-        db.close()
+        try:
+            state_md_after_commit(db)
+        finally:
+            db.close()
     if out:
         print(out)
 
 
 def cmd_hook(args):
-    """Never disturbs the session: always exit 0, silent on any error."""
+    """Always exit zero; publication failures are diagnosed by the publisher."""
     try:
         run_hook()
     except BaseException:
@@ -4316,6 +4603,9 @@ def build_parser():
     complete.add_argument("--run", type=int, required=True)
     complete.add_argument("--evidence", required=True)
     complete.add_argument("--stopped", action="store_true")
+    sp = sub.add_parser("state-md", parents=[common], help="check or rebuild the committed STATE.md projection")
+    sp.set_defaults(fn=cmd_state_md)
+    sp.add_argument("operation", choices=("check", "rebuild"))
     add("init", cmd_init)
     add("platform", cmd_platform)
     add("preflight", cmd_preflight)
@@ -4409,6 +4699,10 @@ def main(argv=None):
             else:
                 with transaction(db, write=args.fn not in READ_ONLY):
                     args.fn(args, db, sdir)
+            if args.fn is not cmd_state_md:
+                if db.publication_error is not None:
+                    return db.publication_error.code
+                state_md_sync(db)
         finally:
             db.close()
         return 0

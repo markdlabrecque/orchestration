@@ -19,7 +19,44 @@ The project root also holds `.orch` (written by the `setup-project` skill). `orc
 
 SQLite runs in WAL mode with a busy timeout. Every command is one transaction, so a killed process leaves either the old state or the new one, never half. Writes take `BEGIN IMMEDIATE`; read-only commands (`list`, `show`, `next`, `stale`, `events`, `route`, `runs`, `platform`, `watch`) use a plain deferred read. `spawn`, `resume`, `retire` and baseline refresh are exceptions: they never hold the write lock while a platform command or worktree engine runs, and hold the ticket's in-flight marker instead (see "Launching sessions"). Older databases gain new columns and tables (`bounces`, `runs`) automatically on first use.
 
-### `config.json`
+## STATE.md synchronization
+
+SQLite is authoritative. `<project root>/STATE.md` is a deterministic projection of committed workflow data, not another state store. If no project root resolves and `ORCH_HOME` is set, the file lives there. Read or change ticket state through `orch`; rebuilding the document does not change workflow decisions or call a provider/platform.
+
+```sh
+orch state-md check --json
+orch state-md rebuild --json
+```
+
+`check` returns `{"fresh": true}` and exit 0 only when the managed bytes match the current committed revision and all observed retained legacy tails. Missing, stale, tampered or malformed content returns `{"fresh": false}` and exit 3 without repairing the file. `rebuild` publishes the current committed snapshot and returns `{"fresh": true}` on success. Rebuilding unchanged data preserves identical bytes and stored timestamps.
+
+The generated section has two ownership delimiters, each on its own line:
+
+```text
+<!-- orch:state-md begin -->
+... generated workflow records ...
+<!-- orch:state-md end -->
+```
+
+Keep human notes outside those delimiters. Initial migration retains every byte of a legacy document, including its old activity log, and adds the managed section after it. Later replacements preserve text outside the section. Missing, duplicate, reversed or malformed delimiters refuse replacement rather than guessing which text can be removed. Retain the file and investigate the ownership damage before retrying; repeated rebuilds cannot resolve ambiguous ownership.
+
+The snapshot starts with a compact recorded-ticket table and activity history ordered by stored event sequence. Detailed JSON rows follow for tickets ordered by ID, events, stage runs, CI evidence and shared baseline records. Together these expose phase, phase-derived status, attempt, retirement, recorded activity and observation time, lifecycle reservations, and recorded recovery/completion evidence. It does not probe live health, infer a current subtask, or classify run outcomes. `selftest-*` tickets and their associated events, runs and CI rows are excluded. Synthetic-only changes do not advance the source revision.
+
+A transactional source revision tracks inserts, updates and deletes, including changes without an event. SQLite triggers also observe writes by older sibling processes. The document records that revision and the event watermark; matching managed bytes are the publication acknowledgment. A process dying between commit and export leaves detectable stale content. A process dying after a complete replacement can leave an already-fresh file, with no second acknowledgment write required.
+
+Successful write transactions publish after commit, including lifecycle intent before platform launch, compensation after failed launch, baseline reservations/results and hook updates. Publication never holds a SQLite write transaction. A stable `.STATE.md.lock` serializes publishers across file replacements. Each publisher captures a fresh committed snapshot and reads the current human text after obtaining that lock, writes and fsyncs a temporary file, atomically replaces STATE.md, then fsyncs the directory. Existing file permissions are retained. A waiting older publisher therefore cannot replace a newer snapshot with cached data.
+
+Already-running legacy appenders lock the STATE.md inode, not `.STATE.md.lock`. Before replacement, the publisher also locks that inode and creates a hard link in `.STATE.md.legacy/`. Each link's name records its device, inode and pre-replacement byte length. The publisher fsyncs the old file and both directories before replacing STATE.md. An old appender that opened the file before replacement can still write to the retained inode after the publisher releases its lock.
+
+Later `check` calls compare every retained tail with its rendered copy. A new tail makes the document stale; rebuild and automatic repair render it under "Retained legacy appends", separately from database activity. Raw bytes remain in the linked file; JSON strings in the projection escape marker-like text and preserve arbitrary bytes using UTF-8 surrogate escapes. The publisher fsyncs observed tails before publishing them. There is no consumed-offset acknowledgment to lose in a crash: each export reads the complete tail from the recorded original length. If a publisher dies before replacement, a link still pointing to the current inode is ignored during tail collection, and its original length is reset under the inode lock before the next replacement. Those bytes are already in the current document, so repair preserves them once.
+
+Keep `.STATE.md.legacy/` with STATE.md in backups and recovery. Retention is indefinite and consumes disk space for replaced documents; there is no automatic pruning because an arbitrarily delayed old writer may still hold any replaced descriptor. Filesystems must support same-filesystem hard links and fsync. Failure to retain the old inode refuses replacement and reports synchronization failure. This protocol preserves cooperating legacy appenders; unrelated editors that replace or truncate files without the locks remain outside it. A legacy writer's own un-fsynced write can still be lost to a machine crash before any repair observes it, just as under the old helper.
+
+Ordinary successful database commands, `init` and `watch` also reconcile stale output. Hooks reconcile even when an activity update is throttled. Commands that only inspect environment/platform configuration do not open the database and do not repair the document. `check` is the explicit non-repairing inspection path.
+
+**Commit and export are separate.** A synchronization failure reports `database commit succeeded; STATE.md is stale or synchronization failed` on stderr. It retains the database commit and does not treat an export error as a failed launch or roll back lifecycle state. The ordinary CLI exits 3 after lifecycle cleanup; hooks retain exit 0 and expose the diagnostic on stderr. SQLite snapshot failures use the same controlled diagnostic, with any open read transaction released before lifecycle work continues. After fixing the reported filesystem, ownership or database-read problem, run `rebuild`, then `check`. Inspect committed state before retrying the original mutation: it may already have succeeded despite the nonzero exit.
+
+## `config.json`
 
 ```json
 {
@@ -209,9 +246,9 @@ A pid reused by an unrelated process is therefore not alive: `stale` lists the t
 
 The plugin ships `hooks/hooks.json`, which runs `orch hook` on `SessionStart`, `PostToolUse`, `Stop`, `SubagentStop` and `SessionEnd` in **every** session where the plugin is enabled. `orch hook` reads the hook's JSON from stdin (`session_id`, `cwd`, `hook_event_name`, `source`, `reason`).
 
-It must never disturb a session: it always exits 0, prints nothing except on `SessionStart` for a matched ticket, catches every error, and returns at once when there is no `<project root>/.agents/orchestration/state.db` for `cwd`. It matches under a plain read and takes the write lock (`BEGIN IMMEDIATE`) only when it is about to write, re-checking the ticket under the lock.
+It always exits 0, prints a stdout context line only on `SessionStart` for a matched ticket, catches every error, and returns at once when there is no `<project root>/.agents/orchestration/state.db` for `cwd`. STATE.md synchronization failures remain visible on stderr, as described in [STATE.md synchronization](#statemd-synchronization). It matches under a plain read and takes the write lock (`BEGIN IMMEDIATE`) only when it is about to write, re-checking the ticket under the lock.
 
-**Matching.** The hook belongs to the non-retired ticket whose worktree (realpath) equals `cwd` or contains it. No match → do nothing, so the main orchestrator (in the project root or the main checkout) is never matched. A row whose worktree is a main checkout (its `.git` is a directory) never matches either. Then:
+**Matching.** The hook belongs to the non-retired ticket whose worktree (realpath) equals `cwd` or contains it. No match → leave ticket records unchanged, so the main orchestrator (in the project root or the main checkout) is never matched. A row whose worktree is a main checkout (its `.git` is a directory) never matches either. Then:
 
 - `SessionStart` on a `done` ticket writes and prints nothing.
 - `SessionStart` from a session id other than the recorded one takes the ticket over (logged as an `attach` event) only when the recorded session is not alive, or the hook's Claude process is the recorded pid (`/clear` starts a new session id in the same process). Otherwise it is ignored entirely and prints nothing, so a second session opened in the worktree cannot hijack a live ticket session.
@@ -304,7 +341,8 @@ Every command accepts `--json`, before or after the command name (one JSON objec
 
 | Command | Who | Effect |
 |---|---|---|
-| `orch init` | main | Create the directory and database. Safe to re-run. |
+| `orch init` | main | Create the directory and database, and synchronize STATE.md. Safe to re-run. |
+| `orch state-md check` / `orch state-md rebuild` | any | Inspect freshness without repair / publish committed records. See [STATE.md synchronization](#statemd-synchronization). |
 | `orch platform` | any | `{"platform": ...}` per "Platforms", and `harness`, `harness_source` per "Harnesses". |
 | `orch preflight` | main | Exit 0 and print `verify_env` (`ddev`, `docker` or `local-tests`), `base_branch` and `platform`. Exit 5 listing every failure. Checks: `BASE_BRANCH` set in the environment or `.orch` (an optional `export ` prefix is allowed; a quoted value is the text inside the quotes, an unquoted value ends at the first whitespace-then-`#` comment); verification environment is `local-tests` when `verify_policy` explicitly selects it, otherwise `ddev` when the main checkout has `.ddev/config.yaml` **and** `ddev` is on `PATH`, else `docker` when `config.json` has `verify_harness` **and** `docker` is on `PATH`, else failure; the platform's binary (`orca` or `herdr`) is on `PATH` when the platform needs one. |
 | `orch add <ticket> --title T [--url U]` | main | New ticket in `ready`. Exit 3 if it exists. Exit 2 unless the id matches `^[A-Za-z0-9][A-Za-z0-9._-]*$` with no `..` (it names files under `logs/` and `briefs/`). |
@@ -320,7 +358,7 @@ Every command accepts `--json`, before or after the command name (one JSON objec
 | `orch block <ticket> --reason R` | either | Phase `blocked`; remembers the prior phase. The reason is recorded in STATE.md. |
 | `orch unblock <ticket>` | either | Back to the remembered phase. Exit 3 if there is none. |
 | `orch ci <ticket> --sha S (--passed \| --failed)` | ticket | Records the CI verdict for that commit. Requires phase `ci`. |
-| `orch merged <ticket> --sha S [--mr URL]` | ticket | Requires phase `ci`. Exit 3 unless the latest CI verdict for exactly `S` is `passed`. Then phase `done`; STATE.md gets `completed: <mr>` with `--mr`, else `completed: commit <sha>`. |
+| `orch merged <ticket> --sha S [--mr URL]` | ticket | Requires phase `ci`. Exit 3 unless the latest CI verdict for exactly `S` is `passed`. Then phase `done`; the committed merge event retains the SHA and optional MR URL. |
 | `orch retire <ticket> [--force] [--keep-worktree]` | main | Requires `done` (or `--force`) and no launch in progress; holds the in-flight marker while it runs, so no `resume` launches meanwhile. Closes what the platform opened. `headless`: signals the session's process group (SIGTERM, SIGKILL after 3 s) when alive and leading its group. `orca`: `orca terminal close --worktree path:<worktree> --all --json`. `herdr`: `herdr workspace close <workspace>`. Platform close errors are reported but don't block retiring. After closing, a session still alive by the identity check is signalled. Then, unless `--keep-worktree`, removes the folder trust `orch` added for the worktree (the key, or the entry it created; a failure only warns) and removes the worktree, branch and DDEV project through the platform adapter (see [platforms.md](platforms.md)); a refusal there (uncommitted work without `--force`) leaves the ticket un-retired and exits 3. Then sets `retired_at`. `desktop`: prints `{"action": "desktop_archive", "ref": ...}` for the main orchestrator to archive the session. |
 | `orch watch [--interval S] [--once]` | any | Live table of non-retired tickets; see [platforms.md](platforms.md). |
 | `orch selftest [...]` | main | Lifecycle self-check; see [platforms.md](platforms.md). |
@@ -330,4 +368,4 @@ Every command accepts `--json`, before or after the command name (one JSON objec
 | `orch runs <ticket>` | any | The ticket's runs, oldest first. |
 | `orch smoke-routing [--model M]...` | main | Checks Claude's Agent tool really runs subagents on the requested model; see "Model routing". |
 
-Every state change appends an event: timestamp, ticket, kind, from phase, to phase, detail.
+Workflow events retain timestamp, ticket, kind, from phase, to phase and detail. Some updates, such as hook activity, have no event; the source revision still tracks them.
