@@ -198,6 +198,20 @@ class RetryTests(RoutingTestCase):
         self.refuse(source, r"legacy|provenance|context", "--model", "heavy",
                     "--effort", "high", "--reason", "cannot invent provenance")
 
+    def test_partial_provenance_refuses_even_explicit_decision(self):
+        source = self.repair()
+        for column, key in (("routing_context", "files"), ("dispatch", "model")):
+            with self.subTest(column=column):
+                partial = dict(source[column])
+                del partial[key]
+                self.db_exec("UPDATE runs SET " + column + "=? WHERE seq=?",
+                             (json.dumps(partial), source["seq"]))
+                self.refuse(source, r"provenance|context")
+                self.refuse(source, r"provenance|context", "--model", "heavy",
+                            "--effort", "high", "--reason", "cannot invent provenance")
+                self.db_exec("UPDATE runs SET " + column + "=? WHERE seq=?",
+                             (json.dumps(source[column]), source["seq"]))
+
     def test_unknown_history_and_invalid_repair_refuse(self):
         source = self.repair()
         for column in ("bounces", "ci_repairs"):

@@ -333,6 +333,23 @@ On Pi the machine config's `pi_models` (`${XDG_CONFIG_HOME:-~/.config}/orchestra
 
 **Runs.** `orch run` records each dispatch **before** it happens in the `runs` table: `seq`, `ticket`, `role`, `model_requested`, `tier`, `effort_requested`, `bounce_count` (the ticket's `bounces` at dispatch), `requested_at`, and, filled by the `SubagentStop` hook on Claude, `agent_id`, `model_resolved`, `effort_resolved`, `resolved_at`, `match` (1/0; null until resolved). `match = 0` is the loud failure: the subagent ran on another model or effort than asked. `orch runs` and `show` print `EFFORT` and `EFFORT_RESOLVED` columns.
 
+### Infrastructure retry
+
+When infrastructure prevents a recorded stage from completing, use `orch retry <ticket> --run <seq> --json`. This records a new attempt and one `retry` event without changing phase or consuming bounce/CI repair budget. Read the fresh output and dispatch from its `dispatch` object; it is already recorded, so do not call `route` or `run` again. Recomputing a route can lose the high effort of a recorded fix.
+
+Exact replay retains the source role, tier, model/provider, effort, harness and routing inputs. It checks current floors and requires unchanged phase/repair context and model mapping. Refusals exit 3 without changing tickets, runs or events. Blocked, done or retired tickets, unknown counters, missing legacy provenance and invalid repair history also refuse. Reconcile the reported problem before dispatch.
+
+A deliberate routing decision uses all three flags: `--model <tier-or-value> --effort <low|high> --reason <nonempty-text>`. Missing components exit 2. This permits an explicit model mapping or harness change, but still requires compatible phase/repair context and current floors. It records the reason and retains the old identity through the source link. This command does not classify failures or authorize bypassing a refused fix transition. A genuine review rejection enters `fix` and escalates normally; a new CI repair uses normal defaults/floors, not replayed effort.
+
+`run`, `retry` and `runs` JSON rows add:
+
+- `dispatch`: `role`, `harness`, `tier`, actual dispatch `model`, `effort`, plus Pi `thinking` or a Codex stage `agent`. Unlike `model_requested`, `dispatch.model` never contains a Codex agent name.
+- `routing_context`: `files`, `lines`, `ambiguous`, `phase`, `bounces`, `ci_repairs`, and `transition`, the latest phase event's `seq`, `from_phase`, `to_phase`, or null. The transition identifies the repair entry and prevents replay across separate visits to the same phase.
+- `retry_of`: immediate source run sequence, or null for ordinary runs. Follow these links to the original dispatch.
+- `retry_reason`: exact deliberate reason, or null for ordinary runs and exact replay.
+
+SQLite adds nullable TEXT columns with those names; dispatch/context are JSON text and `retry_of` is emitted as an integer. Legacy rows retain null provenance rather than inferred values. Each retry has a fresh sequence/time and null resolution fields; its source stays unchanged. Tabular output is unchanged.
+
 **Smoke test.** `orch smoke-routing [--model M]... [--effort E]` (`E` low or high, default `high`; default models `haiku` and `fable`; Claude only, other harnesses exit 3 "not supported") starts, per model, `claude -p --session-id <sid> --output-format stream-json --verbose <claude_args>` in the project root, asking it to dispatch a `general-purpose` subagent with that `model` and `effort`. After it exits (timeout 180 s) it reads `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<project key>/<sid>/subagents/agent-*.jsonl` (the key is the project root with every non-alphanumeric character replaced by `-`) and checks the last assistant entry's `message.model` is `claude-<alias>-…` and its top-level `effort` is the requested one. The transcript is the verdict, never the subagent's self-report. Prints `REQUESTED RESOLVED RESULT` rows (`haiku/high`, `claude-haiku-5-5/high`); exit 0 when all pass, 3 otherwise. `fable`, not `claude-fable-5-1`: the Agent tool accepts only the aliases `sonnet`, `opus`, `haiku`, `fable`.
 
 ## Commands
@@ -366,6 +383,7 @@ Every command accepts `--json`, before or after the command name (one JSON objec
 | `orch route <ticket> --role R [--files N] [--lines N] [--ambiguous]` | ticket | Read-only: the tier, effort and dispatch value for the ticket's harness ("Model routing"). Text: the model on the first line, then `tier:`, `effort:`, `thinking:` (Pi), `agent:` (Codex, stage roles) and a `why:` line per bump or floor applied. `--json`: `{"tier", "model", "effort", "thinking" (Pi), "agent" (Codex), "floors": [reasons]}`. Roles: `filer`, `investigation`, `test-writer`, `implementor`, `reviewer`, `verifier`, `reporter`; another exits 2. An implementor after a `frontier/high` bounce exits 3 (block for a human). |
 | `orch run <ticket> --role R --model M --effort E [--files N] [--lines N] [--ambiguous]` | ticket | Records the dispatch in `runs` before it happens, and a `run` event; prints the run's `seq` (`--json`: the row). `M` is the harness's dispatch value (Claude alias, Codex or Pi model) or a tier name (recorded as that tier's dispatch value); on Codex also the per-rung agent name (`implementor-heavy-high`, which implies its tier and must agree with `E`), and a bare `gpt-6-astra` (heavy and frontier share it) is `heavy`. An unknown value exits 2. `E` is `low` or `high`, required (else exit 2); the run records `effort_requested`. A rung below what `orch route` gives for the same flags exits 3 with the reason. The pipeline passes `route`'s `tier`, since a shared model (Pi heavy/frontier, Codex roles without an agent) would be read as the lower tier. |
 | `orch runs <ticket>` | any | The ticket's runs, oldest first. |
+| `orch retry <ticket> --run SEQ [--model M --effort E --reason TEXT]` | ticket | Records a linked attempt; prints its sequence, or the dispatch-ready run row with `--json`. See "Infrastructure retry". |
 | `orch smoke-routing [--model M]...` | main | Checks Claude's Agent tool really runs subagents on the requested model; see "Model routing". |
 
 Workflow events retain timestamp, ticket, kind, from phase, to phase and detail. Some updates, such as hook activity, have no event; the source revision still tracks them.

@@ -111,7 +111,8 @@ NEW_COLUMNS = (
     ("worktree_branch", "TEXT"),
 )
 # Columns added to `runs` after the first release (effort rungs).
-NEW_RUN_COLUMNS = ("effort_requested", "effort_resolved", "completed_at", "completion_evidence")
+NEW_RUN_COLUMNS = ("effort_requested", "effort_resolved", "completed_at", "completion_evidence",
+                   "dispatch", "routing_context", "retry_of", "retry_reason")
 # Model routing (orch-cli.md "Model routing"). Tiers in order; each role's
 # default tier; per-harness dispatch values (heavy and frontier share a model
 # on Codex and Pi). Two effort rungs per tier; a rung is tier * 2 + effort.
@@ -3134,8 +3135,94 @@ def cmd_events(args, db, sdir):
 
 # ---- model routing ---------------------------------------------------------
 
+def run_dict(row):
+    result = dict(row)
+    for key in ("dispatch", "routing_context"):
+        result[key] = json.loads(result[key]) if result[key] is not None else None
+    if result["retry_of"] is not None:
+        result["retry_of"] = int(result["retry_of"])
+    return result
+
+
+def routing_context(db, row, inputs):
+    # The transition identity distinguishes separate visits to a phase, including
+    # CI repairs which do not increment bounces. Block/unblock is not a repair.
+    event = db.execute(
+        "SELECT seq, from_phase, to_phase FROM events WHERE ticket=? AND kind='phase'"
+        " ORDER BY seq DESC LIMIT 1", (row["id"],)).fetchone()
+    return dict(inputs, phase=row["phase"], bounces=row["bounces"],
+                ci_repairs=row["ci_repairs"],
+                transition=dict(event) if event else None)
+
+
+def record_run(db, row, role, tier, value, effort, selected, context,
+               retry_of=None, retry_reason=None):
+    seq = db.execute(
+        "INSERT INTO runs (ticket, role, model_requested, tier, bounce_count,"
+        " requested_at, effort_requested, dispatch, routing_context, retry_of, retry_reason)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (row["id"], role, value, tier, row["bounces"], now(), effort,
+         json.dumps(selected), json.dumps(context), retry_of, retry_reason)).lastrowid
+    log_event(db, row["id"], "retry" if retry_of is not None else "run",
+              row["phase"], row["phase"],
+              "role=%s model=%s tier=%s effort=%s%s" % (
+                  role, value, tier, effort,
+                  " retry_of=%s reason=%s" % (retry_of, retry_reason) if retry_of is not None else ""))
+    return run_dict(db.execute("SELECT * FROM runs WHERE seq=?", (seq,)).fetchone())
+
+
+def cmd_retry(args, db, sdir):
+    explicit = any(v is not None for v in (args.model, args.effort, args.reason))
+    if explicit and not (args.model and args.effort and args.reason and args.reason.strip()):
+        raise Refusal(EXIT_USAGE, "a deliberate retry needs --model, --effort and a nonempty --reason")
+    row = get_ticket(db, args.ticket)
+    if row["retired_at"] is not None:
+        raise Refusal(EXIT_GATE, "cannot retry a retired ticket")
+    if row["phase"] in ("done", "blocked"):
+        raise Refusal(EXIT_GATE, "cannot retry a %s ticket" % row["phase"])
+    source = db.execute("SELECT * FROM runs WHERE seq=? AND ticket=?",
+                        (args.run, args.ticket)).fetchone()
+    if source is None:
+        raise Refusal(EXIT_GATE, "run %s not found for ticket %s" % (args.run, args.ticket))
+    source = run_dict(source)
+    context, selected = source["routing_context"], source["dispatch"]
+    if (not isinstance(context, dict)
+            or not {"files", "lines", "ambiguous", "phase", "bounces", "ci_repairs", "transition"} <= context.keys()
+            or not isinstance(selected, dict)
+            or not {"role", "harness", "tier", "model", "effort"} <= selected.keys()):
+        raise Refusal(EXIT_GATE, "legacy run lacks retry provenance; reconcile before dispatch")
+    if row["bounces"] is None or row["ci_repairs"] is None:
+        raise Refusal(EXIT_GATE, "unknown bounce or CI repair history; reconcile before retry")
+    inputs = {key: context[key] for key in ("files", "lines", "ambiguous")}
+    current = routing_context(db, row, inputs)
+    if current != context:
+        raise Refusal(EXIT_GATE, "retry phase/repair context changed; use a fresh stage decision")
+    transition = current["transition"]
+    if row["phase"] == "fix" and (not transition or transition["to_phase"] != "fix"
+                                      or transition["from_phase"] not in ("review", "verify", "ci")):
+        raise Refusal(EXIT_GATE, "invalid repair provenance; reconcile before retry")
+    role, harness = source["role"], row_harness(row)
+    if explicit:
+        tier, value, implied = tier_of(harness, role, args.model)
+        effort = args.effort
+        if tier is None or (implied and implied != effort):
+            raise Refusal(EXIT_USAGE, "unknown model or conflicting model/effort for retry")
+        selected = dict(dispatch(harness, role, tier, effort), role=role, harness=harness)
+    else:
+        tier, value, effort = source["tier"], source["model_requested"], source["effort_requested"]
+        if selected != dict(dispatch(harness, role, tier, effort), role=role, harness=harness):
+            raise Refusal(EXIT_GATE, "retry model mapping or harness changed; select --model and --effort with --reason")
+    need, need_effort, reasons = route_tier(db, row, role, **inputs)
+    if rung(tier, effort) < rung(need, need_effort):
+        raise Refusal(EXIT_GATE, "retry is below the current %s/%s floor: %s"
+                      % (need, need_effort, "; ".join(reasons)))
+    result = record_run(db, row, role, tier, value, effort, selected, current,
+                        source["seq"], args.reason if explicit else None)
+    emit(args, result, str(result["seq"]))
+
+
 def ticket_runs(db, tid):
-    return [dict(r) for r in db.execute("SELECT * FROM runs WHERE ticket=? ORDER BY seq",
+    return [run_dict(r) for r in db.execute("SELECT * FROM runs WHERE ticket=? ORDER BY seq",
                                         (tid,))]
 
 
@@ -3324,16 +3411,11 @@ def cmd_run(args, db, sdir):
             args.model, args.effort, tier, args.effort, need, need_effort,
             args.role, args.ticket,
             (": " + "; ".join(reasons)) if reasons else " (the role's default)"))
-    seq = db.execute(
-        "INSERT INTO runs (ticket, role, model_requested, tier, bounce_count,"
-        " requested_at, effort_requested) VALUES (?,?,?,?,?,?,?)",
-        (args.ticket, args.role, value, tier, row["bounces"], now(),
-         args.effort)).lastrowid
-    log_event(db, args.ticket, "run", row["phase"], row["phase"],
-              "role=%s model=%s tier=%s effort=%s" % (args.role, value, tier,
-                                                     args.effort))
-    r = dict(db.execute("SELECT * FROM runs WHERE seq=?", (seq,)).fetchone())
-    emit(args, r, str(seq))
+    selected = dict(dispatch(harness, args.role, tier, args.effort),
+                    role=args.role, harness=harness)
+    r = record_run(db, row, args.role, tier, value, args.effort, selected,
+                   routing_context(db, row, size_args(args)))
+    emit(args, r, str(r["seq"]))
 
 
 def cmd_runs(args, db, sdir):
@@ -4560,6 +4642,7 @@ def build_parser():
         "retire": "retire a ticket's worktree", "events": "show a ticket's events",
         "route": "pick a model for a role", "run": "record a subagent run",
         "runs": "list a ticket's subagent runs", "smoke-routing": "smoke-test model routing",
+        "retry": "replay a recorded stage dispatch",
         "watch": "watch ticket state", "selftest": "run the end-to-end self test",
     }
 
@@ -4659,6 +4742,11 @@ def build_parser():
         sp.add_argument("--files", type=int)
         sp.add_argument("--lines", type=int)
         sp.add_argument("--ambiguous", action="store_true")
+    sp = add("retry", cmd_retry, "ticket")
+    sp.add_argument("--run", required=True, type=int)
+    sp.add_argument("--model")
+    sp.add_argument("--effort", choices=EFFORTS)
+    sp.add_argument("--reason")
     add("runs", cmd_runs, "ticket")
     sp = add("smoke-routing", cmd_smoke_routing)
     sp.add_argument("--model", action="append", dest="models")
