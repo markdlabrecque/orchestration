@@ -112,36 +112,33 @@ main_repo="$MAIN_CHECKOUT"
 # Never stand inside the worktree being removed.
 cd "$ORCH_ROOT" || exit 1
 
-# Locate the worktree by asking git: <id> must be the directory name of a
-# linked worktree of THIS repo, wherever it lives on disk. The first entry
-# in `git worktree list` is the main checkout and is never a candidate.
-worktree=""
-first=1
-while IFS= read -r line; do
-  case "$line" in
-    "worktree "*)
-      wt_path="${line#worktree }"
-      if [ "$first" -eq 1 ]; then
-        first=0
-      elif [ "$(basename "$wt_path")" = "$id" ]; then
-        worktree="$wt_path"
-        break
-      fi
-      ;;
-  esac
-done < <(git -C "$main_repo" worktree list --porcelain 2>/dev/null)
-
-if [ -z "$worktree" ]; then
-  echo "retire-worktree: no worktree named '$id' in this repo (see git worktree list)." >&2
-  exit 1
+# Persist exact git identity before adapters can destroy anything. The record
+# survives checkout removal, including interruption before branch deletion.
+progress="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)/scripts/retirement-progress.py"
+# On Linux, the inherited lock also covers an engine whose orch parent died.
+# Keep it in git metadata, not in the directory being removed.
+if command -v flock >/dev/null 2>&1; then
+  common="$(git -C "$main_repo" rev-parse --git-common-dir)" || exit 4
+  case "$common" in /*) ;; *) common="$main_repo/$common" ;; esac
+  mkdir -p "$common/orch-retirement" || exit 4
+  exec 9>"$common/orch-retirement/$id.lock" || exit 4
+  flock -n 9 || { echo "retire-worktree: teardown already running for $id; retry later." >&2; exit 4; }
 fi
-
+identity="$(python3 "$progress" prepare "$main_repo" "$id" "${ORCH_RETIRE_PATH:-}")" || exit $?
+mapfile -t identity_lines <<< "$identity"
+worktree="${identity_lines[0]}"
+branch="${identity_lines[1]}"
+stage="${identity_lines[2]}"
+finish_git() {
+  local flags=()
+  if [ "$force" -eq 1 ]; then flags+=(--force); fi
+  python3 "$progress" finish "$main_repo" "$id" "$worktree" "${flags[@]}"
+}
 if [ ! -e "$worktree" ]; then
-  echo "retire-worktree: $worktree does not exist." >&2
-  exit 1
+  if [ "$ddev_only" -ne 1 ]; then finish_git || exit $?; fi
+  echo "retire-worktree: recovered teardown of $worktree."
+  exit 0
 fi
-
-branch="$(git -C "$worktree" symbolic-ref --quiet --short HEAD 2>/dev/null)" || branch=""
 
 # --- Resolve the optional project retire hook -------------------------------
 #
@@ -247,7 +244,7 @@ run_own_teardown() {
   # carrying that name (copied config, hand edit) must never delete it.
   if [ "$ddev_project" = "$PROJECT_NAME" ]; then
     echo "retire-worktree: $worktree is registered as '$ddev_project', the main checkout's DDEV project; refusing to delete it." >&2
-    ddev_project="$ddev_project (kept: main checkout's project)"
+    return 4
   elif command -v ddev >/dev/null 2>&1; then
     if [ -d "$worktree/.ddev" ]; then
       if ( cd "$worktree" && ddev delete -yO ) >/dev/null 2>&1; then
@@ -259,24 +256,33 @@ run_own_teardown() {
     else
       echo "retire-worktree: no .ddev directory in $worktree, skipping DDEV delete."
     fi
+  elif [ -d "$worktree/.ddev" ]; then
+    echo "retire-worktree: ddev not on PATH for $worktree; install DDEV or repair PATH and retry." >&2
+    return 4
   else
-    echo "retire-worktree: ddev not on PATH, skipping DDEV delete."
+    echo "retire-worktree: no .ddev directory, skipping DDEV delete."
   fi
 }
 
-if [ -n "$retire_hook" ]; then
+if [ "$stage" = ready ]; then
+  ddev_project="(previously removed)"
+elif [ -n "$retire_hook" ]; then
   echo "retire-worktree: delegating DDEV teardown to $retire_hook."
   ( cd "$worktree" && RETIRE_WORKTREE_IN_HOOK=1 "$retire_hook" )
   hook_rc=$?
   if [ "$hook_rc" -eq 0 ]; then
     ddev_project="(handled by $retire_hook)"
-  else
-    echo "retire-worktree: retire hook $retire_hook did not handle teardown (exit $hook_rc); running the engine's own DDEV step." >&2
+  elif [ "$hook_rc" -eq 3 ]; then
+    echo "retire-worktree: delegate shim $retire_hook; running the engine's own DDEV step." >&2
     run_own_teardown || exit $?
+  else
+    echo "retire-worktree: retire hook $retire_hook failed (exit $hook_rc); repair it and retry." >&2
+    exit 4
   fi
 else
   run_own_teardown || exit $?
 fi
+python3 "$progress" ready "$main_repo" "$id" "$worktree" || exit $?
 
 if [ "$ddev_only" -eq 1 ]; then
   echo "retire-worktree: --ddev-only: left the worktree and branch in place."
@@ -286,9 +292,7 @@ if [ "$ddev_only" -eq 1 ]; then
 fi
 
 # --- Step 5: remove the worktree and branch, from the main checkout --------
-remove_flags=()
-if [ "$force" -eq 1 ]; then remove_flags+=(--force); fi
-if ! git -C "$main_repo" worktree remove "${remove_flags[@]}" "$worktree"; then
+if ! finish_git; then
   echo "retire-worktree: git worktree remove failed for $worktree; branch left untouched." >&2
   if [ "$defer_own_close" -eq 1 ]; then
     echo "retire-worktree: herdr workspace $workspace_id (the caller's own) was left open — its close was deferred until after teardown, which did not complete. Fix the removal failure above, then re-run retire-worktree.sh to finish the teardown and close it." >&2
@@ -296,14 +300,7 @@ if ! git -C "$main_repo" worktree remove "${remove_flags[@]}" "$worktree"; then
   exit 4
 fi
 
-if [ -n "$branch" ] && git -C "$main_repo" show-ref --quiet --verify "refs/heads/$branch"; then
-  git -C "$main_repo" branch -D "$branch" || exit 4
-  branch_report="$branch (deleted)"
-elif [ -n "$branch" ]; then
-  branch_report="$branch (no local branch to delete)"
-else
-  branch_report="none (detached worktree)"
-fi
+branch_report="${branch:-none (detached worktree)} (removed or already absent)"
 
 # --- Step 6: final report ----------------------------------------------------
 echo "retire-worktree: done."

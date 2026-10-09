@@ -9,6 +9,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+# Explicit opt-in, before harness version checks. Ordinary reinstall never
+# enables or changes cleanup units.
+if [ "${1:-}" = cleanup ]; then
+  shift
+  exec python3 "$ROOT/scripts/cleanup-units" "$@"
+fi
 MARKET=orchestration
 PLUGIN="orchestration@$MARKET"
 # Earlier installs of this plugin from other marketplaces; removed so only

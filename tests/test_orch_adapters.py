@@ -1379,8 +1379,25 @@ class LaunchMarkerTests(AdapterTestCase):
         self.assertIsNone(self.marker("t1"))
         self.wait_dead("t1")
         self.set_marker("t1", age_s=3600)
-        self.ok("resume", "t1")
-        self.assertIsNone(self.marker("t1"))
+        marker = self.marker("t1")
+        self.assertIn("launch in progress", self.refused(3, "resume", "t1").stderr)
+        self.assertEqual(self.marker("t1"), marker)
+
+    def test_old_live_marker_refuses_spawn_and_retire(self):
+        self.dead_ticket()
+        self.set_marker("t1", age_s=3600)
+        marker = self.marker("t1")
+        self.assertIn("launch in progress", self.refused(3, "retire", "t1", "--force").stderr)
+        self.assertEqual(self.marker("t1"), marker)
+        self.assertTrue(os.path.isdir(self.show("t1")["worktree"]))
+        self.assertFalse(self.show("t1")["retired"])
+        self.add("t2")
+        self.set_marker("t2", age_s=3600)
+        marker = self.marker("t2")
+        self.assertIn("launch in progress", self.refused(
+            3, "spawn", "t2", "--brief-file", self.brief).stderr)
+        self.assertEqual(self.marker("t2"), marker)
+        self.assertEqual(self.log("create"), [])
 
     def background(self, *args):
         p = subprocess.Popen([ORCH] + list(args), cwd=self.repo, env=self.env,

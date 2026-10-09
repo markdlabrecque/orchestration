@@ -1640,15 +1640,22 @@ def run_engine(kind, main, args, cwd, extra_env=None):
     try:
         p = subprocess.Popen(argv + args, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, errors="replace")
+                             text=True, errors="replace", start_new_session=True)
     except OSError as e:
         return 127, "%s: %s" % (argv[0], e)
-    tail = collections.deque(maxlen=12)
-    for line in p.stdout:
-        sys.stderr.write(line)
-        tail.append(line.rstrip("\n"))
-    p.wait()
-    return p.returncode, "\n".join(tail)
+    try:
+        output, _ = p.communicate(timeout=300)
+    except (subprocess.TimeoutExpired, KeyboardInterrupt) as e:
+        # Do not leave a hook/adapter deleting resources after releasing the
+        # retirement claim. All engine descendants share this process group.
+        os.killpg(p.pid, signal.SIGKILL)
+        output, _ = p.communicate()
+        sys.stderr.write(output)
+        if isinstance(e, KeyboardInterrupt):
+            raise
+        return 124, "worktree engine timed out after 300 seconds"
+    sys.stderr.write(output)
+    return p.returncode, "\n".join(output.splitlines()[-12:])
 
 
 def worktree_name(tid):
@@ -1756,15 +1763,24 @@ def orca_selector(path, wref):
 def remove_worktree(platform, tid, worktree, wref, force):
     """Delete the ticket's DDEV project, checkout and branch. Refuses (exit 3)
     when the engine refuses, e.g. uncommitted work without `force`."""
-    if not worktree or not os.path.isdir(worktree):
+    if not worktree:
         return
     main = main_checkout()
+    if force and not os.path.exists(worktree):
+        # Historical manual --force can acknowledge an externally removed
+        # checkout, but must not bypass known interrupted engine obligations.
+        common = subprocess.run(["git", "-C", main, "rev-parse", "--git-common-dir"],
+                                capture_output=True, text=True, timeout=30, check=True).stdout.strip()
+        progress = os.path.join(main, common, "orch-retirement", os.path.basename(worktree) + ".json")
+        if not os.path.exists(progress) and worktree not in git_worktrees(main):
+            return
     args = [os.path.basename(worktree)]
     if platform == "orca":
         args.append("--ddev-only")  # Orca removes the checkout and branch itself
     if force:
         args.append("--force")
-    rc, tail = run_engine("retire", main, args, main, {"ORCH_RETIRE_MANAGED": "1"})
+    rc, tail = run_engine("retire", main, args, main,
+                          {"ORCH_RETIRE_MANAGED": "1", "ORCH_RETIRE_PATH": worktree})
     if rc != 0:
         raise Refusal(EXIT_GATE, "cannot remove the worktree of %s (%s): retire-worktree"
                       " exited %d: %s" % (tid, worktree, rc, tail))
@@ -1773,8 +1789,28 @@ def remove_worktree(platform, tid, worktree, wref, force):
             call_tool("orca", ["worktree", "rm", "--worktree", orca_selector(worktree, wref)]
                       + (["--force"] if force else []) + ["--json"], timeout=120)
         except ToolError as e:
-            raise Refusal(EXIT_GATE, "cannot remove the worktree of %s (%s): %s"
-                          % (tid, worktree, e))
+            try:
+                reply = call_tool_json("orca", ["worktree", "list", "--json"])
+                entries = (reply.get("result") or {}).get("worktrees")
+                absent = isinstance(entries, list) and all(
+                    isinstance(entry, dict) and entry.get("path") and
+                    os.path.realpath(entry["path"]) != worktree for entry in entries)
+            except ToolError:
+                absent = False
+            if not absent:
+                raise Refusal(EXIT_GATE, "cannot remove the worktree of %s (%s): %s"
+                              % (tid, worktree, e))
+        if os.path.lexists(worktree):
+            raise Refusal(EXIT_GATE, "Orca reported removal but worktree still exists: %s" % worktree)
+        common = subprocess.run(["git", "-C", main, "rev-parse", "--git-common-dir"],
+                                capture_output=True, text=True, timeout=30, check=True).stdout.strip()
+        progress = os.path.join(main, common, "orch-retirement", os.path.basename(worktree) + ".json")
+        if os.path.isfile(progress):
+            p = subprocess.run([sys.executable, os.path.join(PLUGIN_ROOT, "scripts", "retirement-progress.py"),
+                                "finish", main, os.path.basename(worktree), worktree],
+                               capture_output=True, text=True, timeout=120)
+            if p.returncode:
+                raise Refusal(EXIT_GATE, p.stderr.strip())
 
 
 def row_worktree_ref(row):
@@ -1936,6 +1972,22 @@ def platform_close(platform, ref, worktree):
     try:
         call_tool(platform, args)
     except ToolError as e:
+        # A prior close may have succeeded just before orch died. Confirm
+        # absence by listing, rather than treating any close error as success.
+        try:
+            if platform == "herdr":
+                reply = call_tool_json(platform, ["workspace", "list"])
+                workspaces = (reply.get("result") or {}).get("workspaces")
+                if isinstance(workspaces, list) and all(isinstance(w, dict) and w.get("workspace_id") for w in workspaces):
+                    if not any(w["workspace_id"] == ref["workspace"] for w in workspaces):
+                        return True, None
+            elif platform == "orca":
+                reply = call_tool_json(platform, ["terminal", "list", "--worktree", "path:" + worktree, "--json"])
+                terminals = (reply.get("result") or {}).get("terminals")
+                if isinstance(terminals, list) and not terminals:
+                    return True, None
+        except ToolError:
+            pass
         return True, str(e)
     return True, None
 
@@ -3081,6 +3133,12 @@ def retire_ticket(db, sdir, tid, force, keep_worktree=False, automatic=False):
         if automatic and row_platform(row) == "desktop":
             raise Refusal(EXIT_GATE, "Desktop archival needs a session tool; run orch retire %s"
                           " manually and execute its desktop_archive action" % tid)
+        if not force and row["worktree"]:
+            path = os.path.realpath(row["worktree"])
+            for other in db.execute("SELECT id, worktree FROM tickets WHERE id<>? AND retired_at IS NULL AND worktree IS NOT NULL", (tid,)):
+                other_path = os.path.realpath(other["worktree"])
+                if os.path.commonpath([path, other_path]) in (path, other_path):
+                    raise Refusal(EXIT_GATE, "%s overlaps worktree of unretired ticket %s; resolve ownership before retirement" % (path, other["id"]))
         # No resume may launch while the session is being closed and removed.
         marker = claim_launch(db, row, "retire")
     try:
@@ -3102,6 +3160,12 @@ def retire_claimed(db, tid, row, force, keep_worktree, marker):
                               % (platform, tid, err))
             print("orch: warning: could not close the %s session of %s: %s"
                   % (platform, tid, err), file=sys.stderr)
+        if not err and platform != "desktop":
+            with transaction(db):
+                cur = get_ticket(db, tid)
+                if cur["launching"] != marker:
+                    raise Refusal(EXIT_GATE, "%s changed retirement owner while closing session" % tid)
+                db.execute("UPDATE tickets SET launch_ref=NULL WHERE id=?", (tid,))
         kill_session(row, bare_ok=True)
     if not keep_worktree:
         # The worktree goes, so does the trust orch gave it.
@@ -3177,7 +3241,9 @@ def cleanup_notice(sdir, ticket, message):
         try:
             with open(path) as f:
                 sent = json.load(f)
-        except FileNotFoundError:
+        except (FileNotFoundError, ValueError):
+            sent = {}
+        if not isinstance(sent, dict):
             sent = {}
         if message is None:
             sent.pop(ticket, None)
@@ -3230,11 +3296,20 @@ def cmd_reconcile(args):
                             outcome.update(outcome="attention", reason=str(e))
                     message = " ".join("{project}: ticket {ticket}, worktree {worktree}: {reason}".format(**outcome).split())
                     print(message, file=sys.stderr)
-                    cleanup_notice(sdir, tid, message if outcome["outcome"] == "attention" else None)
+                    if outcome["outcome"] != "deferred":
+                        try:
+                            cleanup_notice(sdir, tid, message if outcome["outcome"] == "attention" else None)
+                        except OSError as e:
+                            print("%s: notification delivery failed: %s" % (message, e), file=sys.stderr)
                     outcomes.append(outcome)
         except (Refusal, OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as e:
             outcome = dict(project=root, ticket=None, worktree=None, outcome="attention", reason=str(e))
-            print("%s: project cleanup needs attention: %s" % (root, e), file=sys.stderr)
+            message = "%s: project cleanup needs attention: %s" % (root, e)
+            print(message, file=sys.stderr)
+            try:
+                cleanup_notice(sdir, "__project__", message)
+            except OSError as notice_error:
+                print("%s: notification delivery failed: %s" % (root, notice_error), file=sys.stderr)
             outcomes.append(outcome)
         finally:
             if db is not None:
