@@ -65,6 +65,43 @@ class RetryHookTests(PlatformTestCase):
         self.assertEqual(rows[0], source)
         self.assert_completed(replay, rows[1], "retry-agent", "claude-opus-5-5")
 
+    def check_repeated_source_refused(self, *extra):
+        source = self.dispatch()
+        first = self.retry(source)
+
+        def snapshot():
+            with sqlite3.connect(self.db_path()) as db:
+                return {table: db.execute("SELECT * FROM " + table + " ORDER BY seq").fetchall()
+                        for table in ("tickets", "runs", "events", "ci_results")}
+
+        def refuse(old, latest):
+            before = snapshot()
+            result = self.refused(3, "retry", "t1", "--run", str(old["seq"]), *extra)
+            self.assertEqual(snapshot(), before, "superseded refusal must be atomic")
+            self.assertIn("superseded", result.stderr.lower())
+            self.assertIn("orch retry t1 --run %s" % latest["seq"], result.stderr)
+
+        refuse(source, first)
+        latest = self.retry(first, *extra)
+        self.assertEqual(latest["retry_of"], first["seq"])
+        refuse(source, latest)
+        refuse(first, latest)
+        model = "claude-opus-5-5" if extra else "claude-sonnet-5-5"
+        self.observe("latest-agent", model)
+        rows = self.runs()
+        self.assertEqual(rows[:2], [source, first])
+        self.assert_completed(latest, rows[2], "latest-agent", model)
+        refuse(source, latest)
+        self.observe("latest-agent", model)
+        self.assertEqual(self.runs(), rows)
+
+    def test_exact_repeated_source_refuses_and_points_to_latest_attempt(self):
+        self.check_repeated_source_refused()
+
+    def test_deliberate_repeated_source_refuses_and_points_to_latest_attempt(self):
+        self.check_repeated_source_refused(
+            "--model", "heavy", "--effort", "high", "--reason", "approved replacement")
+
     def test_retry_chain_completion_never_falls_back_to_unlaunched_ancestors(self):
         source = self.dispatch()
         first = self.retry(source)

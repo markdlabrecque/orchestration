@@ -3201,6 +3201,18 @@ def cmd_retry(args, db, sdir):
     if row["phase"] == "fix" and (not transition or transition["to_phase"] != "fix"
                                       or transition["from_phase"] not in ("review", "verify", "ci")):
         raise Refusal(EXIT_GATE, "invalid repair provenance; reconcile before retry")
+    # The command's write transaction serializes this check with insertion, so
+    # two callers cannot create sibling attempts from the same source.
+    latest = db.execute(
+        "WITH RECURSIVE attempts(seq) AS ("
+        " SELECT seq FROM runs WHERE retry_of=? AND ticket=?"
+        " UNION SELECT r.seq FROM runs r JOIN attempts a ON r.retry_of=a.seq"
+        " WHERE r.ticket=?) SELECT MAX(seq) FROM attempts",
+        (source["seq"], args.ticket, args.ticket)).fetchone()[0]
+    if latest is not None:
+        raise Refusal(EXIT_GATE, "run %s is superseded; latest attempt is %s;"
+                      " if another retry is needed, use orch retry %s --run %s"
+                      % (source["seq"], latest, args.ticket, latest))
     role, harness = source["role"], row_harness(row)
     if explicit:
         tier, value, implied = tier_of(harness, role, args.model)
