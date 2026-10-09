@@ -18,6 +18,7 @@ FAULT_CLI = r'''
 import os, runpy, sqlite3, sys, time
 mode, target, script, *args = sys.argv[1:]
 original_replace = os.replace
+original_link = os.link
 original_connect = sqlite3.connect
 original_fdopen = os.fdopen
 original_fsync = os.fsync
@@ -48,7 +49,16 @@ def flock(fd, operation):
     return original_flock(fd, operation)
 
 class Connection(sqlite3.Connection):
+    snapshot_active = False
     def execute(self, sql, *args, **kwargs):
+        if sql.startswith('SELECT revision FROM state_md_revision'):
+            self.snapshot_active = True
+            if mode == 'snapshot-db-failure':
+                raise sqlite3.OperationalError('injected snapshot database failure')
+        if sql == 'COMMIT' and self.snapshot_active and mode == 'snapshot-commit-failure':
+            raise sqlite3.OperationalError('injected snapshot commit failure')
+        if sql in ('COMMIT', 'ROLLBACK'):
+            self.snapshot_active = False
         result = super().execute(sql, *args, **kwargs)
         if mode == 'commit-death' and sql.strip().upper() == 'COMMIT':
             row = super().execute("SELECT title FROM tickets WHERE id='T-1'").fetchone()
@@ -62,6 +72,8 @@ def connect(*args, **kwargs):
 
 def replace(src, dst, *args, **kwargs):
     if os.path.abspath(os.fspath(dst)) == target:
+        if mode == 'before-replace-death':
+            os._exit(77)
         if mode == 'replace-failure':
             raise PermissionError('injected STATE.md replacement failure')
         if mode == 'delayed-replace':
@@ -77,8 +89,16 @@ def replace(src, dst, *args, **kwargs):
             os._exit(78)
         return result
     return original_replace(src, dst, *args, **kwargs)
+def link(src, dst, *args, **kwargs):
+    if mode == 'retention-link-failure':
+        raise OSError('injected legacy hard-link failure')
+    result = original_link(src, dst, *args, **kwargs)
+    if mode == 'retention-link-death':
+        os._exit(76)
+    return result
 sqlite3.connect = connect
 os.replace = replace
+os.link = link
 os.fdopen = fdopen
 os.fsync = fsync
 __import__('fcntl').flock = flock
@@ -137,6 +157,156 @@ class StateMdContractTests(OrchTestCase):
                                str(self.path), ORCH, *args], cwd=self.repo,
                               env=self.env, input=payload, capture_output=True,
                               text=True, timeout=30)
+
+    def test_old_open_descriptor_tail_survives_replacement_and_later_repair(self):
+        self.add('T-1')
+        # This is the old protocol, deliberately not the current append helper.
+        with self.path.open('a+b') as old:
+            old_inode = os.fstat(old.fileno()).st_ino
+            process = self.start_fault('delayed-replace', 'block', 'T-1', '--reason', 'race')
+            self.wait_marker('.paused', process)
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(old, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            Path(str(self.path) + '.release').touch()
+            _, err = process.communicate(timeout=20)
+            self.assertEqual(process.returncode, 0, err)
+            self.assertNotEqual(self.path.stat().st_ino, old_inode)
+            for index, repair in enumerate((self.rebuild, lambda: self.ok('list'))):
+                tail = ('- legacy-only delayed line %s\n' % index).encode()
+                fcntl.flock(old, fcntl.LOCK_EX)
+                old.write(tail)
+                old.flush()
+                fcntl.flock(old, fcntl.LOCK_UN)
+                self.stale()
+                repair()
+                self.assertIn(tail.strip(), self.md())
+                self.fresh()
+                before = self.md()
+                self.assertEqual(self.rebuild(), before)
+            old.seek(0)
+            self.assertIn(b'legacy-only delayed line 0', old.read())
+
+    def test_old_appender_waiting_on_inode_lock_survives_migration(self):
+        legacy = b'# Irreplaceable legacy document\n'
+        self.path.write_bytes(legacy)
+        with self.path.open('a+b') as old:
+            fcntl.flock(old, fcntl.LOCK_EX)
+            process = self.start_fault('waiting-lock', 'add', 'T-1', '--title', 'migration')
+            self.wait_marker('.waiting', process)
+            old.write(b'- legacy before replacement\n')
+            old.flush()
+            fcntl.flock(old, fcntl.LOCK_UN)
+            _, err = process.communicate(timeout=20)
+            self.assertEqual(process.returncode, 0, err)
+            fcntl.flock(old, fcntl.LOCK_EX)
+            old.write(b'- legacy after replacement\n')
+            old.flush()
+            fcntl.flock(old, fcntl.LOCK_UN)
+        self.stale()
+        text = self.rebuild()
+        self.assertTrue(text.startswith(legacy + b'- legacy before replacement\n'))
+        self.assertIn(b'- legacy after replacement', text)
+
+    def test_retained_inode_crash_windows_do_not_lose_or_duplicate_tails(self):
+        self.add('T-1')
+        for mode, code in (('retention-link-death', 76), ('before-replace-death', 77), ('replace-death', 78)):
+            with self.subTest(mode=mode), self.path.open('a+b') as old:
+                process = self.fault(mode, 'add', mode, '--title', mode)
+                self.assertEqual(process.returncode, code, process.stderr)
+                tail = ('- retained crash tail %s\n' % mode).encode()
+                fcntl.flock(old, fcntl.LOCK_EX)
+                old.write(tail)
+                old.flush()
+                fcntl.flock(old, fcntl.LOCK_UN)
+                self.stale()
+                text = self.rebuild()
+                self.assertEqual(text.count(tail.strip()), 1)
+                self.assertEqual(self.rebuild(), text)
+
+    def test_retention_failure_refuses_replacement_and_preserves_old_descriptor(self):
+        self.add('T-1')
+        before = self.md()
+        with self.path.open('a+b') as old:
+            process = self.fault('retention-link-failure', 'block', 'T-1', '--reason', 'retention failed')
+            self.assertEqual(process.returncode, 3, process.stderr)
+            self.assertIn('database commit succeeded', process.stderr)
+            self.assertEqual(self.md(), before)
+            self.assertEqual(self.path.stat().st_ino, os.fstat(old.fileno()).st_ino)
+            old.write(b'- legacy after retention failure\n')
+            old.flush()
+        self.stale()
+        self.assertIn(b'- legacy after retention failure', self.rebuild())
+
+    def test_snapshot_commit_failure_releases_read_transaction_for_lifecycle(self):
+        self.add('T-1')
+        self.env['ORCH_CLAUDE_BIN'] = self.fake_claude(0)
+        process = self.fault('snapshot-commit-failure', 'spawn', 'T-1', '--worktree',
+                             self.worktree, '--brief-file', self.brief)
+        self.assertEqual(process.returncode, 3, process.stderr)
+        self.assertIn('database commit succeeded', process.stderr)
+        self.assertNotIn('Traceback', process.stderr)
+        self.assertEqual(self.db_exec("SELECT phase,launching FROM tickets WHERE id='T-1'"),
+                         [('dispatched', None)])
+        self.wait_calls(1)
+        self.stale()
+        self.rebuild()
+
+    def test_snapshot_database_failure_is_controlled_after_commit(self):
+        process = self.fault('snapshot-db-failure', 'add', 'T-1', '--title', 'db failure committed')
+        self.assertEqual(process.returncode, 3, process.stderr)
+        self.assertNotIn('Traceback', process.stderr)
+        self.assertIn('database commit succeeded', process.stderr)
+        self.assertIn('STATE.md is stale', process.stderr)
+        self.assertEqual(self.db_exec("SELECT title FROM tickets WHERE id='T-1'")[0][0], 'db failure committed')
+        self.stale()
+        self.rebuild()
+        process = self.fault('snapshot-db-failure', 'state-md', 'check', '--json')
+        self.assertEqual(process.returncode, 3, process.stderr)
+        self.assertEqual(json.loads(process.stdout), {'fresh': False})
+        self.assertNotIn('Traceback', process.stderr)
+
+    def test_snapshot_database_failure_hook_reports_and_keeps_exit_zero(self):
+        payload = self.hook_fixture()
+        process = self.fault('snapshot-db-failure', 'hook', payload=payload)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertIn('database commit succeeded', process.stderr)
+        self.assertIn('STATE.md is stale', process.stderr)
+        self.assertNotIn('Traceback', process.stderr)
+        self.assertEqual(self.db_exec("SELECT activity FROM tickets WHERE id='T-1'")[0][0], 'idle')
+        self.stale()
+        self.rebuild()
+
+    def test_snapshot_database_failure_does_not_compensate_spawn_or_resume(self):
+        self.add('T-1')
+        self.env['ORCH_CLAUDE_BIN'] = self.fake_claude(0)
+        for args in (('spawn', 'T-1', '--worktree', self.worktree, '--brief-file', self.brief),
+                     ('resume', 'T-1')):
+            with self.subTest(command=args[0]):
+                process = self.fault('snapshot-db-failure', *args)
+                self.assertEqual(process.returncode, 3, process.stderr)
+                self.assertNotIn('Traceback', process.stderr)
+                self.assertIn('database commit succeeded', process.stderr)
+                phase, marker = self.db_exec("SELECT phase,launching FROM tickets WHERE id='T-1'")[0]
+                self.assertEqual(phase, 'dispatched')
+                self.assertIsNone(marker)
+                self.wait_dead('T-1')
+                self.rebuild()
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_compact_recorded_snapshot_and_history_keep_detailed_rows(self):
+        self.add('T-1', 'Readable | title <tag>')
+        self.db_exec("UPDATE tickets SET attempt=7,activity='idle',last_seen_at='2001-01-01T00:00:00+00:00' WHERE id='T-1'")
+        self.ok('block', 'T-1', '--reason', 'readable blocker')
+        text = self.rebuild().decode()
+        compact = text.split('### Detailed records')[0]
+        self.assertIn('### Recorded tickets', compact)
+        self.assertIn('| T-1 | Readable &#124; title &lt;tag&gt; | blocked | blocked | 7 | no | idle | 2001-01-01T00:00:00+00:00 |', compact)
+        self.assertIn('### Recorded activity', compact)
+        self.assertLess(compact.index('| add |'), compact.index('| block |'))
+        self.assertIn('readable blocker', compact)
+        self.assertIn('"attempt": 7', text.split('### Detailed records')[1])
+        for inferred in ('health', 'alive', 'subtask'):
+            self.assertNotIn(inferred, compact)
 
     def test_baseline_internal_commit_publishes_recorded_evidence(self):
         self.write_orch('BASE_BRANCH=main\n')

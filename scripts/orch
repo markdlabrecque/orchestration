@@ -683,7 +683,16 @@ def state_md_root():
         return root
 
 
-def state_md_snapshot(db):
+def state_md_cell(value):
+    """A single Markdown table cell, with no stored text claiming ownership."""
+    if value is None:
+        return ""
+    return (str(value).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace("|", "&#124;")
+            .replace("\r", "&#13;").replace("\n", "<br>"))
+
+
+def state_md_snapshot(db, legacy=()):
     """One committed read snapshot. No health probes or inferred activity."""
     db.execute("BEGIN")
     try:
@@ -698,12 +707,41 @@ def state_md_snapshot(db):
             ticket["status"] = PHASE_STATUS.get(ticket["phase"], ticket["phase"])
             ticket["retired"] = ticket["retired_at"] is not None
         watermark = max((r["seq"] for r in records["events"]), default=0)
-    finally:
         db.execute("COMMIT")
+    except BaseException:
+        # A failed read/export must not leave a transaction around for the next
+        # lifecycle commit, nor turn a successful launch into compensation.
+        if db.in_transaction:
+            with contextlib.suppress(sqlite3.Error):
+                db.execute("ROLLBACK")
+        raise
     lines = [STATE_BEGIN.decode(), "## Committed workflow", "",
-             "Source revision: %s; event watermark: %s" % (revision, watermark)]
+             "Source revision: %s; event watermark: %s" % (revision, watermark),
+             "", "### Recorded tickets", "",
+             "| Ticket | Title | Phase | Status | Attempt | Retired | Activity | Observed at |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for row in records["tickets"]:
+        values = [row[key] for key in ("id", "title", "phase", "status", "attempt")]
+        values += ["yes" if row["retired"] else "no", row["activity"], row["last_seen_at"]]
+        lines.append("| " + " | ".join(map(state_md_cell, values)) + " |")
+    lines.extend(["", "### Recorded activity", "",
+                  "| Sequence | Recorded at | Ticket | Event | From | To | Detail |",
+                  "| --- | --- | --- | --- | --- | --- | --- |"])
+    for row in records["events"]:
+        lines.append("| " + " | ".join(state_md_cell(row[key]) for key in
+                     ("seq", "ts", "ticket", "kind", "from_phase", "to_phase", "detail")) + " |")
+    if legacy:
+        lines.extend(["", "### Retained legacy appends", "",
+                      "Late writes to replaced files, retained verbatim in `.STATE.md.legacy/`."])
+        for name, tail in legacy:
+            # JSON strings keep arbitrary bytes reversible via surrogateescape;
+            # escaping angle brackets prevents legacy text claiming ownership.
+            lines.extend(["", "#### " + name, "", "```json",
+                          json.dumps(tail.decode("utf-8", "surrogateescape"), ensure_ascii=True)
+                          .replace("<", "\\u003c").replace(">", "\\u003e"), "```"])
+    lines.extend(["", "### Detailed records"])
     for table, rows in records.items():
-        lines.extend(["", "### " + table, "", "```json",
+        lines.extend(["", "#### " + table, "", "```json",
                       json.dumps(rows, ensure_ascii=True, indent=2, sort_keys=True)
                       .replace("<", "\\u003c").replace(">", "\\u003e"), "```"])
     lines.append(STATE_END.decode())
@@ -735,6 +773,79 @@ def state_md_parts(data):
     return start, end
 
 
+def state_md_fsync_directory(path):
+    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def state_md_legacy(root, current_file):
+    """Read tails from every superseded inode. No cursor/ack crash window.
+
+    A retained filename is device-inode-original_length. The original length
+    was read under the old appenders' inode flock, before replacement. Links
+    stay forever: an old process may still hold any of these file descriptors.
+    A link to the CURRENT inode is an interrupted preparation, not a late tail;
+    its bytes are already in the current document and its baseline is reset on
+    the next replacement. Never infer that an old writer has finished.
+    """
+    directory = os.path.join(root, ".STATE.md.legacy")
+    identity = None
+    if current_file is not None:
+        stat = os.fstat(current_file.fileno())
+        identity = (stat.st_dev, stat.st_ino)
+    try:
+        names = sorted(os.listdir(directory))
+    except FileNotFoundError:
+        return []
+    tails = []
+    for name in names:
+        if not re.fullmatch(r"\d+-\d+-\d+", name):
+            raise ValueError("unexpected legacy retention entry: " + name)
+        device, inode, length = map(int, name.split("-"))
+        with open(os.path.join(directory, name), "rb") as retained:
+            stat = os.fstat(retained.fileno())
+            if (stat.st_dev, stat.st_ino) != (device, inode):
+                raise ValueError("legacy retention inode changed: " + name)
+            if (device, inode) == identity:
+                continue
+            fcntl.flock(retained, fcntl.LOCK_SH)
+            if os.fstat(retained.fileno()).st_size < length:
+                raise ValueError("legacy retention file truncated: " + name)
+            retained.seek(length)
+            tail = retained.read()
+            if tail:
+                # Old helpers flush but do not fsync. Persist observed tails
+                # before acknowledging their projection in a durable new file.
+                os.fsync(retained.fileno())
+                tails.append((name, tail))
+    return tails
+
+
+def state_md_retain(root, path, current_file, length):
+    """Durably link the locked old inode BEFORE replacing its last public name."""
+    directory = os.path.join(root, ".STATE.md.legacy")
+    os.makedirs(directory, exist_ok=True)
+    stat = os.fstat(current_file.fileno())
+    prefix = "%s-%s-" % (stat.st_dev, stat.st_ino)
+    name = prefix + str(length)
+    previous = [entry for entry in os.listdir(directory) if entry.startswith(prefix)]
+    if len(previous) > 1:
+        raise ValueError("ambiguous legacy retention baseline")
+    if previous:
+        # A crash before replace can leave the current inode linked. Its later
+        # appends are already outside managed ownership in the current file.
+        if previous[0] != name:
+            os.rename(os.path.join(directory, previous[0]), os.path.join(directory, name))
+    else:
+        os.link(path, os.path.join(directory, name))
+    os.fsync(current_file.fileno())
+    state_md_fsync_directory(directory)
+    state_md_fsync_directory(root)
+
+
 def state_md_sync(db, check=False):
     """Lock before snapshot and notes read; never hold a DB write lock here.
 
@@ -746,14 +857,20 @@ def state_md_sync(db, check=False):
     path = os.path.join(root, "STATE.md")
     temporary = None
     try:
-        with open(os.path.join(root, ".STATE.md.lock"), "a+b") as lock:
+        with contextlib.ExitStack() as stack:
+            lock = stack.enter_context(open(os.path.join(root, ".STATE.md.lock"), "a+b"))
             fcntl.flock(lock, fcntl.LOCK_EX)
-            expected = state_md_snapshot(db)
+            current_file = None
             try:
-                with open(path, "rb") as f:
-                    current = f.read()
+                current_file = stack.enter_context(open(path, "rb"))
+                # Old processes lock this inode, not the stable publisher lock.
+                # Hold it through durable retention and replacement. A writer
+                # that already opened it can safely append after we release it.
+                fcntl.flock(current_file, fcntl.LOCK_EX)
+                current = current_file.read()
             except FileNotFoundError:
                 current = b""
+            expected = state_md_snapshot(db, state_md_legacy(root, current_file))
             parts = state_md_parts(current)
             fresh = parts is not None and current[parts[0]:parts[1]] == expected
             if check or fresh:
@@ -771,15 +888,13 @@ def state_md_sync(db, check=False):
                     raise OSError("short STATE.md write")
                 f.flush()
                 os.fsync(f.fileno())
+            if current_file is not None:
+                state_md_retain(root, path, current_file, len(current))
             os.replace(temporary, path)
             temporary = None
-            directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            state_md_fsync_directory(root)
             return True
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, sqlite3.Error) as e:
         if check:
             return False
         raise Refusal(EXIT_GATE, "database commit succeeded; STATE.md is stale or synchronization failed: %s" % e) from e

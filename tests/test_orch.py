@@ -1142,8 +1142,10 @@ class StateMdTests(OrchTestCase):
         self.add("T-1")
         self.assertTrue(os.path.exists(self.state_md), "committed add must publish")
         self.spawn("T-1", sleep=0)
+        self.assertEqual(self.show("T-1")["attempt"], 1)
         self.wait_dead("T-1")
         self.ok("resume", "T-1")
+        self.assertEqual(self.show("T-1")["attempt"], 2)
         self.wait_dead("T-1")
         self.ok("block", "T-1", "--reason", "needs input")
         self.ok("unblock", "T-1")
@@ -1155,6 +1157,24 @@ class StateMdTests(OrchTestCase):
         text = self.md()
         for evidence in ("T-1", "needs input", "https://example.com/mr/9", "done"):
             self.assertIn(evidence, text)
+        # Assert the exported records, not only DB events: the prior append-log
+        # test guarded pickup -> resume attempt 2 -> block -> completion order.
+        events = json.loads(re.search(r"#### events\n\n```json\n(.*?)\n```", text, re.S).group(1))
+        lifecycle = [event for event in events if event["kind"] in
+                     ("spawn", "resume", "block", "unblock", "merged")]
+        self.assertEqual([event["kind"] for event in lifecycle],
+                         ["spawn", "resume", "block", "unblock", "merged"])
+        self.assertEqual([(event["from_phase"], event["to_phase"]) for event in lifecycle[:4]],
+                         [("ready", "dispatched"), ("dispatched", "dispatched"),
+                          ("dispatched", "blocked"), ("blocked", "dispatched")])
+        self.assertIn("attempt=2", lifecycle[1]["detail"])
+        self.assertEqual([event["seq"] for event in events],
+                         sorted(event["seq"] for event in events))
+        compact = text.split("### Detailed records")[0]
+        positions = [compact.index("| %s |" % kind) for kind in
+                     ("spawn", "resume", "block", "unblock", "merged")]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("attempt=2", compact)
         self.ok("state-md", "check")
 
     def test_merged_without_mr_logs_sha(self):
