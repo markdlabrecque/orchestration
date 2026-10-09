@@ -13,6 +13,10 @@ import sys
 import tempfile
 
 
+class IdentityRefusal(RuntimeError):
+    """Invalid initial target, rather than a failed teardown operation."""
+
+
 def git(main, *args, absent=False):
     p = subprocess.run(['git', '-C', main, *args], capture_output=True, text=True,
                        timeout=30)
@@ -75,7 +79,7 @@ def run(action, main, tid, expected, force=False):
         path = record['path']
         row = None
     else:
-        raise RuntimeError('no registered worktree or recovery identity for %s' % (expected or tid))
+        raise IdentityRefusal('no registered worktree or recovery identity for %s' % (expected or tid))
     if path == main or path == os.path.realpath(rows[0]['worktree']):
         raise RuntimeError('refusing to remove main checkout %s' % path)
     if expected and path != os.path.realpath(expected):
@@ -84,7 +88,7 @@ def run(action, main, tid, expected, force=False):
         raise RuntimeError('newline in worktree path is unsupported')
     exists = os.path.lexists(path)
     if exists and (not row or os.path.islink(path)):
-        raise RuntimeError('unregistered or symlink worktree %s; refusing' % path)
+        raise IdentityRefusal('unregistered or symlink worktree %s; refusing' % path)
     if record and (record['main'] != main or record['path'] != path):
         raise RuntimeError('saved retirement identity differs for %s' % path)
     if action == 'prepare' and exists:
@@ -92,6 +96,8 @@ def run(action, main, tid, expected, force=False):
         head = git(path, 'rev-parse', 'HEAD')
         if record and record['stage'] != 'complete' and (record['branch'] != branch or record['head'] != head):
             raise RuntimeError('branch/HEAD changed during retirement of %s; inspect saved identity %s' % (path, journal))
+        if record and record['stage'] == 'complete' and record.get('workspace'):
+            raise RuntimeError('new checkout at %s while workspace %s still needs closure; recover it first' % (path, record['workspace']))
         if not record or record['stage'] == 'complete':
             record = dict(main=main, path=path, branch=branch, head=head, stage='prepared')
             save(journal, record)
@@ -101,6 +107,15 @@ def run(action, main, tid, expected, force=False):
         print(path)
         print(record['branch'].removeprefix('refs/heads/'))
         print(record['stage'])
+        print(record.get('workspace', ''))
+        return
+    if action == 'workspace':
+        record['workspace'] = os.environ['ORCH_RETIRE_WORKSPACE']
+        save(journal, record)
+        return
+    if action == 'closed':
+        record.pop('workspace', None)
+        save(journal, record)
         return
     if action == 'ready':
         record['stage'] = 'ready'
@@ -139,4 +154,4 @@ if __name__ == '__main__':
         run(*sys.argv[1:5], force='--force' in sys.argv[5:])
     except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
         print('retire-worktree: %s' % e, file=sys.stderr)
-        sys.exit(4)
+        sys.exit(1 if isinstance(e, IdentityRefusal) else 4)

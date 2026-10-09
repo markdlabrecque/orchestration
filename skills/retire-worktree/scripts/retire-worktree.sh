@@ -10,10 +10,9 @@ set -uo pipefail
 # Retire a finished worktree: close its Herdr workspace, delete its DDEV
 # project (or hand that to a project's RETIRE_HOOK, if one resolves), remove
 # the worktree, and delete its local branch. The Herdr close is the engine's
-# own best-effort step and always runs (outside --ddev-only), hook or not, so
-# a manual retire never leaves a Herdr tab pointing at a deleted folder.
-# `orch` closes a ticket's Herdr workspace itself before calling this engine;
-# the engine then finds no workspace and says so, which is harmless.
+# own step (outside --ddev-only), hook or not. Failures leave teardown pending.
+# `orch` closes a ticket's platform itself and sets ORCH_RETIRE_MANAGED=1
+# to skip the engine's Herdr step.
 #
 # Usage: retire-worktree.sh <id> [--force] [--ddev-only]
 #
@@ -24,12 +23,13 @@ set -uo pipefail
 # --force skips the uncommitted-work check (step 2) and lets git discard it
 # anyway.
 #
-# --ddev-only skips the Herdr step (step 3) entirely -- it never calls
-# herdr -- runs steps 1, 2 and 4 (worktree lookup, retire-hook resolution,
+# --ddev-only skips Herdr discovery, runs steps 1, 2 and 4 (worktree lookup,
+# retire-hook resolution,
 # the uncommitted-work check, then the DDEV delete or the retire hook) and
 # stops with exit 0, leaving the worktree checkout and its branch in place
 # for the caller's platform to remove (e.g. `orca worktree rm`). Combinable
 # with --force; without it a dirty worktree still refuses with exit 2.
+# Saved workspace obligations from earlier direct calls must still close.
 #
 # Every step below is destructive and none of it is recoverable outside git's
 # own reflog, so the order matters.
@@ -47,7 +47,7 @@ set -uo pipefail
 # REPLACES this engine's own DDEV-delete step (step 4) only. The Herdr
 # close (step 3) runs before it from the engine itself either way, and the
 # git-level teardown (step 5: `git worktree remove` plus the branch delete)
-# always runs from the engine itself, since only it has the main checkout's
+# runs only after adapter success, since only the engine has the main checkout's
 # context once the worktree directory is gone. A project with no retire hook
 # anywhere is not required to have one -- the engine's own step 4 runs.
 #
@@ -55,14 +55,15 @@ set -uo pipefail
 # $HERDR_WORKSPACE_ID (the agent is retiring the worktree it is running
 # in), closing it in step 3 would kill the agent's own pane -- and this
 # script with it -- before steps 4-6 ever run. In that case the close is
-# deferred to the very last action in the script, after the step 6 report;
-# steps 4 (ddev), 5 (git worktree remove + branch delete) and 6 run first.
+# deferred until steps 4 (ddev) and 5 (git worktree + branch removal) finish.
+# Step 6 reports success only after the deferred close succeeds.
 # A different or unset $HERDR_WORKSPACE_ID closes in step 3 as before. The
-# deferred close is best-effort, same as the undeferred one.
+# deferred workspace identity is saved outside the checkout for retry. A
+# failed close exits 4, even when git teardown has already succeeded.
 #
 # Exit codes: 1 = usage/refusal (bad args, missing/escaping path), 2 = dirty
 # worktree without --force, 3 = re-entered from its own retire hook (see
-# below), 4 = the git worktree removal itself failed.
+# below), 4 = incomplete adapter, hook, recovery or git teardown.
 #
 # Re-entry guard: the conventional <worktree>/scripts/retire-worktree.sh hook
 # is frequently a thin delegate shim that execs straight back into this
@@ -71,11 +72,9 @@ set -uo pipefail
 # sees that variable already set, it knows it has been re-entered from its
 # own hook rather than invoked directly, refuses immediately (exit 3), and
 # touches nothing. The OUTER invocation captures the hook's exit code: 0
-# means the hook genuinely handled step 4 (DDEV delete); any nonzero exit
-# (including 3, from a delegate shim) means it did not, so the engine warns
-# on stderr (naming the hook and its exit code) and falls through to run its
-# own step 4, and the final report names the real DDEV project rather than
-# "(handled by ...)".
+# means the hook handled step 4 (DDEV delete). Exit 3 identifies a delegate
+# shim and runs the engine's own step 4. Other nonzero exits refuse teardown;
+# repair the hook and retry. Hook edits are ordinary uncommitted work.
 
 if [ "${RETIRE_WORKTREE_IN_HOOK-}" = "1" ]; then
   echo "retire-worktree: re-entered from its own retire hook (the hook is a delegate shim back to this engine); refusing." >&2
@@ -129,12 +128,32 @@ mapfile -t identity_lines <<< "$identity"
 worktree="${identity_lines[0]}"
 branch="${identity_lines[1]}"
 stage="${identity_lines[2]}"
+saved_workspace="${identity_lines[3]:-}"
+workspace_absent() {
+  local target="$1" worktrees workspaces
+  worktrees="$(herdr worktree list 2>/dev/null)" || return 1
+  workspaces="$(herdr workspace list 2>/dev/null)" || return 1
+  printf '%s' "$worktrees" | jq -e --arg id "$target" \
+    '(.result.worktrees | type == "array") and ([.result.worktrees[] | select(.open_workspace_id == $id)] | length == 0)' >/dev/null 2>&1 || return 1
+  printf '%s' "$workspaces" | jq -e --arg id "$target" \
+    '(.result.workspaces | type == "array") and ([.result.workspaces[] | select(.workspace_id == $id)] | length == 0)' >/dev/null 2>&1
+}
+close_workspace() {
+  local target="$1"
+  if ! command -v herdr >/dev/null 2>&1 || { ! herdr workspace close "$target" >/dev/null 2>&1 && ! workspace_absent "$target"; }; then
+    echo "retire-worktree: failed to close herdr workspace $target for $worktree; repair Herdr and re-run retire-worktree.sh $id." >&2
+    return 4
+  fi
+  python3 "$progress" closed "$main_repo" "$id" "$worktree" || return $?
+  echo "retire-worktree: herdr workspace $target closed."
+}
 finish_git() {
   local flags=()
   if [ "$force" -eq 1 ]; then flags+=(--force); fi
   python3 "$progress" finish "$main_repo" "$id" "$worktree" "${flags[@]}"
 }
 if [ ! -e "$worktree" ]; then
+  if [ -n "$saved_workspace" ]; then close_workspace "$saved_workspace" || exit $?; fi
   if [ "$ddev_only" -ne 1 ]; then finish_git || exit $?; fi
   echo "retire-worktree: recovered teardown of $worktree."
   exit 0
@@ -180,42 +199,61 @@ echo "retire-worktree: retiring $id at $worktree."
 
 # --- Step 3: close the Herdr workspace, BEFORE the DDEV step / retire hook
 #     and BEFORE the worktree is removed. Always the engine's own job (a
-#     retire hook does not replace it); skipped entirely under --ddev-only.
+#     retire hook does not replace it); discovery skipped under --ddev-only.
 #     UNLESS the resolved workspace is the caller's own (workspace_id ==
 #     $HERDR_WORKSPACE_ID, non-empty): closing it here would kill the
 #     agent's own pane -- and this script with it -- before steps 4-6 ever
 #     run. In that case defer_own_close is set and the actual close is
-#     pushed to the very last action in the script, after step 6. ----------
-workspace_id=""
+#     pushed after git teardown, before the success report. ---------------
+workspace_id="$saved_workspace"
 defer_own_close=0
+# A previous direct call may have left a workspace obligation. A different
+# invocation mode must not erase it when handing deletion to its adapter.
+if [ -n "$saved_workspace" ] && { [ "$ddev_only" -eq 1 ] || [ "${ORCH_RETIRE_MANAGED:-0}" = 1 ]; }; then
+  close_workspace "$saved_workspace" || exit $?
+fi
 if [ "$ddev_only" -ne 1 ] && [ "${ORCH_RETIRE_MANAGED:-0}" != 1 ]; then
   if command -v herdr >/dev/null 2>&1; then
-    wt_json="$(herdr worktree list 2>/dev/null)" || wt_json=""
-    if [ -n "$wt_json" ]; then
+    wt_json="$(herdr worktree list 2>/dev/null)" || {
+      echo "retire-worktree: cannot inspect Herdr worktrees for $worktree; repair Herdr and retry." >&2
+      exit 4
+    }
+    if ! printf '%s' "$wt_json" | jq -e '.result.worktrees | type == "array"' >/dev/null 2>&1; then
+      echo "retire-worktree: invalid Herdr worktree response for $worktree; repair Herdr and retry." >&2
+      exit 4
+    fi
+    if [ -z "$workspace_id" ]; then
       workspace_id="$(printf '%s' "$wt_json" | jq -r --arg p "$worktree" \
-        '(.result.worktrees // [])[] | select(.path==$p) | .open_workspace_id' 2>/dev/null | sed -n '1p')"
+        '.result.worktrees[] | select(.path==$p) | .open_workspace_id // empty' 2>/dev/null | sed -n '1p')"
     fi
 
     if [ -z "${workspace_id:-}" ]; then
-      ws_json="$(herdr workspace list 2>/dev/null)" || ws_json=""
-      if [ -n "$ws_json" ]; then
-        workspace_id="$(printf '%s' "$ws_json" | jq -r --arg p "$worktree" \
-          '(.result.workspaces // [])[] | select(.worktree.checkout_path==$p) | .workspace_id' 2>/dev/null | sed -n '1p')"
+      ws_json="$(herdr workspace list 2>/dev/null)" || {
+        echo "retire-worktree: cannot inspect Herdr workspaces for $worktree; repair Herdr and retry." >&2
+        exit 4
+      }
+      if ! printf '%s' "$ws_json" | jq -e '.result.workspaces | type == "array"' >/dev/null 2>&1; then
+        echo "retire-worktree: invalid Herdr workspace response for $worktree; repair Herdr and retry." >&2
+        exit 4
       fi
+      workspace_id="$(printf '%s' "$ws_json" | jq -r --arg p "$worktree" \
+        '.result.workspaces[] | select(.worktree.checkout_path==$p) | .workspace_id // empty' 2>/dev/null | sed -n '1p')"
     fi
 
+    if [ -n "$workspace_id" ]; then
+      ORCH_RETIRE_WORKSPACE="$workspace_id" python3 "$progress" workspace "$main_repo" "$id" "$worktree" || exit $?
+    fi
     if [ -n "${workspace_id:-}" ] && [ -n "${HERDR_WORKSPACE_ID:-}" ] && [ "$workspace_id" = "${HERDR_WORKSPACE_ID:-}" ]; then
       defer_own_close=1
       echo "retire-worktree: $workspace_id is the caller's own workspace; deferring its close until after teardown (defer)."
     elif [ -n "${workspace_id:-}" ]; then
-      if herdr workspace close "$workspace_id" >/dev/null 2>&1; then
-        echo "retire-worktree: herdr workspace $workspace_id closed."
-      else
-        echo "retire-worktree: failed to close herdr workspace $workspace_id; continuing." >&2
-      fi
+      close_workspace "$workspace_id" || exit $?
     else
       echo "retire-worktree: no herdr workspace found for $worktree."
     fi
+  elif [ -n "$saved_workspace" ]; then
+    echo "retire-worktree: herdr not on PATH for pending workspace $saved_workspace at $worktree; repair PATH and retry." >&2
+    exit 4
   else
     echo "retire-worktree: herdr not on PATH, skipping workspace close."
   fi
@@ -223,9 +261,8 @@ fi
 
 # --- Step 4: delete the DDEV project, from inside the still-existing
 #     worktree. Factored into a function so it can run either as the
-#     engine's default behaviour, or as the fallback when a resolved retire
-#     hook did not actually handle it (nonzero exit, e.g. a delegate shim
-#     ignored via the re-entry guard above). Sets ddev_project. --------------
+#     engine's default behaviour, or for a delegate shim identified by exit
+#     3. Other hook failures refuse rather than fall back. Sets ddev_project. --
 run_own_teardown() {
   ddev_project=""
   if [ -f "$worktree/.ddev/config.local.yaml" ]; then
@@ -309,6 +346,11 @@ fi
 
 branch_report="${branch:-none (detached worktree)} (removed or already absent)"
 
+# --- Deferred step 3: identity survives checkout deletion for retry. ---------
+if [ "$defer_own_close" -eq 1 ]; then
+  close_workspace "$workspace_id" || exit $?
+fi
+
 # --- Step 6: final report ----------------------------------------------------
 echo "retire-worktree: done."
 if [ "$defer_own_close" -eq 1 ]; then
@@ -321,13 +363,3 @@ fi
 echo "retire-worktree:   DDEV project: $ddev_project"
 echo "retire-worktree:   path: $worktree"
 echo "retire-worktree:   branch: $branch_report"
-
-# --- Deferred step 3: close the caller's own Herdr workspace, now that
-#     everything else (ddev delete, git worktree remove, branch delete, the
-#     final report) has already run. Best-effort: a failure warns on
-#     stderr but must not change this script's own exit code. ---------------
-if [ "$defer_own_close" -eq 1 ]; then
-  if ! herdr workspace close "$workspace_id" >/dev/null 2>&1; then
-    echo "retire-worktree: failed to close herdr workspace $workspace_id (deferred close); continuing." >&2
-  fi
-fi
