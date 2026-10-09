@@ -1,5 +1,6 @@
 """Verification policy contracts through the real CLI and launch files."""
 
+import ast
 import json
 import os
 import shutil
@@ -154,6 +155,122 @@ class VerifyPolicyPromptTests(OrchTestCase):
         prompt = self.wait_calls(2)[1]["stdin"]
         self.assertTrue(prompt.startswith("/orchestration:orchestration Implement ticket. Brief body."))
         self.assertNotIn("local-tests", prompt)
+
+
+class VerifyPolicyUpgradeTests(OrchTestCase):
+    """Run a differently worded CLI against briefs retained by an older CLI."""
+
+    def setUp(self):
+        super().setUp()
+        self.init()
+
+    assert_policy_context = VerifyPolicyPromptTests.assert_policy_context
+
+    UPDATED_CONTEXT = (
+        "Verification environment: local-tests\n"
+        "Run required automated tests and keep complete passing evidence for review. "
+        "Exact-head CI remains required before merge. "
+        "After review, proceed directly to report. "
+        "Do not run a separate verify, browser or accessibility stage."
+    )
+
+    def upgraded_cli(self):
+        # Change only instructional wording, not recovery or policy logic.
+        source = read_file(fixtures.ORCH)
+        tree = ast.parse(source)
+        assignment = next(
+            node for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "LOCAL_TESTS_CONTEXT"
+                    for target in node.targets)
+        )
+        lines = source.splitlines(keepends=True)
+        lines[assignment.lineno - 1:assignment.end_lineno] = [
+            "LOCAL_TESTS_CONTEXT = " + repr(self.UPDATED_CONTEXT) + "\n"
+        ]
+        path = os.path.join(self.tmp, "orch-upgraded")
+        with open(path, "w") as f:
+            f.write("".join(lines))
+        os.chmod(path, 0o755)
+        return path
+
+    def recover_with_upgrade(self, continuable, legacy=False):
+        self.write_config({"verify_policy": "local-tests"})
+        self.add("T-upgrade")
+        self.spawn("T-upgrade", sleep=0, init=continuable)
+        self.wait_dead("T-upgrade")
+        if legacy:
+            # Model the stored row from #46, without adding a new launch marker.
+            stored = read_file(os.path.join(fixtures.HERE, "fixtures",
+                                           "verify-policy-46-brief.md"))
+            self.db_exec("UPDATE tickets SET brief=? WHERE id=?", (stored, "T-upgrade"))
+        else:
+            stored = self.db_exec("SELECT brief FROM tickets WHERE id=?", ("T-upgrade",))[0][0]
+            self.assertEqual(self.wait_calls(1)[0]["stdin"],
+                             read_file(os.path.join(self.state_dir, "briefs", "T-upgrade.md")))
+            self.assert_policy_context(stored)
+        self.write_config({"verify_policy": "auto"})
+        original = fixtures.ORCH
+        try:
+            fixtures.ORCH = self.upgraded_cli()
+            self.ok("resume", "T-upgrade", "--note", "Retain this recovery note")
+        finally:
+            fixtures.ORCH = original
+        call = self.wait_calls(2)[1]
+        self.assertEqual("--resume" in call["argv"], continuable)
+        prompt = read_file(os.path.join(self.state_dir, "briefs", "T-upgrade.resume.md"))
+        self.assertEqual(prompt, call["stdin"])
+        self.assertIn("Retain this recovery note", prompt)
+        if continuable:
+            self.assertIn(self.UPDATED_CONTEXT, prompt)
+        else:
+            self.assert_policy_context(prompt)
+            self.assertIn(stored, prompt)
+
+    def test_changed_instructions_continuable_recovery(self):
+        self.recover_with_upgrade(True)
+
+    def test_changed_instructions_fresh_recovery(self):
+        self.recover_with_upgrade(False)
+
+    def test_pre_marker_46_continuable_recovery(self):
+        self.recover_with_upgrade(True, legacy=True)
+
+    def test_pre_marker_46_fresh_recovery(self):
+        self.recover_with_upgrade(False, legacy=True)
+
+    def check_auto_upgrade(self, config, continuable):
+        self.write_config(config)
+        with open(self.brief, "w") as f:
+            f.write("Implement ticket. Discuss local-tests as an option, not a policy.\n"
+                    "Verification environment: local-tests is an example only.\n"
+                    "Independent review and exact-head CI are required before merge.")
+        self.add("T-auto")
+        self.spawn("T-auto", sleep=0, init=continuable)
+        self.wait_dead("T-auto")
+        self.write_config({"verify_policy": "local-tests"})
+        original = fixtures.ORCH
+        try:
+            fixtures.ORCH = self.upgraded_cli()
+            self.ok("resume", "T-auto")
+        finally:
+            fixtures.ORCH = original
+        call = self.wait_calls(2)[1]
+        self.assertEqual("--resume" in call["argv"], continuable)
+        self.assertNotIn(self.UPDATED_CONTEXT, call["stdin"])
+        self.assertNotIn("After review passes, go to report", call["stdin"])
+
+    def test_explicit_auto_not_upgraded_by_config_or_incidental_prose(self):
+        self.check_auto_upgrade({"verify_policy": "auto"}, True)
+
+    def test_explicit_auto_fresh_recovery_not_upgraded(self):
+        self.check_auto_upgrade({"verify_policy": "auto"}, False)
+
+    def test_implicit_auto_continuable_recovery_not_upgraded(self):
+        self.check_auto_upgrade({}, True)
+
+    def test_implicit_auto_not_upgraded_by_config_or_incidental_prose(self):
+        self.check_auto_upgrade({}, False)
 
 
 if __name__ == "__main__":
