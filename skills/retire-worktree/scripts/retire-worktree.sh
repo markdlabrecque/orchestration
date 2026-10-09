@@ -9,11 +9,11 @@ set -uo pipefail
 #
 # Retire a finished worktree: close its Herdr workspace, delete its DDEV
 # project (or hand that to a project's RETIRE_HOOK, if one resolves), remove
-# the worktree, and delete its local branch. The Herdr close is the engine's
-# own best-effort step and always runs (outside --ddev-only), hook or not, so
-# a manual retire never leaves a Herdr tab pointing at a deleted folder.
-# `orch` closes a ticket's Herdr workspace itself before calling this engine;
-# the engine then finds no workspace and says so, which is harmless.
+# the worktree, and retain its local branch for manual cleanup. The Herdr
+# close is the engine's own step (outside --ddev-only), hook or not.
+# Failures and remaining branches leave teardown pending.
+# `orch` closes a ticket's platform itself and sets ORCH_RETIRE_MANAGED=1
+# to skip the engine's Herdr step.
 #
 # Usage: retire-worktree.sh <id> [--force] [--ddev-only]
 #
@@ -21,15 +21,16 @@ set -uo pipefail
 # project root, including the worktree being retired. Flags may appear in
 # any order after <id>.
 #
-# --force skips the uncommitted-work check (step 2) and lets git discard it
-# anyway.
+# --force skips the uncommitted-work check (step 2) and lets git discard it.
+# It never authorizes deleting the retained branch.
 #
-# --ddev-only skips the Herdr step (step 3) entirely -- it never calls
-# herdr -- runs steps 1, 2 and 4 (worktree lookup, retire-hook resolution,
+# --ddev-only skips Herdr discovery, runs steps 1, 2 and 4 (worktree lookup,
+# retire-hook resolution,
 # the uncommitted-work check, then the DDEV delete or the retire hook) and
 # stops with exit 0, leaving the worktree checkout and its branch in place
-# for the caller's platform to remove (e.g. `orca worktree rm`). Combinable
-# with --force; without it a dirty worktree still refuses with exit 2.
+# as a partial teardown only, not permission to delete a retained branch.
+# Combinable with --force; without it a dirty worktree still refuses with exit 2.
+# Saved workspace obligations from earlier direct calls must still close.
 #
 # Every step below is destructive and none of it is recoverable outside git's
 # own reflog, so the order matters.
@@ -46,8 +47,8 @@ set -uo pipefail
 # set to the still-existing worktree, BEFORE the worktree is removed, and
 # REPLACES this engine's own DDEV-delete step (step 4) only. The Herdr
 # close (step 3) runs before it from the engine itself either way, and the
-# git-level teardown (step 5: `git worktree remove` plus the branch delete)
-# always runs from the engine itself, since only it has the main checkout's
+# git-level teardown (step 5: `git worktree remove` and branch absence check)
+# runs only after adapter success, since only the engine has the main checkout's
 # context once the worktree directory is gone. A project with no retire hook
 # anywhere is not required to have one -- the engine's own step 4 runs.
 #
@@ -55,14 +56,15 @@ set -uo pipefail
 # $HERDR_WORKSPACE_ID (the agent is retiring the worktree it is running
 # in), closing it in step 3 would kill the agent's own pane -- and this
 # script with it -- before steps 4-6 ever run. In that case the close is
-# deferred to the very last action in the script, after the step 6 report;
-# steps 4 (ddev), 5 (git worktree remove + branch delete) and 6 run first.
+# deferred until steps 4 (ddev) and 5 (checkout removal) finish.
+# Step 6 reports success only after the deferred close succeeds.
 # A different or unset $HERDR_WORKSPACE_ID closes in step 3 as before. The
-# deferred close is best-effort, same as the undeferred one.
+# deferred workspace identity is saved outside the checkout for retry. A
+# failed close exits 4, even when git teardown has already succeeded.
 #
 # Exit codes: 1 = usage/refusal (bad args, missing/escaping path), 2 = dirty
 # worktree without --force, 3 = re-entered from its own retire hook (see
-# below), 4 = the git worktree removal itself failed.
+# below), 4 = incomplete adapter, hook, recovery or git teardown.
 #
 # Re-entry guard: the conventional <worktree>/scripts/retire-worktree.sh hook
 # is frequently a thin delegate shim that execs straight back into this
@@ -71,11 +73,9 @@ set -uo pipefail
 # sees that variable already set, it knows it has been re-entered from its
 # own hook rather than invoked directly, refuses immediately (exit 3), and
 # touches nothing. The OUTER invocation captures the hook's exit code: 0
-# means the hook genuinely handled step 4 (DDEV delete); any nonzero exit
-# (including 3, from a delegate shim) means it did not, so the engine warns
-# on stderr (naming the hook and its exit code) and falls through to run its
-# own step 4, and the final report names the real DDEV project rather than
-# "(handled by ...)".
+# means the hook handled step 4 (DDEV delete). Exit 3 identifies a delegate
+# shim and runs the engine's own step 4. Other nonzero exits refuse teardown;
+# repair the hook and retry. Hook edits are ordinary uncommitted work.
 
 if [ "${RETIRE_WORKTREE_IN_HOOK-}" = "1" ]; then
   echo "retire-worktree: re-entered from its own retire hook (the hook is a delegate shim back to this engine); refusing." >&2
@@ -112,44 +112,60 @@ main_repo="$MAIN_CHECKOUT"
 # Never stand inside the worktree being removed.
 cd "$ORCH_ROOT" || exit 1
 
-# Locate the worktree by asking git: <id> must be the directory name of a
-# linked worktree of THIS repo, wherever it lives on disk. The first entry
-# in `git worktree list` is the main checkout and is never a candidate.
-worktree=""
-first=1
-while IFS= read -r line; do
-  case "$line" in
-    "worktree "*)
-      wt_path="${line#worktree }"
-      if [ "$first" -eq 1 ]; then
-        first=0
-      elif [ "$(basename "$wt_path")" = "$id" ]; then
-        worktree="$wt_path"
-        break
-      fi
-      ;;
-  esac
-done < <(git -C "$main_repo" worktree list --porcelain 2>/dev/null)
-
-if [ -z "$worktree" ]; then
-  echo "retire-worktree: no worktree named '$id' in this repo (see git worktree list)." >&2
-  exit 1
+# Persist exact git identity before adapters can destroy anything. The record
+# survives checkout removal and the wait for manual branch cleanup.
+progress="$(dirname "$ORCH_PROJECT_LIB")/retirement-progress.py"
+# On Linux, the inherited lock also covers an engine whose orch parent died.
+# Keep it in git metadata, not in the directory being removed.
+if command -v flock >/dev/null 2>&1; then
+  common="$(git -C "$main_repo" rev-parse --git-common-dir)" || exit 4
+  case "$common" in /*) ;; *) common="$main_repo/$common" ;; esac
+  mkdir -p "$common/orch-retirement" || exit 4
+  exec 9>"$common/orch-retirement/$id.lock" || exit 4
+  flock -n 9 || { echo "retire-worktree: teardown already running for $id; retry later." >&2; exit 4; }
 fi
-
+identity="$(python3 "$progress" prepare "$main_repo" "$id" "${ORCH_RETIRE_PATH:-}")" || exit $?
+mapfile -t identity_lines <<< "$identity"
+worktree="${identity_lines[0]}"
+branch="${identity_lines[1]}"
+stage="${identity_lines[2]}"
+saved_workspace="${identity_lines[3]:-}"
+workspace_absent() {
+  local target="$1" worktrees workspaces
+  worktrees="$(herdr worktree list 2>/dev/null)" || return 1
+  workspaces="$(herdr workspace list 2>/dev/null)" || return 1
+  printf '%s' "$worktrees" | python3 "$(dirname "$progress")/retirement_inventory.py" worktrees >/dev/null 2>&1 || return 1
+  printf '%s' "$workspaces" | python3 "$(dirname "$progress")/retirement_inventory.py" workspaces >/dev/null 2>&1 || return 1
+  printf '%s' "$worktrees" | jq -e --arg id "$target" \
+    '(.result.worktrees | type == "array") and ([.result.worktrees[] | select(.open_workspace_id == $id)] | length == 0)' >/dev/null 2>&1 || return 1
+  printf '%s' "$workspaces" | jq -e --arg id "$target" \
+    '(.result.workspaces | type == "array") and ([.result.workspaces[] | select(.workspace_id == $id)] | length == 0)' >/dev/null 2>&1
+}
+close_workspace() {
+  local target="$1"
+  if ! command -v herdr >/dev/null 2>&1 || { ! herdr workspace close "$target" >/dev/null 2>&1 && ! workspace_absent "$target"; }; then
+    echo "retire-worktree: failed to close herdr workspace $target for $worktree; repair Herdr and re-run retire-worktree.sh $id." >&2
+    return 4
+  fi
+  python3 "$progress" closed "$main_repo" "$id" "$worktree" || return $?
+  echo "retire-worktree: herdr workspace $target closed."
+}
+finish_git() {
+  local flags=()
+  if [ "$force" -eq 1 ]; then flags+=(--force); fi
+  ORCH_RETIRE_PROJECT="$ORCH_ROOT" python3 "$progress" finish "$main_repo" "$id" "$worktree" "${flags[@]}"
+}
 if [ ! -e "$worktree" ]; then
-  echo "retire-worktree: $worktree does not exist." >&2
-  exit 1
+  if [ -n "$saved_workspace" ]; then close_workspace "$saved_workspace" || exit $?; fi
+  if [ "$ddev_only" -ne 1 ]; then finish_git || exit $?; fi
+  echo "retire-worktree: recovered teardown of $worktree."
+  exit 0
 fi
-
-branch="$(git -C "$worktree" symbolic-ref --quiet --short HEAD 2>/dev/null)" || branch=""
 
 # --- Resolve the optional project retire hook -------------------------------
 #
-# Resolved BEFORE the dirty check: the conventional
-# <worktree>/scripts/retire-worktree.sh may itself be a freshly-added,
-# not-yet-committed file (e.g. a worktree being retired right after adding
-# the hook), and its own untracked presence must not be what makes the
-# worktree look dirty and block retirement.
+# Resolve before checking dirtiness, but preserve hook edits just like any
+# other tracked or untracked work.
 resolve_retire_hook() { # -> prints path, rc0 if found
   local val
   val="$(orch_get "$ORCH_ROOT" RETIRE_HOOK)"
@@ -176,14 +192,6 @@ else
   : "${dirty:=git status exited $status_failed with no output}"
 fi
 
-# The conventional hook, when it is the SOURCE of the resolved hook (not an
-# env/.orch override pointing outside the worktree), is engine plumbing, not
-# work-in-progress -- its own untracked/modified status must not block
-# retirement, the same way .ddev/config.local.yaml (gitignored) never does.
-if [ -n "$retire_hook" ] && [ "$retire_hook" = "$worktree/scripts/retire-worktree.sh" ]; then
-  dirty="$(printf '%s\n' "$dirty" | grep -vE '^.. scripts/retire-worktree\.sh$' || true)"
-fi
-
 if [ -n "$dirty" ] && [ "$force" -ne 1 ]; then
   echo "retire-worktree: $worktree has uncommitted work; refusing without --force:" >&2
   printf '%s\n' "$dirty" >&2
@@ -194,42 +202,61 @@ echo "retire-worktree: retiring $id at $worktree."
 
 # --- Step 3: close the Herdr workspace, BEFORE the DDEV step / retire hook
 #     and BEFORE the worktree is removed. Always the engine's own job (a
-#     retire hook does not replace it); skipped entirely under --ddev-only.
+#     retire hook does not replace it); discovery skipped under --ddev-only.
 #     UNLESS the resolved workspace is the caller's own (workspace_id ==
 #     $HERDR_WORKSPACE_ID, non-empty): closing it here would kill the
 #     agent's own pane -- and this script with it -- before steps 4-6 ever
 #     run. In that case defer_own_close is set and the actual close is
-#     pushed to the very last action in the script, after step 6. ----------
-workspace_id=""
+#     pushed after git teardown, before the success report. ---------------
+workspace_id="$saved_workspace"
 defer_own_close=0
-if [ "$ddev_only" -ne 1 ]; then
+# A previous direct call may have left a workspace obligation. A different
+# invocation mode must not erase it when handing deletion to its adapter.
+if [ -n "$saved_workspace" ] && { [ "$ddev_only" -eq 1 ] || [ "${ORCH_RETIRE_MANAGED:-0}" = 1 ]; }; then
+  close_workspace "$saved_workspace" || exit $?
+fi
+if [ "$ddev_only" -ne 1 ] && [ "${ORCH_RETIRE_MANAGED:-0}" != 1 ]; then
   if command -v herdr >/dev/null 2>&1; then
-    wt_json="$(herdr worktree list 2>/dev/null)" || wt_json=""
-    if [ -n "$wt_json" ]; then
+    wt_json="$(herdr worktree list 2>/dev/null)" || {
+      echo "retire-worktree: cannot inspect Herdr worktrees for $worktree; repair Herdr and retry." >&2
+      exit 4
+    }
+    if ! printf '%s' "$wt_json" | python3 "$(dirname "$progress")/retirement_inventory.py" worktrees >/dev/null 2>&1; then
+      echo "retire-worktree: invalid Herdr worktree response for $worktree; repair Herdr and retry." >&2
+      exit 4
+    fi
+    if [ -z "$workspace_id" ]; then
       workspace_id="$(printf '%s' "$wt_json" | jq -r --arg p "$worktree" \
-        '(.result.worktrees // [])[] | select(.path==$p) | .open_workspace_id' 2>/dev/null | sed -n '1p')"
+        '.result.worktrees[] | select(.path==$p) | .open_workspace_id // empty' 2>/dev/null | sed -n '1p')"
     fi
 
     if [ -z "${workspace_id:-}" ]; then
-      ws_json="$(herdr workspace list 2>/dev/null)" || ws_json=""
-      if [ -n "$ws_json" ]; then
-        workspace_id="$(printf '%s' "$ws_json" | jq -r --arg p "$worktree" \
-          '(.result.workspaces // [])[] | select(.worktree.checkout_path==$p) | .workspace_id' 2>/dev/null | sed -n '1p')"
+      ws_json="$(herdr workspace list 2>/dev/null)" || {
+        echo "retire-worktree: cannot inspect Herdr workspaces for $worktree; repair Herdr and retry." >&2
+        exit 4
+      }
+      if ! printf '%s' "$ws_json" | python3 "$(dirname "$progress")/retirement_inventory.py" workspaces >/dev/null 2>&1; then
+        echo "retire-worktree: invalid Herdr workspace response for $worktree; repair Herdr and retry." >&2
+        exit 4
       fi
+      workspace_id="$(printf '%s' "$ws_json" | jq -r --arg p "$worktree" \
+        '.result.workspaces[] | select(.worktree.checkout_path==$p) | .workspace_id // empty' 2>/dev/null | sed -n '1p')"
     fi
 
+    if [ -n "$workspace_id" ]; then
+      ORCH_RETIRE_WORKSPACE="$workspace_id" python3 "$progress" workspace "$main_repo" "$id" "$worktree" || exit $?
+    fi
     if [ -n "${workspace_id:-}" ] && [ -n "${HERDR_WORKSPACE_ID:-}" ] && [ "$workspace_id" = "${HERDR_WORKSPACE_ID:-}" ]; then
       defer_own_close=1
       echo "retire-worktree: $workspace_id is the caller's own workspace; deferring its close until after teardown (defer)."
     elif [ -n "${workspace_id:-}" ]; then
-      if herdr workspace close "$workspace_id" >/dev/null 2>&1; then
-        echo "retire-worktree: herdr workspace $workspace_id closed."
-      else
-        echo "retire-worktree: failed to close herdr workspace $workspace_id; continuing." >&2
-      fi
+      close_workspace "$workspace_id" || exit $?
     else
       echo "retire-worktree: no herdr workspace found for $worktree."
     fi
+  elif [ -n "$saved_workspace" ]; then
+    echo "retire-worktree: herdr not on PATH for pending workspace $saved_workspace at $worktree; repair PATH and retry." >&2
+    exit 4
   else
     echo "retire-worktree: herdr not on PATH, skipping workspace close."
   fi
@@ -237,9 +264,8 @@ fi
 
 # --- Step 4: delete the DDEV project, from inside the still-existing
 #     worktree. Factored into a function so it can run either as the
-#     engine's default behaviour, or as the fallback when a resolved retire
-#     hook did not actually handle it (nonzero exit, e.g. a delegate shim
-#     ignored via the re-entry guard above). Sets ddev_project. --------------
+#     engine's default behaviour, or for a delegate shim identified by exit
+#     3. Other hook failures refuse rather than fall back. Sets ddev_project. --
 run_own_teardown() {
   ddev_project=""
   if [ -f "$worktree/.ddev/config.local.yaml" ]; then
@@ -255,59 +281,85 @@ run_own_teardown() {
   # carrying that name (copied config, hand edit) must never delete it.
   if [ "$ddev_project" = "$PROJECT_NAME" ]; then
     echo "retire-worktree: $worktree is registered as '$ddev_project', the main checkout's DDEV project; refusing to delete it." >&2
-    ddev_project="$ddev_project (kept: main checkout's project)"
+    return 4
   elif command -v ddev >/dev/null 2>&1; then
     if [ -d "$worktree/.ddev" ]; then
       if ( cd "$worktree" && ddev delete -yO ) >/dev/null 2>&1; then
         echo "retire-worktree: DDEV project $ddev_project deleted."
       else
-        echo "retire-worktree: failed to delete DDEV project $ddev_project; continuing." >&2
+        echo "retire-worktree: failed to delete DDEV project $ddev_project; retry when DDEV is available." >&2
+        return 4
       fi
     else
       echo "retire-worktree: no .ddev directory in $worktree, skipping DDEV delete."
     fi
+  elif [ -d "$worktree/.ddev" ]; then
+    echo "retire-worktree: ddev not on PATH for $worktree; install DDEV or repair PATH and retry." >&2
+    return 4
   else
-    echo "retire-worktree: ddev not on PATH, skipping DDEV delete."
+    echo "retire-worktree: no .ddev directory, skipping DDEV delete."
   fi
 }
 
-if [ -n "$retire_hook" ]; then
+if [ "$stage" = ready ]; then
+  ddev_project="(previously removed)"
+elif [ -n "$retire_hook" ]; then
   echo "retire-worktree: delegating DDEV teardown to $retire_hook."
   ( cd "$worktree" && RETIRE_WORKTREE_IN_HOOK=1 "$retire_hook" )
   hook_rc=$?
   if [ "$hook_rc" -eq 0 ]; then
     ddev_project="(handled by $retire_hook)"
+  elif [ "$hook_rc" -eq 3 ]; then
+    echo "retire-worktree: delegate shim $retire_hook; running the engine's own DDEV step." >&2
+    run_own_teardown || exit $?
   else
-    echo "retire-worktree: retire hook $retire_hook did not handle teardown (exit $hook_rc); running the engine's own DDEV step." >&2
-    run_own_teardown
+    echo "retire-worktree: retire hook $retire_hook failed (exit $hook_rc); repair it and retry." >&2
+    exit 4
   fi
 else
-  run_own_teardown
+  run_own_teardown || exit $?
 fi
+python3 "$progress" ready "$main_repo" "$id" "$worktree" || exit $?
 
 if [ "$ddev_only" -eq 1 ]; then
+  # The hook may have written new work. Check again before handing deletion
+  # to an external adapter, just as finish_git does for plain git teardown.
+  dirty="$(git -C "$worktree" status --porcelain --untracked-files=all 2>&1)" || {
+    echo "retire-worktree: git status failed after teardown in $worktree; refusing." >&2
+    exit 4
+  }
+  if [ -n "$dirty" ] && [ "$force" -ne 1 ]; then
+    echo "retire-worktree: $worktree has uncommitted work after teardown; refusing." >&2
+    exit 2
+  fi
   echo "retire-worktree: --ddev-only: left the worktree and branch in place."
   echo "retire-worktree:   DDEV project: $ddev_project"
   echo "retire-worktree:   path: $worktree"
   exit 0
 fi
 
-# --- Step 5: remove the worktree and branch, from the main checkout --------
-if ! git -C "$main_repo" worktree remove --force "$worktree"; then
-  echo "retire-worktree: git worktree remove failed for $worktree; branch left untouched." >&2
+# --- Step 5: remove checkout; retain any branch as a manual obligation. ----
+finish_git
+finish_rc=$?
+if [ "$finish_rc" -ne 0 ] && [ -e "$worktree" ]; then
+  echo "retire-worktree: git teardown pending for $worktree; branch left untouched." >&2
   if [ "$defer_own_close" -eq 1 ]; then
-    echo "retire-worktree: herdr workspace $workspace_id (the caller's own) was left open — its close was deferred until after teardown, which did not complete. Fix the removal failure above, then re-run retire-worktree.sh to finish the teardown and close it." >&2
+    echo "retire-worktree: herdr workspace $workspace_id was left open; repair removal and re-run retire-worktree.sh $id." >&2
   fi
   exit 4
 fi
 
-if [ -n "$branch" ] && git -C "$main_repo" show-ref --quiet --verify "refs/heads/$branch"; then
-  git -C "$main_repo" branch -D "$branch"
-  branch_report="$branch (deleted)"
-elif [ -n "$branch" ]; then
-  branch_report="$branch (no local branch to delete)"
-else
-  branch_report="none (detached worktree)"
+# A retained branch must not prevent closing a deferred workspace. Its saved
+# obligation survives even if closing it kills this process.
+if [ "$defer_own_close" -eq 1 ]; then
+  close_workspace "$workspace_id" || exit $?
+fi
+branch_report="${branch:-none (detached worktree)} (confirmed absent)"
+if [ "$finish_rc" -ne 0 ]; then
+  echo "retire-worktree:   DDEV project: $ddev_project"
+  echo "retire-worktree:   path: $worktree"
+  echo "retire-worktree:   branch: $branch (manual cleanup pending)"
+  exit 4
 fi
 
 # --- Step 6: final report ----------------------------------------------------
@@ -322,13 +374,3 @@ fi
 echo "retire-worktree:   DDEV project: $ddev_project"
 echo "retire-worktree:   path: $worktree"
 echo "retire-worktree:   branch: $branch_report"
-
-# --- Deferred step 3: close the caller's own Herdr workspace, now that
-#     everything else (ddev delete, git worktree remove, branch delete, the
-#     final report) has already run. Best-effort: a failure warns on
-#     stderr but must not change this script's own exit code. ---------------
-if [ "$defer_own_close" -eq 1 ]; then
-  if ! herdr workspace close "$workspace_id" >/dev/null 2>&1; then
-    echo "retire-worktree: failed to close herdr workspace $workspace_id (deferred close); continuing." >&2
-  fi
-fi

@@ -48,6 +48,10 @@ class PlatformTestCase(OrchTestCase):
                 if k not in ("ORCH_CLAUDE_BIN", "ORCH_PROJECTS_DIR"):
                     del self.env[k]
         self.set_test_platform_env()
+        # Adapter wiring tests mock engine completion. Checkout removal now
+        # belongs to that engine, not Orca's branch-deleting rm command.
+        with open(self.noop_retire, 'w') as f:
+            f.write('#!/bin/sh\ngit worktree remove --force "$ORCH_RETIRE_PATH"\n')
         self._platform_records = {}
         self.init()
 
@@ -61,6 +65,8 @@ class PlatformTestCase(OrchTestCase):
         default = ORCA_CREATE_OK if name == "orca" else HERDR_CREATE_OK
         key = "terminal create" if name == "orca" else "worktree open"
         responses.setdefault(key, (0, default))
+        if name == 'orca':
+            responses.setdefault('worktree list', (0, {'result': {'worktrees': []}}))
         table = {}
         for k, (rc, out) in responses.items():
             table[k] = [rc, out if isinstance(out, str) else json.dumps(out)]
@@ -70,12 +76,18 @@ class PlatformTestCase(OrchTestCase):
         with open(path, "w") as f:
             f.write(
                 "#!%s\n"
-                "import json, sys\n"
+                "import json, sys, subprocess\n"
                 "a = sys.argv[1:]\n"
                 "with open(%r, 'a') as f:\n"
                 "    f.write(json.dumps(a) + '\\n')\n"
                 "table = json.loads(%r)\n"
                 "rc, out = table.get(' '.join(a[:2]), [0, json.dumps({'result': {}})])\n"
+                "if not rc and a[:2] == ['worktree', 'rm'] and 'worktree rm' not in table:\n"
+                "    selector = a[a.index('--worktree') + 1]\n"
+                "    wt = selector.split('::')[-1] if selector.startswith('id:') else selector.removeprefix('path:')\n"
+                "    branch = subprocess.check_output(['git', '-C', wt, 'branch', '--show-current'], text=True).strip()\n"
+                "    subprocess.run(['git', 'worktree', 'remove', wt], check=True)\n"
+                "    subprocess.run(['git', 'branch', '-D', branch], check=True, stdout=subprocess.DEVNULL)\n"
                 "print(out)\n"
                 "if rc:\n"
                 "    print('fake %s failed', file=sys.stderr)\n"
@@ -1155,6 +1167,17 @@ class AttachRetireTests(PlatformTestCase):
         self.assertIn(["terminal", "close", "--worktree", "path:" + self.wt, "--all",
                        "--json"], self.pcalls("orca"))
         self.assertTrue(self.show("T-1")["retired"])
+
+    def test_retire_orca_false_success_preserves_retirement_pending(self):
+        self.use_orca({'worktree list': (0, {'result': {'worktrees': []}})})
+        with open(self.noop_retire, 'w') as f:
+            f.write('#!/bin/sh\nexit 0\n')  # lying engine must not imply absence
+        self.spawn_on("T-1", "orca", self.wt)
+        p = self.refused(3, "retire", "T-1", "--force")
+        self.assertIn("MANUAL Orca cleanup", p.stderr)
+        self.assertTrue(os.path.isdir(self.wt))
+        self.assertFalse(self.show("T-1")["retired"])
+        self.assertNotIn("retire", self.event_kinds("T-1"))
 
     def test_retire_orca_signals_session_still_alive(self):
         self.spawn_on("T-1", "orca", self.wt)

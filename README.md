@@ -101,6 +101,20 @@ Run `scripts/install-local` from this checkout. Its first line says which versio
 | Pi | `pi install <checkout>` (needs the `subagents` extension for stage agents). Stage agents run on `openai` models by routing tier; set `pi_models` in `~/.config/orchestration/config.json` to use other providers | `/skill:orchestration` |
 | Codex | Adds this checkout as the `orchestration` marketplace, installs `orchestration@orchestration`, then runs `scripts/codex-agents`. Ticket sessions enable hooks themselves (`--enable hooks`) | `$orchestration:orchestration` |
 
+### Optional completed-ticket cleanup
+
+On Linux, explicitly enable a systemd user timer from a stable checkout with
+`scripts/install-local cleanup install --projects-dir "$HOME/Projects"`.
+Ordinary harness reinstall does not enable it. Use `cleanup status`,
+`cleanup disable` or `cleanup uninstall` to inspect or remove it.
+The timer retries completed, unretired tickets about every five minutes while
+its user manager runs, including startup catchup. It never resumes or dispatches
+agents, forces dirty deletion, installs a root service or enables lingering.
+For one project, run `scripts/orch reconcile --project /absolute/project`.
+See [cleanup installation and recovery](skills/orchestration/references/cleanup.md)
+for adapter PATH configuration, journal commands, notification deduplication,
+interrupted teardown recovery and Desktop manual archival.
+
 Every stage dispatch is routed to a model tier and an effort rung: `orch route` picks it, `orch run` records it, and on Claude the `SubagentStop` hook checks the model the subagent really ran on.
 
 Check a machine with `orch selftest` on each harness you use. On Claude it ends with the routing smoke test (`orch smoke-routing`: subagents really run on `haiku` and `fable`); `--skip-routing` leaves it out.

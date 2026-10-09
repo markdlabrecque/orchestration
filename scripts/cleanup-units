@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Explicitly manage the opt-in systemd user cleanup timer."""
+import argparse
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+OWNER = '# Managed by orchestration cleanup installer v1\n'
+
+
+def quote(value, exec_arg=False):
+    if any(c in value for c in '\n\r\0'):
+        raise ValueError('unit values cannot contain newlines or NUL')
+    value = value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%')
+    if exec_arg:
+        value = value.replace('$', '$$')
+    return '"' + value + '"'
+
+
+def ctl(*args, check=True):
+    p = subprocess.run(['systemctl', '--user', *args], timeout=30)
+    if check and p.returncode:
+        raise RuntimeError('systemctl --user %s failed (%s)' % (' '.join(args), p.returncode))
+    return p.returncode
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['install', 'status', 'inspect', 'disable', 'uninstall'])
+    parser.add_argument('--projects-dir', default=os.environ.get('ORCH_PROJECTS_DIR', str(Path.home() / 'Projects')))
+    parser.add_argument('--unit-name', default='orch-cleanup', help='unit basename; use unique names for isolated tests')
+    parser.add_argument('--adapter-path', help='explicit absolute colon-separated PATH for adapters and git')
+    args = parser.parse_args()
+    if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]*', args.unit_name):
+        parser.error('invalid unit name')
+    if os.getuid() == 0:
+        parser.error('cleanup is a user service; do not install as root')
+    directory = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 'systemd/user'
+    service, timer = [args.unit_name + suffix for suffix in ('.service', '.timer')]
+    paths = [directory / name for name in (service, timer)]
+    # Never replace, stop, or unlink units we do not own.
+    for path in paths:
+        if path.is_symlink() or (path.exists() and not path.read_text().startswith(OWNER)):
+            raise RuntimeError('refusing foreign unit %s' % path)
+    if args.action in ('status', 'inspect'):
+        ctl('status', '--no-pager', service, timer, check=False)
+        ctl('list-timers', '--all', '--no-pager', timer, check=False)
+        print('Logs: journalctl --user -u %s --no-pager -n 100' % service)
+        print('Retry: systemctl --user start %s' % service)
+        return
+    if args.action == 'install':
+        root = Path(__file__).resolve().parent.parent
+        projects = os.path.abspath(os.path.expanduser(args.projects_dir))
+        if not os.path.isdir(projects):
+            raise ValueError('projects directory does not exist: ' + projects)
+        adapter_path = args.adapter_path or ':'.join([str(Path.home() / '.local/bin'), '/usr/local/bin', '/usr/bin', '/bin'])
+        if any(not os.path.isabs(p) for p in adapter_path.split(':')):
+            raise ValueError('adapter PATH entries must be absolute and nonempty')
+        service_text = OWNER + '\n'.join([
+            '[Unit]', 'Description=Reconcile completed orchestration worktrees', '',
+            '[Service]', 'Type=oneshot',
+            'Environment=' + quote('ORCH_PROJECTS_DIR=' + projects),
+            'Environment=' + quote('PATH=' + adapter_path),
+            'UnsetEnvironment=ORCH_HOME MAIN_CHECKOUT WORKTREE_ROOT PROJECT_NAME BASE_BRANCH ORCH_PLATFORM HERDR_WORKSPACE_ID ORCH_RETIRE_ENGINE ORCH_CREATE_ENGINE RETIRE_HOOK ORCH_PROJECT_LIB RETIRE_WORKTREE_IN_HOOK ORCH_RETIRE_PATH ORCH_RETIRE_MANAGED',
+            # systemd rejects special characters in the executable itself;
+            # pass the checkout script as an argument to a fixed executable.
+            'ExecStart=/usr/bin/env python3 ' + quote(str(root / 'scripts/orch'), exec_arg=True) + ' reconcile',
+            'WorkingDirectory=/',
+            'TimeoutStartSec=20min', 'TimeoutStopSec=15s', 'KillMode=control-group',
+            'StandardOutput=journal', 'StandardError=journal', '',
+        ])
+        timer_text = OWNER + '\n'.join([
+            '[Unit]', 'Description=Periodic completed orchestration worktree cleanup', '',
+            '[Timer]', 'OnStartupSec=1min', 'OnUnitInactiveSec=5min',
+            'AccuracySec=15s', 'Unit=' + service, '',
+            '[Install]', 'WantedBy=timers.target', '',
+        ])
+        directory.mkdir(parents=True, exist_ok=True)
+        for path, text in zip(paths, (service_text, timer_text)):
+            temp = path.with_suffix(path.suffix + '.tmp')
+            # O_EXCL refuses an unexpected leftover/symlink rather than following it.
+            with temp.open('x') as f:
+                f.write(text)
+            os.replace(temp, path)
+        ctl('daemon-reload')
+        ctl('enable', '--now', timer)
+        print('Enabled %s for direct projects under %s' % (timer, projects))
+    else:
+        owned = [path.name for path in paths if path.exists()]
+        if timer in owned:
+            ctl('disable', '--now', timer)
+        if service in owned:
+            rc = ctl('stop', service, check=False)
+            # Invalid or unloaded owned units still need to be uninstallable.
+            if rc not in (0, 5):
+                raise RuntimeError('cannot stop owned service (%s)' % rc)
+        if args.action == 'uninstall':
+            for path in paths:
+                if path.exists():
+                    path.unlink()
+            ctl('daemon-reload')
+            ctl('reset-failed', service, timer, check=False)
+        print('%s: %s' % (args.action, args.unit_name))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
+        print('cleanup-units: %s' % e, file=sys.stderr)
+        sys.exit(1)

@@ -107,16 +107,14 @@ fi
 # Minimal, curated PATH — see retire-worktree.test.sh for rationale. reap
 # additionally needs `git patch-id`, which is part of git itself.
 # ---------------------------------------------------------------------------
-declare -A _dirs=()
-for b in git bash jq mkdir cat mktemp rm sed grep awk tr dirname basename \
+MINIMAL_PATH="$SANDBOX_BASE/minimal-bin"
+mkdir -p "$MINIMAL_PATH"
+# Individual executables keep real adapters out of direct-engine fixtures.
+for b in git bash jq python3 flock mkdir cat mktemp rm sed grep awk tr dirname basename \
          realpath cut sort uniq wc cmp diff xargs sha1sum true false env \
-         printf mv cp chmod pwd head; do
-  p="$(command -v "$b" 2>/dev/null)" || continue
-  _dirs["$(dirname "$p")"]=1
-done
-MINIMAL_PATH=""
-for d in "${!_dirs[@]}"; do
-  MINIMAL_PATH="${MINIMAL_PATH:+$MINIMAL_PATH:}$d"
+         printf mv cp chmod pwd head tail id ln; do
+  p="$(type -P "$b" 2>/dev/null)" || continue
+  ln -s "$p" "$MINIMAL_PATH/$b"
 done
 
 # ---------------------------------------------------------------------------
@@ -892,8 +890,10 @@ re_outf="$(mktemp)"; re_errf="$(mktemp)"
     bash "$RE_MAIN/scripts/reap-worktrees.sh" ) >"$re_outf" 2>"$re_errf"
 re_rc=$?
 
-if [ "$re_rc" -eq 0 ] && [ ! -e "$RE_WTROOT/re-landed" ] && [ -d "$RE_MAIN/.git" ]; then
-  pass "RE1: in the default layout a landed worktree in <root>/code is reaped and the main checkout beside it is kept"
+if [ "$re_rc" -eq 1 ] && [ ! -e "$RE_WTROOT/re-landed" ] && [ -d "$RE_MAIN/.git" ] \
+   && git -C "$RE_MAIN" show-ref --verify --quiet refs/heads/re-landed \
+   && grep -qF 'MANUAL branch cleanup' "$re_errf"; then
+  pass "RE1: landed checkout removed, branch retained with manual attention, main kept"
 else
   fail "RE1: default layout must reap <root>/code/re-landed and keep the main checkout" \
 "exit $re_rc
