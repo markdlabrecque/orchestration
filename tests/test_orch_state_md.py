@@ -121,6 +121,64 @@ runpy.run_path(script, run_name='__main__')
 '''
 
 
+# Two independent interpreters use public SQLite and inode-lock operations.
+ORDERING_CHILD = r'''
+import fcntl, os, runpy, sqlite3, sys, time
+role, target, database, script = sys.argv[1:]
+def marker(name):
+    with open(target + name, 'w') as file:
+        file.write('ready')
+def wait(name):
+    deadline = time.monotonic() + 12
+    while not os.path.exists(target + name):
+        if time.monotonic() >= deadline:
+            raise TimeoutError('ordering barrier missing: ' + name)
+        time.sleep(.01)
+if role == 'legacy':
+    db = sqlite3.connect(database, timeout=2, isolation_level=None)
+    db.execute('BEGIN IMMEDIATE')
+    with open(target, 'ab') as old:
+        fcntl.flock(old, fcntl.LOCK_EX)
+        db.execute("UPDATE tickets SET title='legacy committed revision' WHERE id='T-1'")
+        marker('.legacy-locked')
+        wait('.release-legacy')
+        old.write(b'- combined ordering legacy append\n')
+        old.flush()
+        os.fsync(old.fileno())
+        db.execute('COMMIT')
+        marker('.legacy-committed')
+    db.close()
+else:
+    connections = []
+    original_connect = sqlite3.connect
+    def connect(*args, **kwargs):
+        db = original_connect(*args, **kwargs)
+        connections.append(db)
+        return db
+    sqlite3.connect = connect
+    original = fcntl.flock
+    def flock(fd, operation):
+        if operation == fcntl.LOCK_EX and os.fstat(fd if isinstance(fd, int) else fd.fileno()).st_ino == os.stat(target).st_ino:
+            assert connections and all(not db.in_transaction for db in connections), \
+                'publisher holds SQLite transaction while waiting for legacy inode'
+            try:
+                original(fd, operation | fcntl.LOCK_NB)
+            except BlockingIOError:
+                marker('.inode-contended')
+            else:
+                raise AssertionError('publisher did not contend on legacy inode')
+            wait('.release-publisher')
+        return original(fd, operation)
+    fcntl.flock = flock
+    module = runpy.run_path(script)
+    db = module['connect'](os.path.dirname(database))
+    marker('.publisher-ready')
+    wait('.legacy-locked')
+    module['state_md_sync'](db)
+    db.close()
+'''
+
+
 class StateMdContractTests(OrchTestCase):
     def setUp(self):
         super().setUp()
@@ -157,6 +215,55 @@ class StateMdContractTests(OrchTestCase):
                                str(self.path), ORCH, *args], cwd=self.repo,
                               env=self.env, input=payload, capture_output=True,
                               text=True, timeout=30)
+
+    def test_legacy_write_transaction_and_publisher_inode_contention_complete(self):
+        self.add('T-1', 'before overlapping legacy commit')
+        before_revision = self.db_exec('SELECT revision FROM state_md_revision')[0][0]
+        processes = []
+        try:
+            def start(role):
+                process = subprocess.Popen(
+                    [sys.executable, '-c', ORDERING_CHILD, role, str(self.path),
+                     self.db_path(), ORCH], cwd=self.repo, env=self.env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                processes.append(process)
+                return process
+
+            publisher = start('publisher')
+            self.wait_marker('.publisher-ready', publisher)
+            legacy = start('legacy')
+            self.wait_marker('.legacy-locked', legacy)
+            self.wait_marker('.inode-contended', publisher)
+            self.assertIsNone(legacy.poll(), 'legacy must still hold its write transaction')
+            self.assertIsNone(publisher.poll(), 'publisher must overlap the legacy lock')
+            # Enter the blocking flock while legacy still holds both locks.
+            Path(str(self.path) + '.release-publisher').touch()
+            Path(str(self.path) + '.release-legacy').touch()
+            for process in processes:
+                out, err = process.communicate(timeout=15)
+                self.assertEqual(process.returncode, 0, (out, err))
+            self.assertTrue(Path(str(self.path) + '.legacy-committed').exists())
+        finally:
+            # Also covers marker failures, watchdog expiry and failed assertions.
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+            for process in processes:
+                out, err = process.communicate(timeout=5)
+                if process.returncode:
+                    print('ordering child exit %s: %s %s' % (process.returncode, out, err),
+                          file=sys.stderr)
+                self.assertIsNotNone(process.returncode, 'child was not reaped')
+        revision = self.db_exec('SELECT revision FROM state_md_revision')[0][0]
+        self.assertGreater(revision, before_revision)
+        self.assertIn(('Source revision: %s;' % revision).encode(), self.md())
+        self.assertIn(b'legacy committed revision', self.md())
+        # Delayed retained-inode tails may need a rebuild, but managed bytes
+        # must already include the legacy database commit.
+        text = self.rebuild()
+        self.assertEqual(text.count(b'- combined ordering legacy append'), 1)
+        self.fresh()
+        self.assertEqual(self.rebuild(), text)
 
     def test_old_open_descriptor_tail_survives_replacement_and_later_repair(self):
         self.add('T-1')
