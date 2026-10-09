@@ -1648,7 +1648,10 @@ def run_engine(kind, main, args, cwd, extra_env=None):
     except (subprocess.TimeoutExpired, KeyboardInterrupt) as e:
         # Do not leave a hook/adapter deleting resources after releasing the
         # retirement claim. All engine descendants share this process group.
-        os.killpg(p.pid, signal.SIGKILL)
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # The interrupted engine may already have exited.
         output, _ = p.communicate()
         sys.stderr.write(output)
         if isinstance(e, KeyboardInterrupt):
