@@ -64,8 +64,10 @@ def main():
             'Environment=' + quote('ORCH_PROJECTS_DIR=' + projects),
             'Environment=' + quote('PATH=' + adapter_path),
             'UnsetEnvironment=ORCH_HOME MAIN_CHECKOUT WORKTREE_ROOT PROJECT_NAME BASE_BRANCH ORCH_PLATFORM HERDR_WORKSPACE_ID ORCH_RETIRE_ENGINE ORCH_CREATE_ENGINE RETIRE_HOOK ORCH_PROJECT_LIB RETIRE_WORKTREE_IN_HOOK ORCH_RETIRE_PATH ORCH_RETIRE_MANAGED',
-            'ExecStart=' + quote(str(root / 'scripts/orch'), exec_arg=True) + ' reconcile',
-            'WorkingDirectory=' + quote(str(root)),
+            # systemd rejects special characters in the executable itself;
+            # pass the checkout script as an argument to a fixed executable.
+            'ExecStart=/usr/bin/env python3 ' + quote(str(root / 'scripts/orch'), exec_arg=True) + ' reconcile',
+            'WorkingDirectory=/',
             'TimeoutStartSec=20min', 'TimeoutStopSec=15s', 'KillMode=control-group',
             'StandardOutput=journal', 'StandardError=journal', '',
         ])
@@ -90,7 +92,10 @@ def main():
         if timer in owned:
             ctl('disable', '--now', timer)
         if service in owned:
-            ctl('stop', service)
+            rc = ctl('stop', service, check=False)
+            # Invalid or unloaded owned units still need to be uninstallable.
+            if rc not in (0, 5):
+                raise RuntimeError('cannot stop owned service (%s)' % rc)
         if args.action == 'uninstall':
             for path in paths:
                 if path.exists():

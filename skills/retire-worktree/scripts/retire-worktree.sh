@@ -114,7 +114,7 @@ cd "$ORCH_ROOT" || exit 1
 
 # Persist exact git identity before adapters can destroy anything. The record
 # survives checkout removal, including interruption before branch deletion.
-progress="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)/scripts/retirement-progress.py"
+progress="$(dirname "$ORCH_PROJECT_LIB")/retirement-progress.py"
 # On Linux, the inherited lock also covers an engine whose orch parent died.
 # Keep it in git metadata, not in the directory being removed.
 if command -v flock >/dev/null 2>&1; then

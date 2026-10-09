@@ -82,7 +82,9 @@ class ReconcileTests(OrchTestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assert_complete('50', path)
         with open(adapter_log) as f:
-            self.assertIn('delete', f.read())
+            calls = f.read()
+        self.assertIn('delete', calls)
+        self.assertNotIn('--force', calls)
         self.assertEqual(self.reconcile().returncode, 0)
         self.assert_complete('50', path)
 
@@ -273,6 +275,23 @@ class ReconcileTests(OrchTestCase):
         with open(os.path.join(self.state_dir, 'cleanup-notifications.json')) as f:
             self.assertNotIn('50', json.load(f))
 
+    def test_notification_storage_failure_does_not_stop_cleanup(self):
+        path = self.completed()
+        os.mkdir(os.path.join(self.state_dir, 'cleanup-notifications.json.lock'))
+        p = self.reconcile()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('notification', p.stderr)
+        self.assert_complete('50', path)
+
+    def test_unavailable_discovery_root_reports_json_attention(self):
+        missing = os.path.join(self.tmp, 'unavailable-projects')
+        p = self.orch('reconcile', '--json', env={'ORCH_PROJECTS_DIR': missing})
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn(missing, p.stderr)
+        self.assertNotIn('Traceback', p.stderr)
+        self.assertEqual(json.loads(p.stdout)['outcomes'][0]['outcome'], 'attention')
+        self.assertFalse(os.path.exists(missing))
+
     def test_project_notification_resolution_and_recurrence(self):
         self.init()
         with open(os.path.join(self.root, '.orch')) as f:
@@ -285,6 +304,40 @@ class ReconcileTests(OrchTestCase):
             with open(os.path.join(self.root, '.orch'), 'w') as f:
                 f.write(original)
             self.assertEqual(self.reconcile().returncode, 0)
+
+    def test_live_nonleader_session_refuses_before_checkout_removal(self):
+        import sys
+        path = self.completed()
+        sid = 'disposable-session-identity'
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)', sid])
+        try:
+            self.db_exec("UPDATE tickets SET pid=?, pid_start=NULL, session_id=?, activity=NULL WHERE id='50'",
+                         (child.pid, sid))
+            p = self.reconcile()
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn('group leader', p.stderr)
+            self.assertIsNone(child.poll())
+            self.assertTrue(os.path.isdir(path))
+            self.assertFalse(is_retired(self.show('50')))
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
+        self.assertEqual(self.reconcile().returncode, 0)
+        self.assert_complete('50', path)
+
+    def test_orca_hook_writes_refuse_before_adapter_removal(self):
+        path = self.completed()
+        self.db_exec("UPDATE tickets SET platform='orca' WHERE id='50'")
+        target = os.path.join(path, 'late-edit')
+        called = os.path.join(self.tmp, 'orca-called')
+        self.stub('orca', 'touch ' + self.quote(called) + '\nexit 1\n')
+        hook = self.stub('write-hook', 'printf valuable > ' + self.quote(target) + '\n')
+        p = self.reconcile(env={'RETIRE_HOOK': hook})
+        self.assertNotEqual(p.returncode, 0)
+        self.assertFalse(os.path.exists(called), 'dirty hook content reached external deletion')
+        with open(target) as f:
+            self.assertEqual(f.read(), 'valuable')
+        self.assertFalse(is_retired(self.show('50')))
 
     def test_git_status_failure_preserves_worktree(self):
         path = self.completed()
@@ -399,4 +452,3 @@ class ReconcileTests(OrchTestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

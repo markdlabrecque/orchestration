@@ -3096,7 +3096,7 @@ def target_exists(pid, group):
     return True
 
 
-def kill_session(row, bare_ok):
+def kill_session(row, bare_ok, strict=False):
     """Signal the session, but only if `pid` is still provably that session.
     A group leader gets its whole group signalled (so members that outlive it,
     such as MCP servers and shells, die too). A non-leader pid is signalled on
@@ -3106,21 +3106,33 @@ def kill_session(row, bare_ok):
         return
     try:
         group = os.getpgid(pid) == pid
-    except OSError:
+    except ProcessLookupError:
+        return
+    except OSError as e:
+        if strict:
+            raise Refusal(EXIT_GATE, "cannot inspect session %s: %s" % (pid, e))
         return
     if not group and not bare_ok:
+        if strict:
+            raise Refusal(EXIT_GATE, "live headless session %s is not its group leader; stop it manually before retirement" % pid)
         return
     send = os.killpg if group else os.kill
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
             send(pid, sig)
-        except OSError:
+        except ProcessLookupError:
+            return
+        except OSError as e:
+            if strict:
+                raise Refusal(EXIT_GATE, "cannot stop session %s: %s" % (pid, e))
             return
         deadline = time.time() + 3.0
         while time.time() < deadline and target_exists(pid, group):
             time.sleep(0.05)
         if not target_exists(pid, group):
             return
+    if strict and row_alive(row) and not (ps_field(pid, "stat") or "").startswith("Z"):
+        raise Refusal(EXIT_GATE, "session %s is still alive after termination; retry retirement after it stops" % pid)
 
 
 def retire_ticket(db, sdir, tid, force, keep_worktree=False, automatic=False):
@@ -3154,7 +3166,7 @@ def retire_claimed(db, tid, row, force, keep_worktree, marker):
     platform = row_platform(row)
     ref = row_launch_ref(row) or {}
     if platform == "headless":
-        kill_session(row, bare_ok=False)
+        kill_session(row, bare_ok=False, strict=not force)
     else:
         _, err = platform_close(platform, ref, row["worktree"])
         if err:
@@ -3169,7 +3181,7 @@ def retire_claimed(db, tid, row, force, keep_worktree, marker):
                 if cur["launching"] != marker:
                     raise Refusal(EXIT_GATE, "%s changed retirement owner while closing session" % tid)
                 db.execute("UPDATE tickets SET launch_ref=NULL WHERE id=?", (tid,))
-        kill_session(row, bare_ok=True)
+        kill_session(row, bare_ok=True, strict=not force)
     if not keep_worktree:
         # The worktree goes, so does the trust orch gave it.
         if not unmark_ticket_trust(db, tid, row["worktree"]) and not force:
@@ -3270,9 +3282,17 @@ def cleanup_notice(sdir, ticket, message):
 
 
 def cmd_reconcile(args):
-    roots = ([os.path.realpath(args.project)] if args.project else
-             [os.path.join(projects_dir(), name) for name in sorted(os.listdir(projects_dir()))])
     outcomes = []
+    roots = []
+    try:
+        roots = ([os.path.realpath(args.project)] if args.project else
+                 [os.path.join(projects_dir(), name) for name in sorted(os.listdir(projects_dir()))])
+    except OSError as e:
+        root = projects_dir()
+        outcomes.append(dict(project=root, ticket=None, worktree=None,
+                             outcome="attention", reason="cannot discover projects: %s" % e))
+        print("%s: cannot discover projects: %s; restore the directory or correct ORCH_PROJECTS_DIR"
+              % (root, e), file=sys.stderr)
     for root in roots:
         sdir = os.path.join(root, ".agents", "orchestration")
         if not (os.path.isfile(os.path.join(root, ".orch"))
@@ -3283,7 +3303,10 @@ def cmd_reconcile(args):
             with cleanup_project(root):
                 main_checkout()
                 db = connect(sdir)
-                cleanup_notice(sdir, "__project__", None)
+                try:
+                    cleanup_notice(sdir, "__project__", None)
+                except OSError as e:
+                    print("%s: notification recovery failed: %s" % (root, e), file=sys.stderr)
                 rows = db.execute("SELECT * FROM tickets WHERE phase='done' AND retired_at IS NULL"
                                   " ORDER BY seq").fetchall()
                 for row in rows:

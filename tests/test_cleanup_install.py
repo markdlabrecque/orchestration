@@ -1,5 +1,6 @@
 """Explicit cleanup installation without contacting systemd or real HOME."""
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -43,6 +44,12 @@ class CleanupInstallTests(unittest.TestCase):
             self.assertIn('PATH=', text)
             self.assertIn('%%', text, 'literal percent must not expand as a systemd specifier')
             self.assertIn('StandardOutput=journal', text)
+            self.assertIn('ExecStart=/usr/bin/env python3 ', text)
+            self.assertIn('WorkingDirectory=/', text)
+            if shutil.which('systemd-analyze'):
+                checked = subprocess.run(['systemd-analyze', '--user', 'verify', service, timer],
+                                         capture_output=True, text=True, timeout=30)
+                self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
             with open(timer) as f:
                 timer_text = f.read()
             self.assertTrue('OnStartupSec=' in timer_text or
@@ -65,6 +72,40 @@ class CleanupInstallTests(unittest.TestCase):
             for command in ('daemon-reload', 'enable', 'disable', 'stop'):
                 self.assertTrue(any(command in call for call in calls), calls)
             self.assertFalse(any('linger' in call for call in calls))
+            # Ordinary Pi reinstall must not touch user units or systemctl.
+            pi = os.path.join(bin_dir, 'pi')
+            with open(pi, 'w') as f:
+                f.write('#!/bin/sh\nexit 0\n')
+            os.chmod(pi, 0o755)
+            env['CLAUDE_CONFIG_DIR'] = os.path.join(tmp, 'claude')
+            p = subprocess.run([INSTALL, 'pi'], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            with open(log) as f:
+                self.assertEqual(f.readlines(), calls)
+            self.assertFalse(any(name.startswith('orch-cleanup') for name in os.listdir(units_dir)))
+
+    def test_foreign_units_and_symlinks_are_never_changed(self):
+        with tempfile.TemporaryDirectory(prefix='cleanup-foreign-') as tmp:
+            directory = os.path.join(tmp, 'systemd/user')
+            os.makedirs(directory)
+            service = os.path.join(directory, 'orch-cleanup.service')
+            env = dict(os.environ, XDG_CONFIG_HOME=tmp)
+            for symlink in (False, True):
+                target = os.path.join(tmp, 'foreign')
+                with open(target, 'w') as f:
+                    f.write('foreign unit content')
+                if symlink:
+                    os.symlink(target, service)
+                else:
+                    shutil.copyfile(target, service)
+                for action in ('install', 'disable', 'uninstall'):
+                    p = subprocess.run([INSTALL, 'cleanup', action, '--projects-dir', tmp],
+                                       env=env, capture_output=True, text=True, timeout=30)
+                    self.assertNotEqual(p.returncode, 0)
+                    self.assertIn('foreign unit', p.stderr)
+                    with open(service) as f:
+                        self.assertEqual(f.read(), 'foreign unit content')
+                os.unlink(service)
 
 
 if __name__ == '__main__':
