@@ -967,7 +967,53 @@ def state_md_after_commit(db):
         print("orch: %s" % e, file=sys.stderr)
 
 
+def state_md_diagnostics():
+    """Account logical sizes under publisher/inode locks, without reading tails."""
+    root = state_md_root()
+    metrics = dict(retained_inode_count=0, retained_bytes=0, scanned_tail_bytes=0)
+    try:
+        with contextlib.ExitStack() as stack:
+            lock = stack.enter_context(open(os.path.join(root, ".STATE.md.lock"), "a+b"))
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            identity = None
+            try:
+                current = stack.enter_context(open(os.path.join(root, "STATE.md"), "rb"))
+                fcntl.flock(current, fcntl.LOCK_SH)
+                stat = os.fstat(current.fileno())
+                identity = (stat.st_dev, stat.st_ino)
+            except FileNotFoundError:
+                pass
+            directory = os.path.join(root, ".STATE.md.legacy")
+            try:
+                names = sorted(os.listdir(directory))
+            except FileNotFoundError:
+                return metrics
+            for name in names:
+                if not re.fullmatch(r"\d+-\d+-\d+", name):
+                    raise ValueError("unexpected legacy retention entry: " + name)
+                device, inode, length = map(int, name.split("-"))
+                with open(os.path.join(directory, name), "rb") as retained:
+                    fcntl.flock(retained, fcntl.LOCK_SH)
+                    stat = os.fstat(retained.fileno())
+                    if (stat.st_dev, stat.st_ino) != (device, inode):
+                        raise ValueError("legacy retention inode changed: " + name)
+                    if (device, inode) != identity:
+                        if stat.st_size < length:
+                            raise ValueError("legacy retention file truncated: " + name)
+                        metrics["scanned_tail_bytes"] += stat.st_size - length
+                    metrics["retained_inode_count"] += 1
+                    metrics["retained_bytes"] += stat.st_size
+        return metrics
+    except (OSError, ValueError) as e:
+        raise Refusal(EXIT_GATE, "STATE.md retention diagnostics failed: %s" % e) from e
+
+
 def cmd_state_md(args, db, sdir):
+    if args.operation == "diagnostics":
+        metrics = state_md_diagnostics()
+        emit(args, metrics, "Retained inode count: {retained_inode_count}\n"
+             "Retained bytes: {retained_bytes}\nScanned tail bytes: {scanned_tail_bytes}".format(**metrics))
+        return
     fresh = state_md_sync(db, check=args.operation == "check")
     emit(args, {"fresh": fresh}, "STATE.md is " + ("fresh" if fresh else "stale"))
     if not fresh:
@@ -5205,9 +5251,9 @@ def build_parser():
     grant.add_argument("--event", type=int, required=True, help="current phase-changing event sequence")
     grant.add_argument("--approved", action="store_true")
     grant.add_argument("--predecessor", help="consumed first grant ID; explicitly approve the final fifth repair")
-    sp = sub.add_parser("state-md", parents=[common], help="check or rebuild the committed STATE.md projection")
+    sp = sub.add_parser("state-md", parents=[common], help="check, rebuild or diagnose retention of the STATE.md projection")
     sp.set_defaults(fn=cmd_state_md)
-    sp.add_argument("operation", choices=("check", "rebuild"))
+    sp.add_argument("operation", choices=("check", "rebuild", "diagnostics"))
     sp = add("reconcile", cmd_reconcile)
     sp.add_argument("--project", help="scan only this project root")
     add("init", cmd_init)
@@ -5303,6 +5349,10 @@ def main(argv=None):
     try:
         if args.fn in NO_DB:
             return args.fn(args) or 0
+        # Diagnostics must not open/migrate the database or reconcile projection.
+        if args.fn is cmd_state_md and args.operation == "diagnostics":
+            cmd_state_md(args, None, None)
+            return 0
         sdir = state_dir()
         db = connect(sdir)
         try:
