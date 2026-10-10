@@ -46,16 +46,23 @@ A request to start, work on, or resume tickets authorizes this whole loop. Do no
    2. Write the brief (template below) to a temp file, using `verify_env` from preflight. For `local-tests`, require all project-required automated tests, independent review and exact-head CI; go from review to report without a separate verify, browser or accessibility stage. Accessibility tests are `on` only when `.orch` in the project root has `ACCESSIBILITY_TESTS=true` (any case). Missing, or any other value, is `off`.
    3. `orch spawn <ticket> --worktree <absolute path> --brief-file <file>`. On Desktop, carry out the printed action (below).
    A ticket whose prerequisite is not `done` stays in `ready` until it is.
-6. **Supervise until every ticket is done.** Run `orch wait --since <watermark>` in the background (Claude Code: Bash `run_in_background`; Codex and Pi: their background command mechanism). It returns when a ticket is `blocked`, `done`, `idle`, `dead` or `stalled`. React to the printed events by the rules below, then start the next `wait` with the printed watermark (the first one needs no `--since`). Exit 6 means nothing happened; re-run it. Keep a slow fallback `orch list` check (every 20-30 minutes) in case a wait dies. Apply [Assignment](#assignment) before resuming or messaging an active ticket to carry on, and before dispatching newly unblocked tickets. React by phase and `health`:
+6. **Supervise until every ticket is done.** Run `orch wait --since <watermark>` in the background (Claude Code: Bash `run_in_background`; Codex and Pi: their background command mechanism). It returns when a ticket is `blocked`, asks a `question`, is `done`, `idle`, `dead` or `stalled`. React to the printed events by the rules below, then start the next `wait` with the printed watermark (the first one needs no `--since`). Exit 6 means nothing happened; re-run it. Keep a slow fallback `orch list` check (every 20-30 minutes) in case a wait dies. Apply [Assignment](#assignment) before resuming or messaging an active ticket to carry on, and before dispatching newly unblocked tickets. React by phase and `health`:
    - Confirmed shared baseline failure → follow [Shared baseline failures](references/orch-cli.md#shared-baseline-failures). Record explicit reproduction evidence and the owning fix ticket; `orch next` prioritizes its ready owner. Keep affected implementation and unrelated work moving. Once the owner is done, identify the actual integrated fix SHA and run `baseline resolve`, even if it had already merged at confirmation. Send recorded refresh requests to affected ticket orchestrators; main never rebases their worktrees.
    - `done` with no retirement timestamp → `orch retire <ticket>` and, on Desktop, carry out its action. This command already removes the worktree and DDEV project through the retirement engine; successful retirement needs no second teardown. Inspect refusals and preserve the pending cleanup for retry. Then dispatch anything newly unblocked.
    - `dead` and not done (`orch stale`) → `orch resume <ticket>`. If the same ticket dies twice in a row at the same phase, look at why (headless: the tail of `<project root>/.agents/orchestration/logs/<ticket>.log`; Orca/Herdr/Desktop: the session itself), fix the cause if it is environmental, and resume. Otherwise, report it.
    - `idle` and not done or blocked → the session finished a turn without finishing the ticket. Headless sessions exit at that point and show `dead`, so they get resumed. On Orca, Herdr or Desktop the session stays open, so send it a message (`orca terminal send`, `herdr agent prompt`, or the Desktop session tool): "Run `orch show <ticket>` and carry on."
    - `stalled` → look at the session. Kill it only if it is truly stuck; it then shows `dead` and gets resumed.
+   - `question` → apply the answer rules below, then `orch answer <ticket> <question-id> <answer>`. The session's `orch ask` returns it.
    - `blocked` → read the reason with `orch show`. If it is a permitted stop (see the pipeline reference), ask the user, then `orch resume <ticket> --note "<answer>"`. Resume restores the phase the ticket was blocked from.
 7. **Report.** When the batch is done: per ticket, the MR, the merge SHA, the errors the verifier reported (listed in the MR description), the follow-up tickets filed, and anything a person still needs to look at.
 
 The main orchestrator never runs stages, edits code, or merges. If a ticket session cannot be started, report the blocker; never fall back to doing the ticket in this session.
+
+### Answer rules
+
+- May answer: facts the main orchestrator can see (other tickets' scope, phase or files touched, known baseline failures, whether a dependency is merged).
+- Must escalate to the human: scope, product behaviour, anything the ticket's binding decisions leave open, anything a brief says not to decide. Ask the human, then `orch answer` with their reply. The ask may time out first; the ticket then blocks and is resumed after the answer.
+- Recorded: every question and answer stays in `orch events` and STATE.md. An answer that changes what the ticket does is also posted as a ticket comment.
 
 ### Assignment
 
@@ -81,6 +88,7 @@ retire anything. Record every phase change with `orch`.
 Scope: <scope and acceptance criteria>
 Known premises to verify: <premises>
 Dependencies / related tickets: <list or none>
+Unsure of a fact the main orchestrator can see? `orch ask`. A decision only the human can make, or an ask that timed out? `orch block`.
 ```
 
 ## Platforms

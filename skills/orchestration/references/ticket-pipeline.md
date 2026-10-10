@@ -145,6 +145,8 @@ A stop is allowed only when the answer is genuinely not yours to give. On a stop
 - a premise the ticket rests on is false, and correcting it changes the ticket, not just the diff;
 - the ticket ends with **no code change**, and the project's `AGENTS.md` doesn't say how to close such a ticket.
 
+Before stopping, if the question is a fact the main orchestrator can see (another ticket's scope, a baseline failure, whether a dependency is merged), run `orch ask <ticket> "<question>"` and use the answer. On exit 6, `orch block <ticket> --reason "<question>"`; after resume, re-running the same `ask` picks up an answer given meanwhile.
+
 Ask once, two options max, with a recommendation. Once answered, run to the end.
 
 ### Not stops
