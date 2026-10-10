@@ -27,7 +27,7 @@ def retirement_inventory(reply, kind):
     from retirement_inventory import inventory
     return inventory(reply, kind)
 
-EXIT_USAGE, EXIT_GATE, EXIT_NOT_FOUND, EXIT_PREFLIGHT = 2, 3, 4, 5
+EXIT_USAGE, EXIT_GATE, EXIT_NOT_FOUND, EXIT_PREFLIGHT, EXIT_TIMEOUT = 2, 3, 4, 5, 6
 
 PHASE_STATUS = {
     "ready": "ready",
@@ -4006,6 +4006,120 @@ def cmd_watch(args):
             return
 
 
+# ---- wait: block until a ticket needs attention ---------------------------------
+
+WAIT_HEALTH = ("idle", "dead", "stalled")
+
+
+def wake_kind(kind, to_phase, detail):
+    """Wake kind for an events row, or None. The one place to add a new kind."""
+    if kind == "block":
+        return "blocked"
+    if to_phase == "done":
+        return "done"
+    if kind == "health" and detail in WAIT_HEALTH:
+        return detail
+    return None
+
+
+def wait_last_health(db, tid):
+    row = db.execute(
+        "SELECT detail FROM events WHERE ticket=? AND kind='health' AND seq >"
+        " COALESCE((SELECT MAX(seq) FROM events WHERE ticket=?"
+        " AND kind IN ('spawn','resume','attach','unblock')), 0) ORDER BY seq DESC LIMIT 1",
+        (tid, tid)).fetchone()
+    return row[0] if row else "working"
+
+
+def wait_health(row, alive, cfg):
+    h = health(row, alive, cfg)
+    return "working" if h == "none" else h
+
+
+def wait_record_health(sdir, cfg):
+    """Record derived idle/dead/stalled changes as `health` events. Plain reads
+    unless something changed; liveness is probed before the write lock. Returns
+    the event watermark: every event that existed when the decision was made and
+    the health rows inserted here, and nothing committed after."""
+    db = connect(sdir)
+    try:
+        while True:
+            with transaction(db, write=False):
+                top = db.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]
+                rows = [r for r in db.execute("SELECT * FROM tickets").fetchall()
+                        if is_active(r)]
+                todo = [(r, wait_health(r, row_alive(r), cfg)) for r in rows]
+                changed = []
+                for r, h in todo:
+                    last = wait_last_health(db, r["id"])
+                    if h != last and (h in WAIT_HEALTH or last in WAIT_HEALTH):
+                        changed.append((r["id"], h))
+            if not changed:
+                return top
+            base = None
+            with transaction(db):
+                if db.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0] == top:
+                    for tid, h in changed:
+                        row = db.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
+                        if row is None or not is_active(row):
+                            continue
+                        last = wait_last_health(db, tid)
+                        if h != last:
+                            log_event(db, tid, "health", row["phase"], row["phase"], h)
+                    base = db.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]
+            if base is not None:
+                return base  # else an event landed after the read: decide again
+    finally:
+        db.close()
+
+
+def wait_read(sdir, since):
+    db = connect(sdir)
+    try:
+        with transaction(db, write=False):
+            top = db.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]
+            rows = db.execute(
+                "SELECT e.* FROM events e JOIN tickets t ON t.id=e.ticket"
+                " WHERE e.seq>? AND e.seq<=? AND t.retired_at IS NULL ORDER BY e.seq",
+                (since, top)).fetchall()
+        events = []
+        for r in rows:
+            k = wake_kind(r["kind"], r["to_phase"], r["detail"])
+            if k:
+                events.append({"seq": r["seq"], "ticket": r["ticket"], "ts": r["ts"],
+                               "kind": k, "phase": r["to_phase"], "detail": r["detail"]})
+        return events, max(top, since)
+    finally:
+        db.close()
+
+
+def cmd_wait(args):
+    if args.timeout < 0:
+        raise Refusal(EXIT_USAGE, "--timeout must not be negative")
+    sdir = state_dir()
+    cfg = load_config(sdir)
+    since = args.since
+    if since is None:
+        since = wait_record_health(sdir, cfg)  # state already present is not "new"
+    interval = max(0.05, args.interval)
+    deadline = time.monotonic() + args.timeout
+    while True:
+        wait_record_health(sdir, cfg)
+        events, mark = wait_read(sdir, since)
+        if events or time.monotonic() >= deadline:
+            break
+        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+    if args.json:
+        print(json.dumps({"events": events, "watermark": mark,
+                          "timed_out": not events}))
+    else:
+        for e in events:
+            print("%d\t%s\t%s\t%s" % (e["seq"], e["ticket"], e["kind"], e["detail"] or ""))
+        print("watermark %d" % mark)
+    sys.stdout.flush()
+    return 0 if events else EXIT_TIMEOUT
+
+
 # ---- routing smoke test ----------------------------------------------------------
 
 SMOKE_MODELS = ("haiku", "fable")
@@ -5191,7 +5305,8 @@ def build_parser():
         "route": "pick a model for a role", "run": "record a subagent run",
         "runs": "list a ticket's subagent runs", "smoke-routing": "smoke-test model routing",
         "retry": "replay a recorded stage dispatch",
-        "watch": "watch ticket state", "selftest": "run the end-to-end self test",
+        "watch": "watch ticket state", "wait": "block until a ticket needs attention",
+        "selftest": "run the end-to-end self test",
         "reconcile": "retire completed tickets in configured projects",
     }
 
@@ -5325,6 +5440,10 @@ def build_parser():
     sp = add("watch", cmd_watch)
     sp.add_argument("--interval", type=float, default=5.0)
     sp.add_argument("--once", action="store_true")
+    sp = add("wait", cmd_wait)
+    sp.add_argument("--since", type=int)
+    sp.add_argument("--timeout", type=float, default=540.0)
+    sp.add_argument("--interval", type=float, default=1.0)
     sp = add("selftest", cmd_selftest)
     sp.add_argument("--harness", choices=HARNESSES)
     sp.add_argument("--keep", action="store_true")
@@ -5337,7 +5456,7 @@ def build_parser():
 
 READ_ONLY = (cmd_list, cmd_show, cmd_next, cmd_stale, cmd_events, cmd_route, cmd_runs)
 NO_DB = (cmd_reconcile, cmd_init, cmd_preflight, cmd_platform, cmd_hook, cmd_watch,
-         cmd_selftest, cmd_smoke_routing)
+         cmd_wait, cmd_selftest, cmd_smoke_routing)
 
 
 def main(argv=None):

@@ -73,7 +73,8 @@ The plugin carries the `create-worktree` and `retire-worktree` skills (scripts a
 |---|---|
 | `orch spawn <ticket> --brief-file F [--worktree P]` | Without `--worktree`, the adapter's `create_worktree` makes it first. With `--worktree`, it uses the existing one, as today. |
 | `orch retire <ticket> [--force] [--keep-worktree]` | `close`, then signal any session still alive by the identity check, then remove the folder trust `orch` added and `remove_worktree` (both unless `--keep-worktree`), then mark retired. Uncommitted work, unresolved teardown or a retained branch leaves the ticket un-retired, exits 3 and says why. `--force` does not delete retained branches. |
-| `orch watch [--interval S]` | Redraw a table of every non-retired ticket (id, platform, phase, health, last activity, review rounds) every `S` seconds (default 5) until interrupted. `--once` prints one frame (tests); `--once --json` prints `{"tickets": [{"id", "platform", "phase", "health", "last_seen_at", "review_rounds"}]}`. |
+| `orch wait [--since SEQ] [--timeout S]` | The agent's wake-up, not for people: blocks until a ticket is blocked, done, idle, dead or stalled. See [orch-cli.md](orch-cli.md#waiting-for-events). |
+| `orch watch [--interval S]` | The live table for people. Redraw a table of every non-retired ticket (id, platform, phase, health, last activity, review rounds) every `S` seconds (default 5) until interrupted. `--once` prints one frame (tests); `--once --json` prints `{"tickets": [{"id", "platform", "phase", "health", "last_seen_at", "review_rounds"}]}`. |
 | `orch selftest [--keep] [--timeout S] [--harness H] [--skip-routing]` | Below. |
 | `orch selftest --continue <run-id> --answer <json>` | Desktop only: the main orchestrator reports the result of an action. |
 
