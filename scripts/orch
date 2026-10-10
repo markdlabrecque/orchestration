@@ -4015,6 +4015,8 @@ def wake_kind(kind, to_phase, detail):
     """Wake kind for an events row, or None. The one place to add a new kind."""
     if kind == "block":
         return "blocked"
+    if kind == "question":
+        return "question"
     if to_phase == "done":
         return "done"
     if kind == "health" and detail in WAIT_HEALTH:
@@ -4118,6 +4120,73 @@ def cmd_wait(args):
         print("watermark %d" % mark)
     sys.stdout.flush()
     return 0 if events else EXIT_TIMEOUT
+
+
+# ---- ask / answer: a ticket session asks the main orchestrator -------------------
+
+def answer_for(db, tid, qid):
+    row = db.execute(
+        "SELECT detail FROM events WHERE ticket=? AND kind='answer' AND detail LIKE ?"
+        " ORDER BY seq LIMIT 1", (tid, "q%d: %%" % qid)).fetchone()
+    return None if row is None else row[0][len("q%d: " % qid):]
+
+
+def cmd_ask(args):
+    if args.timeout < 0:
+        raise Refusal(EXIT_USAGE, "--timeout must not be negative")
+    if not args.question.strip():
+        raise Refusal(EXIT_USAGE, "question must not be empty")
+    sdir = state_dir()
+    db = connect(sdir)
+    try:
+        with transaction(db):
+            row = get_ticket(db, args.ticket)
+            if row["retired_at"] is not None:
+                raise Refusal(EXIT_GATE, "%s is retired" % args.ticket)
+            q = db.execute(
+                "SELECT seq FROM events WHERE ticket=? AND kind='question' AND detail=?"
+                " ORDER BY seq DESC LIMIT 1", (args.ticket, args.question)).fetchone()
+            qid = q[0] if q else log_event(db, args.ticket, "question", row["phase"],
+                                           row["phase"], args.question)
+        state_md_sync(db)
+        interval = max(0.05, args.interval)
+        deadline = time.monotonic() + args.timeout
+        while True:
+            with transaction(db, write=False):
+                answer = answer_for(db, args.ticket, qid)
+            if answer is not None or time.monotonic() >= deadline:
+                break
+            time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps({"question_id": qid, "question": args.question,
+                          "answer": answer, "timed_out": answer is None}))
+    elif answer is not None:
+        print(answer)
+    else:
+        print("orch: question %d unanswered; run `orch block %s --reason \"<question>\"`"
+              % (qid, args.ticket), file=sys.stderr)
+    sys.stdout.flush()
+    return 0 if answer is not None else EXIT_TIMEOUT
+
+
+def cmd_answer(args, db, sdir):
+    row = get_ticket(db, args.ticket)
+    if row["retired_at"] is not None:
+        raise Refusal(EXIT_GATE, "%s is retired" % args.ticket)
+    if not args.answer.strip():
+        raise Refusal(EXIT_USAGE, "answer must not be empty")
+    if db.execute("SELECT 1 FROM events WHERE seq=? AND ticket=? AND kind='question'",
+                  (args.question_id, args.ticket)).fetchone() is None:
+        raise Refusal(EXIT_NOT_FOUND, "no question %d for %s" % (args.question_id, args.ticket))
+    if answer_for(db, args.ticket, args.question_id) is not None:
+        raise Refusal(EXIT_GATE, "question %d is already answered" % args.question_id)
+    log_event(db, args.ticket, "answer", row["phase"], row["phase"],
+              "q%d: %s" % (args.question_id, args.answer))
+    emit(args, {"ticket": args.ticket, "question_id": args.question_id,
+                "answer": args.answer},
+         "%s question %d answered" % (args.ticket, args.question_id))
 
 
 # ---- routing smoke test ----------------------------------------------------------
@@ -5306,6 +5375,8 @@ def build_parser():
         "runs": "list a ticket's subagent runs", "smoke-routing": "smoke-test model routing",
         "retry": "replay a recorded stage dispatch",
         "watch": "watch ticket state", "wait": "block until a ticket needs attention",
+        "ask": "ask the main orchestrator a question and wait for the answer",
+        "answer": "answer a ticket session's question",
         "selftest": "run the end-to-end self test",
         "reconcile": "retire completed tickets in configured projects",
     }
@@ -5444,6 +5515,12 @@ def build_parser():
     sp.add_argument("--since", type=int)
     sp.add_argument("--timeout", type=float, default=540.0)
     sp.add_argument("--interval", type=float, default=1.0)
+    sp = add("ask", cmd_ask, "ticket", "question")
+    sp.add_argument("--timeout", type=float, default=540.0)
+    sp.add_argument("--interval", type=float, default=1.0)
+    sp = add("answer", cmd_answer, "ticket")
+    sp.add_argument("question_id", type=int)
+    sp.add_argument("answer")
     sp = add("selftest", cmd_selftest)
     sp.add_argument("--harness", choices=HARNESSES)
     sp.add_argument("--keep", action="store_true")
@@ -5456,7 +5533,7 @@ def build_parser():
 
 READ_ONLY = (cmd_list, cmd_show, cmd_next, cmd_stale, cmd_events, cmd_route, cmd_runs)
 NO_DB = (cmd_reconcile, cmd_init, cmd_preflight, cmd_platform, cmd_hook, cmd_watch,
-         cmd_wait, cmd_selftest, cmd_smoke_routing)
+         cmd_wait, cmd_ask, cmd_selftest, cmd_smoke_routing)
 
 
 def main(argv=None):
