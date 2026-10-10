@@ -117,4 +117,6 @@ interrupted teardown recovery and Desktop manual archival.
 
 Every stage dispatch is routed to a model tier and an effort rung: `orch route` picks it, `orch run` records it, and on Claude the `SubagentStop` hook checks the model the subagent really ran on.
 
+Follow tickets live with `orch watch`; the main orchestrator uses `orch wait` to be woken when one needs attention.
+
 Check a machine with `orch selftest` on each harness you use. On Claude it ends with the routing smoke test (`orch smoke-routing`: subagents really run on `haiku` and `fable`); `--skip-routing` leaves it out.
