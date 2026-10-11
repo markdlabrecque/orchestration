@@ -57,11 +57,14 @@ class EngineDeadlineTests(unittest.TestCase):
         self.patch('base_branch', return_value=('main', '.orch'))
         tool = self.patch('call_tool_json', return_value={
             'result': {'worktree': {'path': self.path, 'id': 'wt66'}}})
-        self.assertEqual(self.orch.create_worktree('orca', '66'),
-                         (self.path, {'orca_worktree': 'wt66'}))
+        # macOS tempdirs are /var/... symlinks to /private/var/...
+        path, extra = self.orch.create_worktree('orca', '66')
+        self.assertEqual((os.path.realpath(path), extra),
+                         (os.path.realpath(self.path), {'orca_worktree': 'wt66'}))
         self.command.assert_called_once_with('create', self.tmp)
         self.assertEqual(popen.call_args.args[0], ['fake-engine', '--provision'])
-        self.assertEqual(popen.call_args.kwargs['cwd'], self.path)
+        self.assertEqual(os.path.realpath(popen.call_args.kwargs['cwd']),
+                         os.path.realpath(self.path))
         self.assertEqual(popen.call_args.kwargs['env']['BASE_BRANCH'], 'main')
         # Orca's separate worktree-create API timeout is not this engine deadline.
         self.assertEqual(tool.call_args.kwargs['timeout'], 300)

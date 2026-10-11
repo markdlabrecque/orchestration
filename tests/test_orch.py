@@ -41,11 +41,7 @@ PHASE_STATUS = {
 }
 
 
-# Environment variables the agent harnesses export to their tools; scrubbed so
-# harness detection never sees the agent running this suite.
-HARNESS_MARKERS = ("CLAUDECODE", "PI_CODING_AGENT", "PI_SESSION_ID", "PI_SUBAGENT_CHILD",
-                   "ORCH_PI_PARENT_SESSION", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
-                   "CODEX_CI", "AI_AGENT")
+from testenv import HARNESS_MARKERS, clean_env  # noqa: E402
 
 
 def pid_alive(pid):
@@ -112,11 +108,7 @@ class OrchTestCase(unittest.TestCase):
 
         # Strip platform detection too: spawn defaults to the detected platform,
         # and this suite may itself run inside Orca, Herdr or Claude Desktop.
-        self.env = {
-            k: v for k, v in os.environ.items()
-            if not k.startswith(("ORCH_", "ORCA_", "HERDR_"))
-            and k not in ("CLAUDE_CODE_ENTRYPOINT",) + HARNESS_MARKERS
-        }
+        self.env = clean_env()
         self.env.update(
             {
                 "ORCH_PROJECTS_DIR": self.projects,

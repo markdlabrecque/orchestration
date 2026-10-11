@@ -6,6 +6,8 @@ import subprocess
 import tempfile
 import unittest
 
+from testenv import clean_env
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "skills/setup-project/scripts/setup-project.sh"
 
@@ -17,8 +19,8 @@ class SetupProjectTests(unittest.TestCase):
         self.projects = Path(self.temp.name) / "Projects with spaces"
         self.root = self.projects / "project with spaces"
         self.root.mkdir(parents=True)
-        self.env = {k: v for k, v in os.environ.items()
-                    if not k.startswith(("ORCH_", "GIT_"))}
+        self.env = {k: v for k, v in clean_env().items()
+                    if not k.startswith("GIT_")}
         self.env.update(ORCH_PROJECTS_DIR=str(self.projects),
                         GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@example.com",
                         GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@example.com",

@@ -125,11 +125,12 @@ if command -v flock >/dev/null 2>&1; then
   flock -n 9 || { echo "retire-worktree: teardown already running for $id; retry later." >&2; exit 4; }
 fi
 identity="$(python3 "$progress" prepare "$main_repo" "$id" "${ORCH_RETIRE_PATH:-}")" || exit $?
-mapfile -t identity_lines <<< "$identity"
-worktree="${identity_lines[0]}"
-branch="${identity_lines[1]}"
-stage="${identity_lines[2]}"
-saved_workspace="${identity_lines[3]:-}"
+{
+  IFS= read -r worktree || true
+  IFS= read -r branch || true
+  IFS= read -r stage || true
+  IFS= read -r saved_workspace || true
+} <<< "$identity"
 workspace_absent() {
   local target="$1" worktrees workspaces
   worktrees="$(herdr worktree list 2>/dev/null)" || return 1
@@ -153,7 +154,7 @@ close_workspace() {
 finish_git() {
   local flags=()
   if [ "$force" -eq 1 ]; then flags+=(--force); fi
-  ORCH_RETIRE_PROJECT="$ORCH_ROOT" python3 "$progress" finish "$main_repo" "$id" "$worktree" "${flags[@]}"
+  ORCH_RETIRE_PROJECT="$ORCH_ROOT" python3 "$progress" finish "$main_repo" "$id" "$worktree" ${flags[@]+"${flags[@]}"}
 }
 if [ ! -e "$worktree" ]; then
   if [ -n "$saved_workspace" ]; then close_workspace "$saved_workspace" || exit $?; fi
