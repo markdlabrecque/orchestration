@@ -100,6 +100,18 @@ class RetirementSafetyTests(unittest.TestCase):
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(self.record()['stage'], 'complete')
 
+    def test_broken_jq_fails_closed_before_teardown(self):
+        self.fx.stub('jq', 'exit 127\n')
+        self.inventories(worktrees=[{'path': self.path, 'open_workspace_id': 'ws1'}])
+        p = self.engine()
+        self.assertEqual(p.returncode, 4, p.stdout + p.stderr)
+        self.assertIn('jq', p.stderr)
+        self.assertTrue(os.path.isfile(os.path.join(self.path, 'README')))
+        self.fx.git('show-ref', '--verify', 'refs/heads/ticket-50')
+        self.assertEqual(self.record()['stage'], 'prepared')
+        with open(self.calls) as f:
+            self.assertNotIn('workspace close', f.read())
+
     def test_orca_retirement_never_calls_branch_deleting_adapter(self):
         self.inventories()
         self.fx.db_exec("UPDATE tickets SET platform='orca' WHERE id='50'")

@@ -228,7 +228,10 @@ if [ "$ddev_only" -ne 1 ] && [ "${ORCH_RETIRE_MANAGED:-0}" != 1 ]; then
     fi
     if [ -z "$workspace_id" ]; then
       workspace_id="$(printf '%s' "$wt_json" | jq -r --arg p "$worktree" \
-        '.result.worktrees[] | select(.path==$p) | .open_workspace_id // empty' 2>/dev/null | sed -n '1p')"
+        '.result.worktrees[] | select(.path==$p) | .open_workspace_id // empty' 2>/dev/null | sed -n '1p')" || {
+        echo "retire-worktree: jq failed while looking up the Herdr worktree for $worktree; repair jq and retry." >&2
+        exit 4
+      }
     fi
 
     if [ -z "${workspace_id:-}" ]; then
@@ -241,7 +244,10 @@ if [ "$ddev_only" -ne 1 ] && [ "${ORCH_RETIRE_MANAGED:-0}" != 1 ]; then
         exit 4
       fi
       workspace_id="$(printf '%s' "$ws_json" | jq -r --arg p "$worktree" \
-        '.result.workspaces[] | select(.worktree.checkout_path==$p) | .workspace_id // empty' 2>/dev/null | sed -n '1p')"
+        '.result.workspaces[] | select(.worktree.checkout_path==$p) | .workspace_id // empty' 2>/dev/null | sed -n '1p')" || {
+        echo "retire-worktree: jq failed while looking up the Herdr workspace for $worktree; repair jq and retry." >&2
+        exit 4
+      }
     fi
 
     if [ -n "$workspace_id" ]; then

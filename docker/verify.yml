@@ -1,0 +1,20 @@
+# Non-root verify harness (jq, git, procps installed).
+#
+# Start (from anywhere; the mount is relative to this file):
+#   docker compose -f docker/verify.yml up -d --build
+# Run the suites:
+#   docker compose -f docker/verify.yml exec verify python3 -m unittest discover -s tests
+#   docker compose -f docker/verify.yml exec verify bash skills/retire-worktree/tests/retire-worktree.test.sh
+#   docker compose -f docker/verify.yml exec verify bash skills/retire-worktree/tests/reap-worktrees.test.sh
+# Stop: docker compose -f docker/verify.yml down
+# Override the project name with ORCH_VERIFY_NAME (or `-p`).
+name: ${ORCH_VERIFY_NAME:-orchestration-verify}
+services:
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    volumes:
+      - ..:/work
+    command: sleep infinity
