@@ -105,13 +105,15 @@ No reset or reconciliation command is provided. An explicit requesting-human app
 
 ## Review findings ledger
 
-Pass the `findings` from `orch show <ticket> --json` to the reviewer. The reviewer ends with a `findings` block (`<id or new> | <severity> | <open|fixed> | <file or -> | <summary>`) and reuses a ledger id when re-raising. Record it (stage agents never write state):
+Pass the `findings` from `orch show <ticket> --json` to the reviewer. The reviewer ends with a `findings` block (`<id or new> | <severity> | <open|fixed> | <category or -> | <file or -> | <summary>`) and reuses a ledger id when re-raising. Record it (stage agents never write state):
 
-- `new` -> `orch finding add <ticket> --severity S --summary T [--file F]`
+- `new` -> `orch finding add <ticket> --severity S --summary T [--file F] [--category C]`
 - existing id reported `open` -> `orch finding raise <ticket> <id>`
 - `fixed` -> `orch finding set <ticket> <id> --status fixed`
 - you filed a follow-up ticket for it (see next section) -> `orch finding set <ticket> <id> --status deferred`
 - you judged the finding wrong -> `orch finding set <ticket> <id> --status disputed`
+
+Round 2 and later: the reviewer brief lists the open must-fix findings by ledger id (from `orch show <ticket> --json`, `findings` where status is open and severity must-fix), plus the rule that review re-checks only those and the code changed to fix them, and that a new must-fix needs a category: `correctness`, `security`, `test` or `fix-defect`. orch downgrades a new uncategorised must-fix to follow-up and records the reason; never pass a category the reviewer did not justify. If no open must-fix remains after recording, the review passes (orch refuses the `review -> fix` bounce); file the follow-ups per the next section.
 
 `rounds_open` above 1 means the same finding kept failing across reviews; treat it as a signal to escalate or block. See [Review findings](orch-cli.md#review-findings).
 

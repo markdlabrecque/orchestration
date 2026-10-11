@@ -215,6 +215,8 @@ CREATE TABLE IF NOT EXISTS findings (
     rounds_open INTEGER NOT NULL,
     created_at TEXT,
     updated_at TEXT,
+    category TEXT,
+    reason TEXT,
     UNIQUE(ticket, id)
 );
 CREATE TABLE IF NOT EXISTS selftest_runs (
@@ -521,7 +523,9 @@ def connect(sdir, timeout=30):
         db.executescript(SCHEMA)
     ticket_cols = {r[1] for r in db.execute("PRAGMA table_info(tickets)")}
     run_cols = {r[1] for r in db.execute("PRAGMA table_info(runs)")}
+    finding_cols = {r[1] for r in db.execute("PRAGMA table_info(findings)")}
     needs_upgrade = (any(name not in ticket_cols for name, _ in NEW_COLUMNS)
+                     or not {"category", "reason"} <= finding_cols
                      or any(name not in run_cols for name in NEW_RUN_COLUMNS))
     # Initialized databases stay read-only on connect, even with an active writer.
     with transaction(db) if needs_upgrade else contextlib.nullcontext():
@@ -551,6 +555,9 @@ def connect(sdir, timeout=30):
                             and e["to_phase"] == "fix" for e in events) if complete else None
                 db.execute("UPDATE tickets SET %s=? WHERE id=?" % column,
                            (count, row["id"]))
+        for name in ("category", "reason"):
+            if name not in {r[1] for r in db.execute("PRAGMA table_info(findings)")}:
+                db.execute("ALTER TABLE findings ADD COLUMN %s TEXT" % name)
         run_cols = {r[1] for r in db.execute("PRAGMA table_info(runs)")}
         for name in NEW_RUN_COLUMNS:
             if name not in run_cols:
@@ -2751,7 +2758,8 @@ def cmd_list(args, db, sdir):
 
 
 FINDING_FIELDS = ("id", "round", "severity", "summary", "file", "status",
-                  "status_round", "last_raised_round", "rounds_open")
+                  "status_round", "last_raised_round", "rounds_open", "category", "reason")
+FINDING_CATEGORIES = ("correctness", "security", "test", "fix-defect")
 FINDING_SEVERITIES = ("must-fix", "follow-up", "nit")
 FINDING_STATUSES = ("open", "fixed", "deferred", "disputed")
 
@@ -2769,6 +2777,7 @@ def cmd_finding(args, db, sdir):
     if rnd < 1:
         raise Refusal(EXIT_GATE, "no review round yet; findings follow a review")
     op, ts = args.finding_cmd, now()
+    downgraded = False
     if op == "add":
         summary = args.summary.strip()
         if not summary:
@@ -2776,11 +2785,20 @@ def cmd_finding(args, db, sdir):
         nums = [int(r[0][1:]) for r in db.execute(
             "SELECT id FROM findings WHERE ticket=?", (args.ticket,))]
         fid = "F%d" % (max(nums, default=0) + 1)
+        severity, reason, note = args.severity, None, ""
+        if rnd >= 2 and severity == "must-fix" and not args.category:
+            severity = "follow-up"
+            reason = ("downgraded from must-fix: new in round %d, not "
+                      "correctness/security/test/fix-defect" % rnd)
+            note = " (downgraded from must-fix)"
         db.execute(
             "INSERT INTO findings(ticket,id,round,severity,summary,file,status,status_round,"
-            "last_raised_round,rounds_open,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (args.ticket, fid, rnd, args.severity, summary, args.file, "open", rnd, rnd, 1, ts, ts))
-        detail = "%s add %s open round %d: %s" % (fid, args.severity, rnd, summary)
+            "last_raised_round,rounds_open,created_at,updated_at,category,reason)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (args.ticket, fid, rnd, severity, summary, args.file, "open", rnd, rnd, 1, ts, ts,
+             args.category, reason))
+        detail = "%s add %s%s open round %d: %s" % (fid, severity, note, rnd, summary)
+        downgraded = bool(reason)
     else:
         fid = args.finding
         f = db.execute("SELECT * FROM findings WHERE ticket=? AND id=?",
@@ -2801,7 +2819,7 @@ def cmd_finding(args, db, sdir):
             detail = "%s set %s round %d" % (fid, args.status, rnd)
     log_event(db, args.ticket, "finding", None, None, detail)
     out = next(x for x in ticket_findings(db, args.ticket) if x["id"] == fid)
-    emit(args, out, fid)
+    emit(args, out, fid + (" (downgraded to follow-up)" if downgraded else ""))
 
 
 def cmd_show(args, db, sdir):
@@ -3338,6 +3356,14 @@ def cmd_phase(args, db, sdir):
             message += "; dispatch the ticket with `orch spawn %s` before phase transitions" % args.ticket
         raise Refusal(EXIT_GATE, message)
     bounce = new == "fix" and cur in ("review", "verify")
+    if (new == "fix" and cur == "review" and row["review_rounds"] >= 2
+            and db.execute("SELECT 1 FROM findings WHERE ticket=?", (args.ticket,)).fetchone()
+            and not db.execute("SELECT 1 FROM findings WHERE ticket=? AND status='open'"
+                               " AND severity='must-fix'", (args.ticket,)).fetchone()):
+        raise Refusal(EXIT_GATE, "no open must-fix finding in review round %d; late findings"
+                      " outside correctness/security/test/fix-defect are follow-ups and do not"
+                      " bounce; record or re-raise the qualifying must-fix first"
+                      % row["review_rounds"])
     ci_repair = new == "fix" and cur == "ci"
     grant = None
     if args.repair_grant is not None or args.workflow is not None or args.agent is not None:
@@ -5567,6 +5593,7 @@ def build_parser():
             fp.add_argument("--severity", required=True, choices=FINDING_SEVERITIES)
             fp.add_argument("--summary", required=True)
             fp.add_argument("--file")
+            fp.add_argument("--category", choices=FINDING_CATEGORIES)
         else:
             fp.add_argument("finding")
         if name == "set":
