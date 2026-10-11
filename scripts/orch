@@ -43,6 +43,7 @@ PHASE_STATUS = {
     "ci": "verified",
     "done": "done",
     "blocked": "blocked",
+    "parked": "parked",
 }
 
 TRANSITIONS = {
@@ -59,7 +60,7 @@ TRANSITIONS = {
 }
 
 PHASE_ORDER = ("spec", "tests", "implement", "review", "fix", "verify", "report",
-               "mr", "ci", "ready", "dispatched", "done", "blocked")
+               "mr", "ci", "ready", "dispatched", "done", "blocked", "parked")
 
 BOUNCE_CAP = 3
 CI_REPAIR_CAP = 2
@@ -116,6 +117,8 @@ NEW_COLUMNS = (
     ("ci_repairs", "INTEGER DEFAULT 0"),
     ("baseline_refresh", "TEXT"),
     ("worktree_branch", "TEXT"),
+    # URL of the draft PR/MR a capped ticket was parked as (`orch park`).
+    ("parked_pr", "TEXT"),
 )
 # Columns added to `runs` after the first release (effort rungs).
 NEW_RUN_COLUMNS = ("effort_requested", "effort_resolved", "completed_at", "completion_evidence",
@@ -703,6 +706,7 @@ def ticket_dict(row, cfg, full=True, alive=None):
             "worktree_branch": row["worktree_branch"],
             "baseline_refresh": row["baseline_refresh"],
             "prior_phase": row["prior_phase"],
+            "parked_pr": row["parked_pr"],
             "launch_ref": row_launch_ref(row),
             "launched_at": row["launched_at"],
             "created_at": row["created_at"],
@@ -1086,7 +1090,7 @@ def log_event(db, tid, kind, from_phase, to_phase, detail=None):
 
 
 def is_active(row):
-    return row["phase"] not in ("ready", "done", "blocked") and row["retired_at"] is None
+    return row["phase"] not in ("ready", "done", "blocked", "parked") and row["retired_at"] is None
 
 
 # ---- shared baseline coordination --------------------------------------------
@@ -1352,8 +1356,8 @@ def baseline_refresh(args, db):
         if not refresh:
             raise Refusal(EXIT_GATE, "no refresh requested for this ticket")
         try:
-            if row["retired_at"] or row["phase"] == "done":
-                raise Refusal(EXIT_GATE, "cannot refresh a done or retired ticket")
+            if row["retired_at"] or row["phase"] in ("done", "parked"):
+                raise Refusal(EXIT_GATE, "cannot refresh a done, parked or retired ticket")
             if not args.stage_boundary:
                 raise Refusal(EXIT_GATE, "refresh requires --stage-boundary")
             baseline_idle(db, row)
@@ -2711,7 +2715,26 @@ def cmd_add(args, db, sdir):
     if not TICKET_ID.match(args.ticket) or ".." in args.ticket:
         raise Refusal(EXIT_USAGE, "invalid ticket id %r: use letters, digits, '.', '_'"
                       " and '-', starting with a letter or digit, no '..'" % args.ticket)
-    if db.execute("SELECT 1 FROM tickets WHERE id=?", (args.ticket,)).fetchone():
+    old = db.execute("SELECT phase, retired_at, worktree, trust_marked, trust_codex"
+                     " FROM tickets WHERE id=?", (args.ticket,)).fetchone()
+    if old and old["phase"] == "parked" and old["retired_at"] is not None:
+        if old["trust_marked"] or old["trust_codex"] or (
+                old["worktree"] and os.path.exists(old["worktree"])):
+            raise Refusal(EXIT_GATE, "cannot re-add %s: its kept checkout %s (or folder trust) "
+                          "survives; remove it first (manual cleanup, or finish retirement "
+                          "without --keep-worktree), then re-add"
+                          % (args.ticket, old["worktree"]))
+        # Pick a retired parked ticket up again on its pushed branch; history,
+        # runs and budgets stay.
+        db.execute("UPDATE tickets SET phase='ready', prior_phase=NULL, retired_at=NULL,"
+                   " worktree=NULL, worktree_ref=NULL, worktree_branch=NULL, pid=NULL,"
+                   " pid_start=NULL, session_id=NULL, session_seen=0, launch_ref=NULL,"
+                   " launched_at=NULL, launching=NULL, activity=NULL WHERE id=?",
+                   (args.ticket,))
+        log_event(db, args.ticket, "readd", "parked", "ready", args.title)
+        return emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
+                    "re-added %s" % args.ticket)
+    if old:
         raise Refusal(EXIT_GATE, "ticket already exists: %s" % args.ticket)
     db.execute(
         "INSERT INTO tickets (id, title, url, phase, created_at) VALUES (?,?,?,?,?)",
@@ -3056,8 +3079,8 @@ def resume_ticket(db, sdir, cfg, tid, note=None, platform=None, harness=None):
         old_harness = row_harness(row)
         if not row["worktree"] or (not row["session_id"] and old_harness != "codex"):
             raise Refusal(EXIT_GATE, "ticket %s has no recorded session" % tid)
-        if row["phase"] == "blocked" and not row["prior_phase"]:
-            raise Refusal(EXIT_GATE, "%s is blocked with no remembered phase" % tid)
+        if row["phase"] in ("blocked", "parked") and not row["prior_phase"]:
+            raise Refusal(EXIT_GATE, "%s is %s with no remembered phase" % (tid, row["phase"]))
         platform = platform or row_platform(row)
         harness = harness or old_harness
         check_harness_platform(harness, platform)
@@ -3095,6 +3118,11 @@ def resume_ticket(db, sdir, cfg, tid, note=None, platform=None, harness=None):
             db.execute("UPDATE tickets SET phase=?, prior_phase=NULL WHERE id=?",
                        (phase, tid))
             evs.append(log_event(db, tid, "unblock", "blocked", phase, "resume"))
+        elif phase == "parked":
+            phase = row["prior_phase"]
+            db.execute("UPDATE tickets SET phase=?, prior_phase=NULL WHERE id=?",
+                       (phase, tid))
+            evs.append(log_event(db, tid, "unpark", "parked", phase, "resume"))
         attempt = row["attempt"] + 1
         marker = claim_launch(db, row, "resume")
         db.execute("UPDATE tickets SET pid=NULL, pid_start=NULL, activity=NULL,"
@@ -3300,6 +3328,10 @@ def cmd_phase(args, db, sdir):
         raise Refusal(EXIT_GATE, "ticket %s is retired" % args.ticket)
     if new == "done":
         raise Refusal(EXIT_GATE, "done is reachable only through `orch merged`")
+    if new == "parked":
+        raise Refusal(EXIT_GATE, "parked is reachable only through `orch park`")
+    if cur == "parked":
+        raise Refusal(EXIT_GATE, "%s is parked; resume or re-add it" % args.ticket)
     if new not in TRANSITIONS.get(cur, ()):
         message = "illegal transition %s -> %s for %s" % (cur, new, args.ticket)
         if cur == "ready":
@@ -3345,7 +3377,7 @@ def cmd_phase(args, db, sdir):
 def cmd_block(args, db, sdir):
     row = get_ticket(db, args.ticket)
     cur = row["phase"]
-    if cur in ("blocked", "done") or row["retired_at"] is not None:
+    if cur in ("blocked", "done", "parked") or row["retired_at"] is not None:
         raise Refusal(EXIT_GATE, "cannot block %s in phase %s%s" % (
             args.ticket, cur, " (retired)" if row["retired_at"] else ""))
     db.execute("UPDATE tickets SET phase='blocked', prior_phase=? WHERE id=?",
@@ -3354,6 +3386,25 @@ def cmd_block(args, db, sdir):
     state_md_log(args.ticket, "blocked: " + args.reason)
     emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
          "%s blocked (was %s)" % (args.ticket, cur))
+
+
+def cmd_park(args, db, sdir):
+    row = get_ticket(db, args.ticket)
+    cur = row["phase"]
+    if row["retired_at"] is not None:
+        raise Refusal(EXIT_GATE, "cannot park a retired ticket")
+    if cur in ("ready", "done", "parked"):
+        raise Refusal(EXIT_GATE, "cannot park %s in phase %s" % (args.ticket, cur))
+    if not args.pr.startswith(("http://", "https://")):
+        raise Refusal(EXIT_USAGE, "--pr must be an http(s) URL")
+    prior = row["prior_phase"] if cur == "blocked" else cur
+    db.execute("UPDATE tickets SET phase='parked', parked_pr=?, prior_phase=? WHERE id=?",
+               (args.pr, prior, args.ticket))
+    log_event(db, args.ticket, "park", cur, "parked",
+              args.pr + ((" " + args.reason) if args.reason else ""))
+    state_md_log(args.ticket, "parked: " + args.pr)
+    emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
+         "%s parked (was %s): %s" % (args.ticket, cur, args.pr))
 
 
 def cmd_unblock(args, db, sdir):
@@ -3468,8 +3519,8 @@ def retire_ticket(db, sdir, tid, force, keep_worktree=False, automatic=False):
         row = get_ticket(db, tid)
         if row["retired_at"] is not None:
             raise Refusal(EXIT_GATE, "%s is already retired" % tid)
-        if row["phase"] != "done" and not force:
-            raise Refusal(EXIT_GATE, "retire requires phase done (or --force); %s is %s"
+        if row["phase"] not in ("done", "parked") and not force:
+            raise Refusal(EXIT_GATE, "retire requires phase done or parked (or --force); %s is %s"
                           % (tid, row["phase"]))
         if automatic and row_platform(row) == "desktop":
             raise Refusal(EXIT_GATE, "Desktop archival needs a session tool; run orch retire %s"
@@ -3534,7 +3585,7 @@ def retire_claimed(db, tid, row, force, keep_worktree, marker):
         cur = get_ticket(db, tid)
         if cur["retired_at"] is not None:
             raise Refusal(EXIT_GATE, "%s is already retired" % tid)
-        if cur["launching"] != marker or (not force and cur["phase"] != "done"):
+        if cur["launching"] != marker or (not force and cur["phase"] not in ("done", "parked")):
             raise Refusal(EXIT_GATE, "%s changed phase or retirement owner during teardown" % tid)
         db.execute("UPDATE tickets SET retired_at=?, launching=NULL WHERE id=?",
                    (now(), tid))
@@ -3740,7 +3791,7 @@ def cmd_retry(args, db, sdir):
     refuse_if_refreshing(row)
     if row["retired_at"] is not None:
         raise Refusal(EXIT_GATE, "cannot retry a retired ticket")
-    if row["phase"] in ("done", "blocked"):
+    if row["phase"] in ("done", "blocked", "parked"):
         raise Refusal(EXIT_GATE, "cannot retry a %s ticket" % row["phase"])
     source = db.execute("SELECT * FROM runs WHERE seq=? AND ticket=?",
                         (args.run, args.ticket)).fetchone()
@@ -4105,6 +4156,8 @@ def wake_kind(kind, to_phase, detail):
         return "blocked"
     if kind == "question":
         return "question"
+    if kind == "park":
+        return "parked"
     if to_phase == "done":
         return "done"
     if kind == "health" and detail in WAIT_HEALTH:
@@ -5457,6 +5510,7 @@ def build_parser():
         "attach": "attach a session to a ticket", "stale": "list stale tickets",
         "hook": "harness hook entry point", "phase": "move a ticket to a phase",
         "block": "block a ticket", "unblock": "unblock a ticket",
+        "park": "park a capped ticket as a draft PR/MR",
         "ci": "record a CI result", "merged": "mark a ticket merged",
         "retire": "retire a ticket's worktree", "events": "show a ticket's events",
         "route": "pick a model for a role", "run": "record a subagent run",
@@ -5575,6 +5629,9 @@ def build_parser():
     sp.add_argument("--agent")
     sp = add("block", cmd_block, "ticket")
     sp.add_argument("--reason", required=True, help="why it is blocked, recorded in STATE.md")
+    sp = add("park", cmd_park, "ticket")
+    sp.add_argument("--pr", required=True, help="URL of the draft PR/MR")
+    sp.add_argument("--reason")
     add("unblock", cmd_unblock, "ticket")
     sp = add("ci", cmd_ci, "ticket")
     sp.add_argument("--sha", required=True)
