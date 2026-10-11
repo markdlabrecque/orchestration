@@ -179,6 +179,21 @@ Ask once, two options max, with a recommendation. Once answered, run to the end.
 
 An offer at the end of a message ("Want me to…", "Your call") is a stop in disguise. Either do the thing or drop the sentence.
 
+## Parking a capped ticket
+
+A human-triggered fallback that ends a capped or blocked ticket without merging. Park only when a human picks it from triage or asks for it on a blocked ticket. Never park on a timer.
+
+1. Commit the work as it stands.
+2. Rebase onto `BASE_BRANCH` if that is clean; otherwise push as is.
+3. Push the branch.
+4. Open a draft: `gh pr create --draft --base <BASE_BRANCH>` or `glab mr create --draft --target-branch <BASE_BRANCH>`. The body lists the open `must-fix` entries from `orch show <ticket> --json` `findings` with their ids (F1, F2…), plus the block reason and links to review notes where the ledger has none, the triage case and options if there is one, and the test results.
+5. Comment the link on the ticket (`gh issue comment` / `glab issue note`). Leave the ticket open.
+6. `orch park <ticket> --pr <url> [--reason R]`.
+
+Then stop: no CI watch, no merge. Orchestration never merges a parked PR.
+
+To pick it up again: if the ticket is not retired, `orch resume <ticket>` restores its prior phase and keeps `parked_pr`. If it was retired (`orch retire` accepts `parked` without `--force`), `orch add <ticket> --title T` re-opens it as `ready` with history, budgets and `parked_pr` kept; then `create-worktree <ticket>` (checks out the pushed branch) and `orch spawn`. Budgets are never replenished: a capped ticket still needs a human repair grant before another fix.
+
 ## Project conventions
 
 Read the project's `AGENTS.md` (or `CLAUDE.md`) before `mr`. Branch and commit conventions, MR assignee, labels, issue transitions, changelog entries and whether merges wait for a human all come from there. Where they conflict with this file, the project wins.
