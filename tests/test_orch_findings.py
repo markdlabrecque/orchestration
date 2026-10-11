@@ -35,6 +35,7 @@ class FindingsTests(RoutingTestCase):
 
     def test_raise_counts_each_round_once_and_set_reopens(self):
         self.j("finding", "add", "t1", "--severity", "must-fix", "--summary", "x")
+        self.j("finding", "add", "t1", "--severity", "must-fix", "--summary", "keeps bounces legitimate")
         self.ok("finding", "raise", "t1", "F1")
         self.assertEqual(self.ledger()["F1"]["rounds_open"], 1)
         self.next_round()
@@ -51,7 +52,7 @@ class FindingsTests(RoutingTestCase):
         f = self.ledger()["F1"]
         self.assertEqual((f["status"], f["status_round"], f["rounds_open"]),
                          ("open", 3, 3))
-        self.assertEqual(len(self.finding_events()), 6)
+        self.assertEqual(len(self.finding_events()), 7)
 
     def test_state_md_lists_only_open_must_fix(self):
         self.j("finding", "add", "t1", "--severity", "must-fix", "--summary", "keepme")
@@ -89,3 +90,39 @@ class FindingsTests(RoutingTestCase):
             "AND name LIKE 'state_md_findings_%' ORDER BY name"),
             [("state_md_findings_delete",), ("state_md_findings_insert",),
              ("state_md_findings_update",)])
+
+    def add_must_fix(self, *extra):
+        return self.j("finding", "add", "t1", "--severity", "must-fix",
+                      "--summary", "late", *extra)
+
+    def test_round2_uncategorised_must_fix_downgrades_and_cannot_bounce(self):
+        self.next_round()
+        f = self.add_must_fix()
+        self.assertEqual(f["severity"], "follow-up")
+        self.assertIn("downgraded", f["reason"])
+        self.assertIn("downgraded", self.ledger()[f["id"]]["reason"])
+        bounces = self.show("t1")["bounces"]
+        self.refused(3, "phase", "t1", "fix")
+        t = self.show("t1")
+        self.assertEqual((t["phase"], t["bounces"]), ("review", bounces))
+
+    def test_round2_categorised_must_fix_stays_and_bounces(self):
+        self.next_round()
+        f = self.add_must_fix("--category", "fix-defect")
+        self.assertEqual((f["severity"], f["category"]), ("must-fix", "fix-defect"))
+        self.ok("phase", "t1", "fix")
+
+    def test_round2_reraised_round1_must_fix_bounces(self):
+        self.add_must_fix()  # round 1, uncategorised, stays must-fix
+        self.next_round()
+        self.ok("finding", "raise", "t1", "F1")
+        self.ok("phase", "t1", "fix")
+
+    def test_findings_table_without_category_reason_is_migrated(self):
+        for col in ("category", "reason"):  # no-op until the schema has them
+            if col in [r[1] for r in self.db_exec("PRAGMA table_info(findings)")]:
+                self.db_exec("ALTER TABLE findings DROP COLUMN " + col)
+        self.ok("show", "t1")
+        cols = [r[1] for r in self.db_exec("PRAGMA table_info(findings)")]
+        self.assertIn("category", cols)
+        self.assertIn("reason", cols)

@@ -473,7 +473,7 @@ Every command accepts `--json`, before or after the command name (one JSON objec
 | `orch wait [--since SEQ] [--timeout S] [--interval S]` | main | Agent wake-up: blocks until a ticket needs attention; see "Waiting for events". |
 | `orch ask <ticket> <question> [--timeout S] [--interval S] [--json]` | ticket | Asks the main orchestrator and blocks for the answer; see "Asking the main orchestrator". |
 | `orch answer <ticket> <question-id> <answer> [--json]` | main | Answers a ticket's question. Exit 4 for an unknown id, 3 if already answered or retired, 2 if empty. |
-| `orch finding add <ticket> --severity S --summary T [--file F]` / `raise <ticket> <id>` / `set <ticket> <id> --status X` | ticket | Review findings ledger; see "Review findings". |
+| `orch finding add <ticket> --severity S --summary T [--file F] [--category C]` / `raise <ticket> <id>` / `set <ticket> <id> --status X` | ticket | Review findings ledger; see "Review findings". |
 | `orch selftest [...]` | main | Lifecycle self-check; see [platforms.md](platforms.md). |
 | `orch events <ticket>` | any | The ticket's event log, oldest first. |
 | `orch route <ticket> --role R [--files N] [--lines N] [--ambiguous]` | ticket | Read-only: the tier, effort and dispatch value for the ticket's harness ("Model routing"). Text: the model on the first line, then `tier:`, `effort:`, `thinking:` (Pi), `agent:` (Codex, stage roles) and a `why:` line per bump or floor applied. `--json`: `{"tier", "model", "effort", "thinking" (Pi), "agent" (Codex), "floors": [reasons]}`. Roles: `filer`, `investigation`, `test-writer`, `implementor`, `reviewer`, `verifier`, `reporter`; another exits 2. An implementor after a `frontier/high` bounce exits 3 (block for a human). |
@@ -488,13 +488,13 @@ Workflow events retain timestamp, ticket, kind, from phase, to phase and detail.
 
 One `findings` row per review finding per ticket, recorded by the ticket orchestrator from the reviewer's `findings` block.
 
-- `orch finding add <ticket> --severity must-fix|follow-up|nit --summary T [--file F]`: next id `F<n>` (stable per ticket), round = current `review_rounds`, status `open`, `rounds_open` 1. Prints the id (`--json`: the finding).
+- `orch finding add <ticket> --severity must-fix|follow-up|nit --summary T [--file F] [--category correctness|security|test|fix-defect]`: next id `F<n>` (stable per ticket), round = current `review_rounds`, status `open`, `rounds_open` 1. Prints the id (`--json`: the finding). From round 2, a `must-fix` without `--category` is stored as `follow-up` with a `reason` (`downgraded from must-fix: ...`), exit 0, and printed as `F3 (downgraded to follow-up)`; with a category it stays `must-fix`.
 - `orch finding raise <ticket> <id>`: reviewer re-raised it. In a later round than `last_raised_round`, `rounds_open` + 1; the same round again does not count. A non-open finding reopens.
 - `orch finding set <ticket> <id> --status open|fixed|deferred|disputed`: sets status and `status_round`.
 
-Fields: `id, round, severity, summary, file, status, status_round, last_raised_round, rounds_open`. `orch show` lists them (`findings` in `--json`).
+Fields: `id, round, severity, summary, file, status, status_round, last_raised_round, rounds_open, category, reason`. `orch show` lists them (`findings` in `--json`).
 
-Refusals: unknown ticket or finding exit 4; no review round yet, or `PI_SUBAGENT_CHILD=1`, exit 3; empty summary exit 2; bad severity or status exit 2. Each change writes one `finding` event (no phases). STATE.md gains `### Open must-fix findings` (open, must-fix only) and a `findings` detailed record.
+Refusals: unknown ticket or finding exit 4; no review round yet, or `PI_SUBAGENT_CHILD=1`, exit 3; empty summary exit 2; bad severity or status exit 2; `orch phase <ticket> fix` from `review` exits 3 when `review_rounds >= 2`, the ticket has ledger rows and no finding is open and must-fix, with no state changes (not applied to verify->fix, ci->fix, or tickets with no ledger rows). Each change writes one `finding` event (no phases). STATE.md gains `### Open must-fix findings` (open, must-fix only) and a `findings` detailed record.
 
 ## Waiting for events
 
