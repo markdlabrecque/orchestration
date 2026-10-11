@@ -3339,6 +3339,56 @@ def matching_repair_grant(args, db, row):
     return grant
 
 
+def bounce_triage(db, sdir, tid, origin, count, cap):
+    """Read-only triage of a bounce-cap stop; writes a Markdown file, never the DB."""
+    must = [f for f in ticket_findings(db, tid) if f["severity"] == "must-fix"]
+    if not must:
+        return None, None
+    ids = lambda items: ", ".join(f["id"] for f in items)
+    disputed = [f for f in must if f["status"] == "disputed"]
+    recurring = [f for f in must if f["status"] == "open" and (f["rounds_open"] or 0) >= 2]
+    unfixed = [f for f in must if f["status"] != "fixed"]
+    vague = [f for f in unfixed if f["status"] == "deferred" or not f["file"]]
+    if disputed:
+        case, signal = "disagreement", "disputed must-fix: " + ids(disputed)
+        rec = "human picks one side of the dispute (one question, two options)"
+        other = "file the disputed point as a follow-up"
+    elif recurring:
+        case, signal = "recurring-finding", "open for 2+ rounds: " + ids(recurring)
+        rec = ("one granted repair on the frontier tier with only %s in the brief"
+               % ids(recurring))
+        other = "split the finding into a follow-up and ship the rest"
+    elif unfixed and len(vague) * 2 >= len(unfixed):
+        case, signal = "unclear-or-oversized", "deferred or fileless must-fix: " + ids(vague)
+        rec = "split, ship the done part, file the rest"
+        other = "ask the human to clarify the scope"
+    else:
+        case, signal = "moving-target", ("open must-fixes are mostly fresh (rounds_open 1)"
+                                         if unfixed else "no must-fix open; cap reached anyway")
+        rec = "turn the remaining findings into follow-ups and continue"
+        other = "one granted repair"
+    lines = [
+        "# Bounce cap triage: %s" % tid, "",
+        "Stop: bounces budget exhausted (%d/%d), from %s -> fix" % (count, cap, origin), "",
+        "Case: %s" % case, "Signal: %s" % signal, "",
+        "Recommended: %s" % rec, "Other option: %s" % other, "",
+        "How to answer: `orch resume %s --note \"<choice>\"`. Options that need an extra"
+        " repair go through the repair-grant procedure"
+        " (orch-cli.md#one-extra-repair-exception); triage grants nothing." % tid, "",
+        "Also available: park as a draft PR (`orch park %s --pr <url>`; see"
+        " ticket-pipeline.md#parking-a-capped-ticket)." % tid, "",
+        "| id | status | rounds_open | file | summary |", "|---|---|---|---|---|"]
+    for f in must:
+        lines.append("| %s | %s | %s | %s | %s |" % (
+            f["id"], f["status"], f["rounds_open"], f["file"] or "",
+            str(f["summary"]).replace("|", "\\|").replace("\n", " ")))
+    path = os.path.join(sdir, "triage", tid + ".md")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return case, path
+
+
 def cmd_phase(args, db, sdir):
     row = get_ticket(db, args.ticket)
     cur, new = row["phase"], args.phase
@@ -3376,9 +3426,22 @@ def cmd_phase(args, db, sdir):
         if count is None or (count >= cap and grant is None):
             why = ("unknown %s history requires evidence-backed human reconciliation" % column
                    if count is None else "%s budget exhausted (%d/%d)" % (column, count, cap))
-            raise Refusal(EXIT_GATE, why + "; stop before dispatch and block for a human"
+            reason, extra = why, ""
+            if bounce and count is not None:
+                try:
+                    case, tpath = bounce_triage(db, sdir, args.ticket, cur, count, cap)
+                except OSError as e:
+                    case, tpath = None, None
+                    reason += "; triage: write failed (%s)" % e
+                else:
+                    if case:
+                        reason += "; triage: %s" % tpath
+                        extra = "; triage case %s" % case
+                    else:
+                        reason += "; triage: no findings ledger"
+            raise Refusal(EXIT_GATE, why + extra + "; stop before dispatch and block for a human"
                           " (`orch block %s --reason \"%s; findings: <link>\"`)"
-                          % (args.ticket, why))
+                          % (args.ticket, reason))
     if bounce:
         last = last_run(db, args.ticket, "implementor")
         if last and rung_of(last) >= TOP_RUNG:
