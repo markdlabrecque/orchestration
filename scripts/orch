@@ -198,6 +198,22 @@ CREATE TABLE IF NOT EXISTS baselines (
     id TEXT PRIMARY KEY,
     record TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS findings (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket TEXT NOT NULL,
+    id TEXT NOT NULL,
+    round INTEGER NOT NULL,
+    severity TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    file TEXT,
+    status TEXT NOT NULL,
+    status_round INTEGER NOT NULL,
+    last_raised_round INTEGER NOT NULL,
+    rounds_open INTEGER NOT NULL,
+    created_at TEXT,
+    updated_at TEXT,
+    UNIQUE(ticket, id)
+);
 CREATE TABLE IF NOT EXISTS selftest_runs (
     run TEXT PRIMARY KEY,
     state TEXT NOT NULL,
@@ -498,7 +514,7 @@ def connect(sdir, timeout=30):
         db.execute("PRAGMA journal_mode=WAL")
     have = {r[0] for r in db.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
-    if not {"tickets", "events", "ci_results", "selftest_runs", "runs", "baselines", "run_outcomes", "repair_grants", "second_repair_grants"} <= have:
+    if not {"tickets", "events", "ci_results", "selftest_runs", "runs", "baselines", "run_outcomes", "repair_grants", "second_repair_grants", "findings"} <= have:
         db.executescript(SCHEMA)
     ticket_cols = {r[1] for r in db.execute("PRAGMA table_info(tickets)")}
     run_cols = {r[1] for r in db.execute("PRAGMA table_info(runs)")}
@@ -703,7 +719,9 @@ STATE_END = b"<!-- orch:state-md end -->"
 def state_md_schema(db):
     """Triggers also track commits made by already-running older CLI versions."""
     if db.execute("SELECT COUNT(*) FROM sqlite_master WHERE name IN "
-                  "('state_md_repair_grants_delete', 'state_md_second_repair_grants_delete')").fetchone()[0] == 2:
+                  "('state_md_repair_grants_delete', 'state_md_second_repair_grants_delete', "
+                  "'state_md_findings_insert', 'state_md_findings_update', "
+                  "'state_md_findings_delete')").fetchone()[0] == 5:
         return
     with transaction(db):
         db.execute("CREATE TABLE IF NOT EXISTS state_md_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL)")
@@ -711,7 +729,8 @@ def state_md_schema(db):
         for table, key in (("tickets", "id"), ("events", "ticket"),
                            ("runs", "ticket"), ("ci_results", "ticket"),
                            ("run_outcomes", "ticket"), ("repair_grants", "ticket"),
-                           ("second_repair_grants", "ticket"), ("baselines", None)):
+                           ("second_repair_grants", "ticket"), ("findings", "ticket"),
+                           ("baselines", None)):
             for action in ("INSERT", "UPDATE", "DELETE"):
                 refs = ("OLD", "NEW") if action == "UPDATE" else ("OLD",) if action == "DELETE" else ("NEW",)
                 condition = " OR ".join("substr(%s.%s,1,9) != 'selftest-'" % (ref, key)
@@ -750,6 +769,7 @@ def state_md_snapshot(db, legacy=()):
                                   ("runs", "ticket", "seq"), ("ci_results", "ticket", "seq"),
                                   ("run_outcomes", "ticket", "seq"), ("repair_grants", "ticket", "ticket"),
                                   ("second_repair_grants", "ticket", "ticket"),
+                                  ("findings", "ticket", "seq"),
                                   ("baselines", None, "id")):
             where = " WHERE substr(%s,1,9) != 'selftest-'" % key if key else ""
             records[table] = [dict(r) for r in db.execute("SELECT * FROM %s%s ORDER BY %s" % (table, where, order))]
@@ -780,6 +800,13 @@ def state_md_snapshot(db, legacy=()):
     for row in records["events"]:
         lines.append("| " + " | ".join(state_md_cell(row[key]) for key in
                      ("seq", "ts", "ticket", "kind", "from_phase", "to_phase", "detail")) + " |")
+    lines.extend(["", "### Open must-fix findings", "",
+                  "| Ticket | Finding | Round | Rounds open | File | Summary |",
+                  "| --- | --- | --- | --- | --- | --- |"])
+    for row in records["findings"]:
+        if row["status"] == "open" and row["severity"] == "must-fix":
+            lines.append("| " + " | ".join(state_md_cell(row[key]) for key in
+                         ("ticket", "id", "round", "rounds_open", "file", "summary")) + " |")
     if legacy:
         lines.extend(["", "### Retained legacy appends", "",
                       "Late writes to replaced files, retained verbatim in `.STATE.md.legacy/`."])
@@ -2700,6 +2727,60 @@ def cmd_list(args, db, sdir):
                  load_config(sdir))
 
 
+FINDING_FIELDS = ("id", "round", "severity", "summary", "file", "status",
+                  "status_round", "last_raised_round", "rounds_open")
+FINDING_SEVERITIES = ("must-fix", "follow-up", "nit")
+FINDING_STATUSES = ("open", "fixed", "deferred", "disputed")
+
+
+def ticket_findings(db, tid):
+    return [{k: r[k] for k in FINDING_FIELDS} for r in db.execute(
+        "SELECT * FROM findings WHERE ticket=? ORDER BY seq", (tid,))]
+
+
+def cmd_finding(args, db, sdir):
+    row = get_ticket(db, args.ticket)
+    if os.environ.get("PI_SUBAGENT_CHILD") == "1":
+        raise Refusal(EXIT_GATE, "findings must be recorded by the ticket orchestrator")
+    rnd = row["review_rounds"] or 0
+    if rnd < 1:
+        raise Refusal(EXIT_GATE, "no review round yet; findings follow a review")
+    op, ts = args.finding_cmd, now()
+    if op == "add":
+        summary = args.summary.strip()
+        if not summary:
+            raise Refusal(EXIT_USAGE, "finding summary must not be empty")
+        nums = [int(r[0][1:]) for r in db.execute(
+            "SELECT id FROM findings WHERE ticket=?", (args.ticket,))]
+        fid = "F%d" % (max(nums, default=0) + 1)
+        db.execute(
+            "INSERT INTO findings(ticket,id,round,severity,summary,file,status,status_round,"
+            "last_raised_round,rounds_open,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (args.ticket, fid, rnd, args.severity, summary, args.file, "open", rnd, rnd, 1, ts, ts))
+        detail = "%s add %s open round %d: %s" % (fid, args.severity, rnd, summary)
+    else:
+        fid = args.finding
+        f = db.execute("SELECT * FROM findings WHERE ticket=? AND id=?",
+                       (args.ticket, fid)).fetchone()
+        if f is None:
+            raise Refusal(EXIT_NOT_FOUND, "no finding %s on ticket %s" % (fid, args.ticket))
+        if op == "raise":
+            if rnd > f["last_raised_round"]:
+                db.execute("UPDATE findings SET rounds_open=rounds_open+1, last_raised_round=?,"
+                           " updated_at=? WHERE seq=?", (rnd, ts, f["seq"]))
+            if f["status"] != "open":
+                db.execute("UPDATE findings SET status='open', status_round=?, updated_at=?"
+                           " WHERE seq=?", (rnd, ts, f["seq"]))
+            detail = "%s raise round %d" % (fid, rnd)
+        else:
+            db.execute("UPDATE findings SET status=?, status_round=?, updated_at=? WHERE seq=?",
+                       (args.status, rnd, ts, f["seq"]))
+            detail = "%s set %s round %d" % (fid, args.status, rnd)
+    log_event(db, args.ticket, "finding", None, None, detail)
+    out = next(x for x in ticket_findings(db, args.ticket) if x["id"] == fid)
+    emit(args, out, fid)
+
+
 def cmd_show(args, db, sdir):
     row = get_ticket(db, args.ticket)
     t = ticket_dict(row, load_config(sdir))
@@ -2716,6 +2797,13 @@ def cmd_show(args, db, sdir):
     text = "\n".join("%s: %s" % (k, v) for k, v in t.items())
     if runs:
         text += "\nruns:\n" + fmt_runs(runs)
+    found = ticket_findings(db, args.ticket)
+    if found:
+        text += "\nfindings:\n" + "\n".join(
+            "%s\t%s\t%s\tround=%s\trounds_open=%s\t%s\t%s" % (
+                f["id"], f["severity"], f["status"], f["round"], f["rounds_open"],
+                f["file"] or "-", f["summary"]) for f in found)
+    t["findings"] = found
     t["runs"] = runs
     t["run_outcomes"] = [outcome for run in runs for outcome in run["outcomes"]]
     emit(args, t, text)
@@ -5415,6 +5503,20 @@ def build_parser():
         if name == "ack":
             for flag in ("sha", "tests", "review"):
                 bp.add_argument("--" + flag, required=True)
+    finding = sub.add_parser("finding", parents=[common], help="record review findings and their status per ticket")
+    fcmds = finding.add_subparsers(dest="finding_cmd", required=True)
+    for name in ("add", "raise", "set"):
+        fp = fcmds.add_parser(name, parents=[common])
+        fp.set_defaults(fn=cmd_finding)
+        fp.add_argument("ticket")
+        if name == "add":
+            fp.add_argument("--severity", required=True, choices=FINDING_SEVERITIES)
+            fp.add_argument("--summary", required=True)
+            fp.add_argument("--file")
+        else:
+            fp.add_argument("finding")
+        if name == "set":
+            fp.add_argument("--status", required=True, choices=FINDING_STATUSES)
     complete = sub.add_parser("complete-run", parents=[common], help="attest a stage invocation and its children have stopped")
     complete.set_defaults(fn=cmd_complete_run)
     complete.add_argument("ticket")

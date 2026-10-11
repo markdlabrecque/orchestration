@@ -103,6 +103,18 @@ Use `orch show` on resume to inspect both durable counts. Legacy migration prese
 
 No reset or reconciliation command is provided. An explicit requesting-human approval can authorize the [one-extra-repair exception](orch-cli.md#one-extra-repair-exception). After its consumption, a separate explicit approval can authorize the [second and final exception](orch-cli.md#second-explicit-exception), bound to that predecessor at four bounces. Neither exception waives the independent frontier gate; a refusal still stops dispatch. Follow that parent-owned grant and matching transition procedure before any additional repair work. It preserves the used budget and history; it does not waive routing, independent review, automated gates or CI. Without that approval and successful transition, keep the ticket blocked. Unknown history remains blocked until evidence-backed human reconciliation under separately authorized state maintenance recovers the actual count. Retain that count, the reasoning and supporting exports, backups, tracker links or session records in the tracker or durable evidence files, and link them in the block reason. Never assume zero or forgive attempts. See [orch-cli.md](orch-cli.md#durable-budgets-and-legacy-history) for migration and inspection details.
 
+## Review findings ledger
+
+Pass the `findings` from `orch show <ticket> --json` to the reviewer. The reviewer ends with a `findings` block (`<id or new> | <severity> | <open|fixed> | <file or -> | <summary>`) and reuses a ledger id when re-raising. Record it (stage agents never write state):
+
+- `new` -> `orch finding add <ticket> --severity S --summary T [--file F]`
+- existing id reported `open` -> `orch finding raise <ticket> <id>`
+- `fixed` -> `orch finding set <ticket> <id> --status fixed`
+- you filed a follow-up ticket for it (see next section) -> `orch finding set <ticket> <id> --status deferred`
+- you judged the finding wrong -> `orch finding set <ticket> <id> --status disputed`
+
+`rounds_open` above 1 means the same finding kept failing across reviews; treat it as a signal to escalate or block. See [Review findings](orch-cli.md#review-findings).
+
 ## Review findings: fix now or file a ticket
 
 You decide each finding **without asking the user**.
