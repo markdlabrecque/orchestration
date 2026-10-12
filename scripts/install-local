@@ -3,6 +3,8 @@
 #
 #     install-local [claude|codex|pi ...]    # default: every harness on PATH
 #
+# Every run also links ~/bin/orch-update to this script.
+#
 # Safe to re-run after every change. Claude Code and Codex install a copy, so
 # each run reinstalls from this checkout; Pi loads the checkout in place.
 # Restart open sessions to pick up the new copy.
@@ -107,6 +109,25 @@ install_pi() {
   fi
 }
 
+# `orch-update` in ~/bin runs this script from anywhere. A link to another
+# checkout is repointed here; a real file there is left alone.
+link_update_command() {
+  local link="$HOME/bin/orch-update" target="$ROOT/scripts/install-local"
+  if [ -L "$link" ] && [ "$(readlink "$link")" = "$target" ]; then return 0; fi
+  if [ -e "$link" ] && [ ! -L "$link" ]; then
+    echo "orchestration: $link is not a symlink; left alone." >&2
+    return 0
+  fi
+  mkdir -p "$HOME/bin"
+  ln -sfn "$target" "$link"
+  echo "linked $link -> $target"
+  case ":$PATH:" in
+    *":$HOME/bin:"*) ;;
+    *) echo "note: $HOME/bin is not on PATH" ;;
+  esac
+}
+
+link_update_command
 if command -v claude >/dev/null; then version_check; fi
 
 harnesses=("$@")
@@ -116,7 +137,8 @@ if [ ${#harnesses[@]} -eq 0 ]; then
   done
 fi
 
-for h in "${harnesses[@]}"; do
+# bash 3.2 (macOS /bin/bash) treats an empty array as unset under `set -u`.
+for h in ${harnesses[@]+"${harnesses[@]}"}; do
   case "$h" in
     claude|codex|pi) "install_$h" ;;
     *) echo "unknown harness: $h (use claude, codex or pi)" >&2; exit 2 ;;
