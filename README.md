@@ -93,7 +93,7 @@ Every `.orch` key resolves the same way: environment variable, then `.orch`, the
 
 The skill is user-invoked only on every harness. Ticket sessions run on the harness the main orchestrator runs on; `ORCH_HARNESS` overrides the detection.
 
-Run `scripts/install-local` from this checkout. Its first line says which version Claude Code has installed and which this checkout offers; when they match (same version and commit, clean tree) it exits there. Otherwise it installs the plugin in every harness on `PATH` (or only the ones you name: `scripts/install-local codex`), and removes older installs from other marketplaces. Re-run it after every change, then restart open sessions. Claude Code and Codex install a copy, so they need the re-run; Pi loads the checkout in place.
+Run `scripts/install-local` from this checkout. Its first line says which version Claude Code has installed and which this checkout offers; when they match (same version and commit, clean tree) it exits there. Otherwise it installs the plugin in every harness on `PATH` (or only the ones you name: `scripts/install-local codex`), and removes older installs from other marketplaces. Every run also links `~/bin/orch-update` to this script, so `orch-update` refreshes the install from anywhere. Re-run it after every change, then restart open sessions. Claude Code and Codex install a copy, so they need the re-run; Pi loads the checkout in place.
 
 | Harness | What the script does | Start it |
 |---|---|---|
