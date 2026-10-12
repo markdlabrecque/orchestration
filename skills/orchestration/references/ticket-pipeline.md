@@ -103,6 +103,22 @@ Use `orch show` on resume to inspect both durable counts. Legacy migration prese
 
 No reset or reconciliation command is provided. An explicit requesting-human approval can authorize the [one-extra-repair exception](orch-cli.md#one-extra-repair-exception). After its consumption, a separate explicit approval can authorize the [second and final exception](orch-cli.md#second-explicit-exception), bound to that predecessor at four bounces. Neither exception waives the independent frontier gate; a refusal still stops dispatch. Follow that parent-owned grant and matching transition procedure before any additional repair work. It preserves the used budget and history; it does not waive routing, independent review, automated gates or CI. Without that approval and successful transition, keep the ticket blocked. Unknown history remains blocked until evidence-backed human reconciliation under separately authorized state maintenance recovers the actual count. Retain that count, the reasoning and supporting exports, backups, tracker links or session records in the tracker or durable evidence files, and link them in the block reason. Never assume zero or forgive attempts. See [orch-cli.md](orch-cli.md#durable-budgets-and-legacy-history) for migration and inspection details.
 
+## Bounce cap triage
+
+When `orch phase <t> fix` from `review` or `verify` is refused for an exhausted bounce budget, `orch` reads the findings ledger and picks one case (first match wins, must-fix findings only):
+
+| Order | Case | Rule | Recommended | Other option |
+|---|---|---|---|---|
+| 0 | no ledger | no must-fix findings | no file; refusal says `triage: no findings ledger` | n/a |
+| 1 | `disagreement` | any must-fix is `disputed` | human picks one side | file the point as a follow-up |
+| 2 | `recurring-finding` | an `open` must-fix has `rounds_open >= 2` | one granted repair on the frontier tier, only those ids in the brief | split it into a follow-up, ship the rest |
+| 3 | `unclear-or-oversized` | at least half of the not-`fixed` must-fix are `deferred` or have no file | split, ship the done part, file the rest | ask the human to clarify scope |
+| 4 | `moving-target` | anything else | turn remaining findings into follow-ups and continue | one granted repair |
+
+Because the review-round gate refuses `fix` once a ticket has no open must-fix, `disagreement` is only reachable at the cap while at least one other must-fix is still open.
+
+The file is `<state dir>/triage/<ticket>.md` (overwritten, no timestamps). The block reason takes the form `orch block <t> --reason "bounces budget exhausted (3/3); triage: <path>; findings: <link>"`. Triage never consumes a bounce, grants a repair or bypasses the frontier gate. The triage file also offers parking the ticket as a draft PR; see [Parking a capped ticket](#parking-a-capped-ticket).
+
 ## Review findings ledger
 
 Pass the `findings` from `orch show <ticket> --json` to the reviewer. The reviewer ends with a `findings` block (`<id or new> | <severity> | <open|fixed> | <category or -> | <file or -> | <summary>`) and reuses a ledger id when re-raising. Record it (stage agents never write state):
@@ -177,7 +193,7 @@ Ask once, two options max, with a recommendation. Once answered, run to the end.
 | Visible defect in this ticket's own output | Fix it. It's the deliverable. |
 | "Reviewer found a separate bug. File it?" | File it. Report the ID. |
 | "Run `ddev drush cim -y`? It wipes local drift." | Run it. The worktree's DDEV database is disposable. |
-| Repair budget exhausted or history unknown | Stop before fix dispatch, retain findings and evidence, and explicitly `orch block` for a human. No reset or route-around dispatch. |
+| Repair budget exhausted or history unknown | Stop before fix dispatch (a bounce-cap stop also writes a [triage file](#bounce-cap-triage)), retain findings and evidence, and explicitly `orch block` for a human. No reset or route-around dispatch. |
 
 An offer at the end of a message ("Want me to…", "Your call") is a stop in disguise. Either do the thing or drop the sentence.
 
