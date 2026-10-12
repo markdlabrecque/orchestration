@@ -2777,6 +2777,9 @@ def cmd_finding(args, db, sdir):
         if args.category is not None and args.category not in FINDING_CATEGORIES:
             raise Refusal(EXIT_USAGE, "unknown category %r: one of %s"
                           % (args.category, ", ".join(FINDING_CATEGORIES)))
+    if args.finding_cmd == "set" and args.status not in FINDING_STATUSES:
+        raise Refusal(EXIT_USAGE, "unknown status %r: one of %s"
+                      % (args.status, ", ".join(FINDING_STATUSES)))
     row = get_ticket(db, args.ticket)
     if os.environ.get("PI_SUBAGENT_CHILD") == "1":
         raise Refusal(EXIT_GATE, "findings must be recorded by the ticket orchestrator")
@@ -5665,14 +5668,17 @@ def build_parser():
         fp.set_defaults(fn=cmd_finding)
         fp.add_argument("ticket")
         if name == "add":
-            fp.add_argument("--severity", required=True)
+            fp.add_argument("--severity", required=True,
+                            help="one of: " + ", ".join(FINDING_SEVERITIES))
             fp.add_argument("--summary", required=True)
             fp.add_argument("--file")
-            fp.add_argument("--category")
+            fp.add_argument("--category",
+                            help="one of: " + ", ".join(FINDING_CATEGORIES))
         else:
             fp.add_argument("finding")
         if name == "set":
-            fp.add_argument("--status", required=True, choices=FINDING_STATUSES)
+            fp.add_argument("--status", required=True,
+                            help="one of: " + ", ".join(FINDING_STATUSES))
     complete = sub.add_parser("complete-run", parents=[common], help="attest a stage invocation and its children have stopped")
     complete.set_defaults(fn=cmd_complete_run)
     complete.add_argument("ticket")

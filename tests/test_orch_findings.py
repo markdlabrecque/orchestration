@@ -155,3 +155,23 @@ class FindingsTests(RoutingTestCase):
         self.assertNotIn("usage:", p.stderr)
         for sev in ("must-fix", "follow-up", "nit"):
             self.assertIn(sev, p.stderr)
+
+    def test_finding_set_bad_status_is_orch_usage_error(self):
+        self.j("finding", "add", "t1", "--severity", "nit", "--summary", "typo")
+        p = self.refused(2, "finding", "set", "t1", "F1", "--status", "bogus")
+        self.assertTrue(p.stderr.startswith("orch: "), p.stderr)
+        self.assertNotIn("usage:", p.stderr)
+        for st in ("open", "fixed", "deferred", "disputed"):
+            self.assertIn(st, p.stderr)
+
+    def test_finding_add_help_lists_severity_and_category_values(self):
+        import re
+        out = self.ok("finding", "add", "--help", env={"COLUMNS": "200"}).stdout
+        opts = out[out.index("\n  -h, --help") + 1:]
+        # split the options section into per-flag blocks
+        blocks = re.split(r"\n  (?=-)", opts)
+        help_of = {b.split()[0]: " ".join(b.split()[2:]) for b in blocks}
+        for sev in ("must-fix", "follow-up", "nit"):
+            self.assertIn(sev, help_of["--severity"])
+        for cat in ("correctness", "security", "test", "fix-defect"):
+            self.assertIn(cat, help_of["--category"])
