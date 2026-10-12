@@ -126,3 +126,32 @@ class FindingsTests(RoutingTestCase):
         cols = [r[1] for r in self.db_exec("PRAGMA table_info(findings)")]
         self.assertIn("category", cols)
         self.assertIn("reason", cols)
+
+    def test_show_text_findings_have_header_and_unprefixed_rows(self):
+        self.j("finding", "add", "t1", "--severity", "nit", "--summary", "typo")
+        lines = self.ok("show", "t1").stdout.splitlines()
+        i = lines.index("findings:")
+        self.assertEqual(lines[i + 1].split("\t"),
+                         ["ID", "SEVERITY", "STATUS", "ROUND", "ROUNDS_OPEN",
+                          "FILE", "SUMMARY"])
+        self.assertEqual(lines[i + 2].split("\t"),
+                         ["F1", "nit", "open", "1", "1", "-", "typo"])
+
+    def test_events_text_hides_none_phase_for_finding_events(self):
+        self.j("finding", "add", "t1", "--severity", "nit", "--summary", "typo")
+        rows = [l.split("\t") for l in self.ok("events", "t1").stdout.splitlines()]
+        finding = [r for r in rows if r[1] == "finding"]
+        self.assertTrue(finding)
+        for r in finding:
+            self.assertEqual(len(r), 4)
+            self.assertEqual(r[2], "")
+            self.assertNotIn("None", "\t".join(r))
+        self.assertIn("implement -> review", [r[2] for r in rows if r[1] == "phase"])
+
+    def test_finding_add_bad_severity_is_orch_usage_error(self):
+        p = self.refused(2, "finding", "add", "t1", "--severity", "bogus",
+                         "--summary", "x")
+        self.assertTrue(p.stderr.startswith("orch: "), p.stderr)
+        self.assertNotIn("usage:", p.stderr)
+        for sev in ("must-fix", "follow-up", "nit"):
+            self.assertIn(sev, p.stderr)

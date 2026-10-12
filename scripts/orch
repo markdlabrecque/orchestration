@@ -2770,6 +2770,13 @@ def ticket_findings(db, tid):
 
 
 def cmd_finding(args, db, sdir):
+    if args.finding_cmd == "add":
+        if args.severity not in FINDING_SEVERITIES:
+            raise Refusal(EXIT_USAGE, "unknown severity %r: one of %s"
+                          % (args.severity, ", ".join(FINDING_SEVERITIES)))
+        if args.category is not None and args.category not in FINDING_CATEGORIES:
+            raise Refusal(EXIT_USAGE, "unknown category %r: one of %s"
+                          % (args.category, ", ".join(FINDING_CATEGORIES)))
     row = get_ticket(db, args.ticket)
     if os.environ.get("PI_SUBAGENT_CHILD") == "1":
         raise Refusal(EXIT_GATE, "findings must be recorded by the ticket orchestrator")
@@ -2841,9 +2848,11 @@ def cmd_show(args, db, sdir):
     found = ticket_findings(db, args.ticket)
     if found:
         text += "\nfindings:\n" + "\n".join(
-            "%s\t%s\t%s\tround=%s\trounds_open=%s\t%s\t%s" % (
+            ["\t".join(("ID", "SEVERITY", "STATUS", "ROUND", "ROUNDS_OPEN",
+                        "FILE", "SUMMARY"))] + [
+            "%s\t%s\t%s\t%s\t%s\t%s\t%s" % (
                 f["id"], f["severity"], f["status"], f["round"], f["rounds_open"],
-                f["file"] or "-", f["summary"]) for f in found)
+                f["file"] or "-", f["summary"]) for f in found])
     t["findings"] = found
     t["runs"] = runs
     t["run_outcomes"] = [outcome for run in runs for outcome in run["outcomes"]]
@@ -3706,8 +3715,11 @@ def cmd_events(args, db, sdir):
         "SELECT seq, ts, ticket, kind, from_phase, to_phase, detail FROM events"
         " WHERE ticket=? ORDER BY seq", (args.ticket,))]
     emit(args, {"events": evs}, "\n".join(
-        "%s\t%s\t%s -> %s\t%s" % (e["ts"], e["kind"], e["from_phase"],
-                                  e["to_phase"], e["detail"] or "") for e in evs))
+        "%s\t%s\t%s\t%s" % (
+            e["ts"], e["kind"],
+            ("%s -> %s" % (e["from_phase"] or "", e["to_phase"] or "")).strip()
+            if e["from_phase"] or e["to_phase"] else "",
+            e["detail"] or "") for e in evs))
 
 
 
@@ -5653,10 +5665,10 @@ def build_parser():
         fp.set_defaults(fn=cmd_finding)
         fp.add_argument("ticket")
         if name == "add":
-            fp.add_argument("--severity", required=True, choices=FINDING_SEVERITIES)
+            fp.add_argument("--severity", required=True)
             fp.add_argument("--summary", required=True)
             fp.add_argument("--file")
-            fp.add_argument("--category", choices=FINDING_CATEGORIES)
+            fp.add_argument("--category")
         else:
             fp.add_argument("finding")
         if name == "set":
