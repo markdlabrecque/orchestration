@@ -32,6 +32,7 @@ import importlib.util
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -52,7 +53,27 @@ SELFTEST_STEPS = ["preflight", "create", "launch", "report-in", "state", "visibl
                   "kill", "resume", "teardown", "clean"]
 BRIEF = "Implement ticket. Brief body."
 
-ENGINE_SRC = r'''
+INTERRUPT_HELPER = r'''
+import os, signal, sys, time
+def interrupt_parent():
+    # Only signal an orch the test isolated in its own session; then wait to be
+    # killed by orch so the interrupt always lands while this tool is running.
+    pp = os.getppid()
+    try:
+        ok = pp != 1 and os.getpgid(pp) == pp and os.getsid(pp) == pp
+    except OSError:
+        ok = False
+    if not ok:
+        sys.stderr.write("fake: parent is not an isolated orch; not signalling\\n")
+        sys.exit(3)
+    os.kill(pp, signal.SIGINT)
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        time.sleep(0.1)
+    sys.exit(3)
+'''
+
+ENGINE_SRC = INTERRUPT_HELPER + r'''
 import json, os, signal, subprocess, sys
 KIND, LOG, RC, MSG, INTERRUPT = %(kind)r, %(log)r, %(rc)r, %(msg)r, %(interrupt)r
 a = sys.argv[1:]
@@ -61,7 +82,7 @@ env = {k: os.environ.get(k) for k in
 with open(LOG, "a") as f:
     f.write(json.dumps({"who": KIND, "argv": a, "cwd": os.getcwd(), "env": env}) + "\n")
 if INTERRUPT:
-    os.kill(os.getppid(), signal.SIGINT)
+    interrupt_parent()
 if RC:
     sys.stderr.write(MSG + "\n")
     sys.exit(RC)
@@ -151,7 +172,7 @@ def maybe_block(cmd):
             time.sleep(0.05)
 '''
 
-ORCA_SRC = r'''
+ORCA_SRC = INTERRUPT_HELPER + r'''
 import json, os, shlex, signal, subprocess, sys, time
 LOG, REPO, ROOT, FAIL, TRUST = %(log)r, %(repo)r, %(root)r, %(fail)r, %(trust)r
 OPTS = %(opts)r
@@ -169,8 +190,7 @@ def git(*args):
 ''' + SESSION_HELPERS.replace("%", "%%") + r'''
 maybe_block(cmd)
 if cmd in OPTS.get("interrupt", ()):
-    os.kill(os.getppid(), signal.SIGINT)
-    time.sleep(5)
+    interrupt_parent()
 registered = os.path.join(os.path.dirname(LOG), "orca-registered")
 if cmd == "repo add":
     open(registered, "w").close()
@@ -229,7 +249,7 @@ else:
     print(json.dumps({"result": {}}))
 '''
 
-HERDR_SRC = r'''
+HERDR_SRC = INTERRUPT_HELPER + r'''
 import json, os, signal, subprocess, sys, time
 LOG, FAIL, TRUST = %(log)r, %(fail)r, %(trust)r
 OPTS = %(opts)r
@@ -243,8 +263,7 @@ if cmd in FAIL:
 ''' + SESSION_HELPERS.replace("%", "%%") + r'''
 maybe_block(cmd)
 if cmd in OPTS.get("interrupt", ()):
-    os.kill(os.getppid(), signal.SIGINT)
-    time.sleep(5)
+    interrupt_parent()
 opened = os.path.join(os.path.dirname(LOG), "herdr-open-path")
 # The main checkout's workspace ("w0"): open while this file exists.
 main_ws = os.path.join(os.path.dirname(LOG), "herdr-main-open")
@@ -357,6 +376,15 @@ class AdapterTestCase(PlatformTestCase):
         self.brief_text = BRIEF
 
     # ---- fakes -----------------------------------------------------------
+
+    def orch_isolated(self, *args, timeout=150):
+        """orch in its own session with SIGINT at default, so the interrupt a
+        fake sends is delivered even if this runner was backgrounded (SIG_IGN)."""
+        e = dict(self.env)
+        return subprocess.run(
+            [ORCH, *args], cwd=self.repo, env=e, capture_output=True, text=True,
+            timeout=timeout, start_new_session=True,
+            preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
 
     def _script(self, name, src):
         self._fake_count += 1
@@ -1521,8 +1549,9 @@ class SelftestTeardownTests(AdapterTestCase):
     """Teardown and clean run whatever happened before them, and the run is
     always reported."""
 
-    def selftest(self, timeout="3"):
-        p = self.orch("selftest", "--json", "--skip-routing", "--timeout", timeout, timeout=150)
+    def selftest(self, timeout="3", interrupt=False):
+        run = self.orch_isolated if interrupt else self.orch
+        p = run("selftest", "--json", "--skip-routing", "--timeout", timeout, timeout=150)
         try:
             out = json.loads(p.stdout)
         except ValueError:
@@ -1552,7 +1581,7 @@ class SelftestTeardownTests(AdapterTestCase):
     def test_interrupt_at_launch_still_tears_down(self):
         self.env["ORCH_PLATFORM"] = "orca"
         self.use_orca2(interrupt=["terminal create"])
-        p, out, steps = self.selftest()
+        p, out, steps = self.selftest(interrupt=True)
         self.assertNotEqual(p.returncode, 0)
         self.assertNotIn("Traceback", p.stderr)
         self.assertIs(out["ok"], False)
@@ -1568,7 +1597,7 @@ class SelftestTeardownTests(AdapterTestCase):
     def test_interrupt_inside_teardown_still_runs_clean(self):
         self.env["ORCH_CLAUDE_BIN"] = self.session_claude()
         self.env["ORCH_RETIRE_ENGINE"] = self.fake_engine("retire", interrupt=True)
-        p, out, steps = self.selftest("30")
+        p, out, steps = self.selftest("30", interrupt=True)
         self.assertNotEqual(p.returncode, 0)
         self.assertNotIn("Traceback", p.stderr)
         self.assertEqual(steps["resume"]["status"], "pass", steps["resume"])
@@ -1927,8 +1956,9 @@ class HerdrMainWorkspaceTests(AdapterTestCase):
         super().setUp()
         self.env["ORCH_PLATFORM"] = "herdr"
 
-    def selftest(self):
-        p = self.orch("selftest", "--json", "--skip-routing", "--timeout", "3", timeout=150)
+    def selftest(self, interrupt=False):
+        run = self.orch_isolated if interrupt else self.orch
+        p = run("selftest", "--json", "--skip-routing", "--timeout", "3", timeout=150)
         try:
             out = json.loads(p.stdout)
         except ValueError:
@@ -1974,7 +2004,7 @@ class HerdrMainWorkspaceTests(AdapterTestCase):
 
     def test_interrupt_closes_main_workspace(self):
         self.use_herdr2(main_opens=True, interrupt=["agent start"])
-        p, out, steps = self.selftest()
+        p, out, steps = self.selftest(interrupt=True)
         self.assertNotIn("Traceback", p.stderr)
         self.assertIn("interrupt", steps["launch"]["detail"].lower())
         self.assertEqual(steps["teardown"]["status"], "pass", steps["teardown"])
