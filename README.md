@@ -52,7 +52,7 @@ Run coding tickets end to end. A main orchestrator gives each ticket its own wor
 ## Requirements
 
 - `python3` 3.9+ and `git`.
-- The harness on `PATH`: `claude`, `pi` (with the `subagents` extension) or `codex`. For Orca or Herdr, their CLI too (`orca`, `herdr`). For Desktop, the main session needs the `start_session` tool.
+- The harness on `PATH`: `claude`, `pi` (with the `subagents` extension) or `codex`. For Orca or Herdr, their CLI too (`orca`, `herdr`). For Desktop, the main session needs the `start_session` tool, or use `--desktop-cli`.
 - `glab` or `gh` for MRs and CI.
 - The `setup-project`, `create-worktree` and `retire-worktree` skills (bundled) for project setup and worktree setup and teardown.
 - A verification environment: DDEV in the project, or a Docker harness command in `<project root>/.agents/orchestration/config.json` (`verify_harness`). Without one, default preflight stops before any ticket starts. Projects requiring only local automated tests can explicitly select `verify_policy` below.

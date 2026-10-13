@@ -1095,6 +1095,166 @@ class ResumePlatformTests(PlatformTestCase):
         self.assertEqual(self.show("T-1")["attempt"], 2)
 
 
+class DesktopCliTests(PlatformTestCase):
+    """--desktop-cli: orch itself runs claude --bg, reads the session id back,
+    and opens it in Claude Desktop through `script` (no start_session needed)."""
+
+    SHORT = "abc12345"
+    SID = "abc12345-aaaa-4bbb-8ccc-000000000001"
+
+    def setUp(self):
+        super().setUp()
+        self.wt = self.git_wt("dcli")
+        self.log = os.path.join(self.tmp, "desktop-cli.jsonl")
+        self.env["ORCH_CLAUDE_BIN"] = self.desktop_fake_claude()
+        self.env["ORCH_SCRIPT_BIN"] = self.desktop_fake_script()
+
+    def desktop_fake_claude(self, bg_fail=False, no_sid=False):
+        path = os.path.join(self.tmp, "fake-desktop-claude")
+        agents = [{"id": self.SHORT, "sessionId": self.SID, "name": "tT-1",
+                   "cwd": self.wt, "kind": "background", "state": "done"}]
+        if no_sid:
+            agents[0].pop("sessionId")
+        with open(path, "w") as f:
+            f.write(
+                "#!%s\n"
+                "import json, os, sys\n"
+                "a = sys.argv[1:]\n"
+                "try:\n"
+                "    e = json.load(open(os.environ['ORCH_CLAUDE_JSON']))\n"
+                "    trusted = e['projects'][os.path.realpath(os.getcwd())]"
+                "['hasTrustDialogAccepted'] is True\n"
+                "except Exception:\n"
+                "    trusted = False\n"
+                "open(%r, 'a').write(json.dumps({'who': 'claude', 'argv': a,"
+                " 'cwd': os.getcwd(), 'trusted': trusted}) + '\\n')\n"
+                "if a[:1] == ['--bg']:\n"
+                "    if %r or not trusted:\n"
+                "        print('Workspace not trusted. Run `claude` in ' + os.getcwd() + ' once',"
+                " file=sys.stderr)\n"
+                "        sys.exit(1)\n"
+                "    print('Starting background service...')\n"
+                "    print('backgrounded \\u00b7 %s \\u00b7 ' + a[a.index('--name') + 1])\n"
+                "elif a[:3] == ['agents', '--json', '--all']:\n"
+                "    print(json.dumps(%r))\n"
+                "elif a[:1] == ['stop']:\n"
+                "    print('stopped ' + a[1])\n"
+                % (sys.executable, self.log, bg_fail, self.SHORT, agents)
+            )
+        os.chmod(path, 0o755)
+        return path
+
+    def desktop_fake_script(self, rc=0):
+        path = os.path.join(self.tmp, "fake-script")
+        with open(path, "w") as f:
+            f.write(
+                "#!%s\n"
+                "import json, sys\n"
+                "open(%r, 'a').write(json.dumps({'who': 'script', 'argv': sys.argv[1:]})"
+                " + '\\n')\n"
+                "sys.exit(%d)\n" % (sys.executable, self.log, rc)
+            )
+        os.chmod(path, 0o755)
+        return path
+
+    def logged(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log) as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def assert_opened(self, entry):
+        self.assertEqual(entry["who"], "script")
+        self.assertEqual(entry["argv"], ["-q", "/dev/null", self.env["ORCH_CLAUDE_BIN"],
+                                         "--desktop", "--resume", self.SID])
+
+    def check_spawn(self, out):
+        self.assertEqual(out["action"], "desktop_send")
+        self.assertEqual(out["ref"], self.SID)
+        self.assertEqual(out["name"], "tT-1")
+        self.assertIn("Implement ticket. Brief body.", read_file(out["prompt_file"]))
+        calls = self.logged()
+        self.assertEqual(
+            [c["argv"][0] if c["who"] == "claude" else "script" for c in calls],
+            ["--bg", "agents", "stop", "script"])
+        bg = calls[0]
+        self.assertTrue(bg["trusted"], "worktree must be trusted before --bg")
+        self.assertEqual(os.path.realpath(bg["cwd"]), self.wt)
+        self.assertEqual(bg["argv"][:3], ["--bg", "--name", "tT-1"])
+        self.assertNotIn("--session-id", bg["argv"])
+        self.assertTrue(bg["argv"][-1].strip(), "first prompt missing")
+        self.assertEqual(calls[1]["argv"], ["agents", "--json", "--all"])
+        self.assertEqual(calls[2]["argv"], ["stop", self.SHORT])
+        self.assert_opened(calls[3])
+        t = self.show("T-1")
+        self.assertEqual(t["session_id"], self.SID)
+        self.assertEqual(t["launch_ref"], {"desktop": self.SID})
+        self.assertIn("attach", self.event_kinds("T-1"))
+
+    def test_spawn_flag(self):
+        self.add("T-1")
+        self.check_spawn(self.j("spawn", "T-1", "--worktree", self.wt, "--brief-file",
+                                self.brief, "--platform", "desktop", "--desktop-cli"))
+
+    def test_spawn_env(self):
+        self.add("T-1")
+        self.check_spawn(self.j("spawn", "T-1", "--worktree", self.wt, "--brief-file",
+                                self.brief, "--platform", "desktop",
+                                env={"ORCH_DESKTOP_CLI": "1"}))
+
+    def test_resume_with_ref_skips_bg(self):
+        self.spawn_on("T-1", "desktop", self.wt)
+        self.ok("attach", "T-1", "--ref", self.SID)
+        out = self.j("resume", "T-1", "--desktop-cli")
+        self.assertEqual(out["action"], "desktop_send")
+        self.assertEqual(out["ref"], self.SID)
+        self.assertEqual(out["name"], "tT-1")
+        self.assertTrue(os.path.isfile(out["prompt_file"]))
+        calls = self.logged()
+        self.assertFalse([c for c in calls if c["who"] == "claude" and c["argv"][0] == "--bg"])
+        self.assert_opened(calls[-1])
+        self.assertEqual(self.show("T-1")["launch_ref"], {"desktop": self.SID})
+
+    def test_resume_with_non_uuid_ref_starts_fresh(self):
+        self.spawn_on("T-1", "desktop", self.wt)
+        self.ok("attach", "T-1", "--ref", "local_123")
+        out = self.j("resume", "T-1", "--desktop-cli")
+        self.assertEqual(out["action"], "desktop_send")
+        self.assertEqual(out["ref"], self.SID)
+        calls = self.logged()
+        self.assertEqual([c["argv"][0] for c in calls if c["who"] == "claude"][0], "--bg")
+        self.assert_opened(calls[-1])
+        self.assertEqual(self.show("T-1")["launch_ref"], {"desktop": self.SID})
+
+    def test_failure_after_bg_stops_the_session_and_restores(self):
+        self.env["ORCH_CLAUDE_BIN"] = self.desktop_fake_claude(no_sid=True)
+        self.add("T-1")
+        p = self.refused(3, "spawn", "T-1", "--worktree", self.wt, "--brief-file",
+                         self.brief, "--platform", "desktop", "--desktop-cli")
+        self.assertIn("cannot start", p.stderr)
+        calls = self.logged()
+        self.assertIn(["stop", self.SHORT], [c["argv"] for c in calls if c["who"] == "claude"])
+        self.assertFalse([c for c in calls if c["who"] == "script"])
+        t = self.show("T-1")
+        self.assertEqual(t["phase"], "ready")
+        self.assertIsNone(t["session_id"])
+
+    def test_bg_failure_refuses_and_restores(self):
+        self.env["ORCH_CLAUDE_BIN"] = self.desktop_fake_claude(bg_fail=True)
+        self.add("T-1")
+        p = self.refused(3, "spawn", "T-1", "--worktree", self.wt, "--brief-file",
+                         self.brief, "--platform", "desktop", "--desktop-cli")
+        self.assertIn("cannot start", p.stderr)
+        self.assertFalse([c for c in self.logged() if c["who"] == "script"])
+        t = self.show("T-1")
+        self.assertEqual(t["phase"], "ready")
+        self.assertIsNone(t["session_id"])
+        self.assertIsNone(t["launch_ref"])
+        with open(self.claude_json) as f:
+            entry = (json.load(f).get("projects") or {}).get(self.wt) or {}
+        self.assertNotIn("hasTrustDialogAccepted", entry, "trust mark not undone")
+
+
 class PidWalkTests(PlatformTestCase):
     def test_headless_hook_records_the_claude_pid(self):
         """A real walk: the hook runs as a child of an executable named
