@@ -2570,13 +2570,13 @@ def log_picked_up(db, tid):
 
 
 def finish_launch(db, sdir, cfg, row, evs, platform, session, prompt_file,
-                  desktop_action, marker):
+                  desktop_action, marker, desktop_cli=False):
     """Steps 2 and 3 of `spawn`/`resume` (step 1 is already committed; `row`
     is the ticket as it was before it). Clears `marker` whatever happens.
     Returns (output, is_action)."""
     try:
         result = launch_steps(db, sdir, cfg, row, evs, platform, session,
-                              prompt_file, desktop_action, marker)
+                              prompt_file, desktop_action, marker, desktop_cli)
         log_picked_up(db, row["id"])
         return result
     except TrustBlocked:
@@ -2586,8 +2586,107 @@ def finish_launch(db, sdir, cfg, row, evs, platform, session, prompt_file,
         release_launch(db, row["id"], marker)
 
 
+def record_desktop_session(db, tid, row, ref, session_id):
+    """Point the ticket at a Desktop session and log the `attach` event."""
+    detail = []
+    if ref:
+        db.execute("UPDATE tickets SET launch_ref=? WHERE id=?",
+                   (json.dumps({"desktop": ref}), tid))
+        detail.append("ref=" + ref)
+    if session_id:
+        if session_id != row["session_id"]:
+            # A different session: the old process identity no longer applies.
+            db.execute("UPDATE tickets SET session_id=?, pid=NULL, pid_start=NULL,"
+                       " activity=NULL WHERE id=?", (session_id, tid))
+        detail.append("session=" + session_id)
+    log_event(db, tid, "attach", row["phase"], row["phase"], " ".join(detail))
+    return detail
+
+
+def desktop_cli_run(argv, cwd, what, worktree, stdin=None):
+    try:
+        p = subprocess.run(argv, cwd=cwd, stdin=stdin, capture_output=True, text=True,
+                           timeout=90)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise cannot_start("desktop session", worktree, "%s: %s" % (what, e))
+    if p.returncode != 0:
+        raise cannot_start("desktop session", worktree, "%s failed: %s" % (
+            what, (p.stderr or p.stdout).strip()[:300]))
+    return p.stdout
+
+
+SESSION_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def desktop_cli_stop(claude, short, worktree):
+    try:
+        subprocess.run([claude, "stop", short], cwd=worktree, capture_output=True,
+                       timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def desktop_cli_launch(row, cfg, ref, name):
+    """Step 2 of a --desktop-cli launch: start the session with `claude --bg`
+    (unless `ref` is a Desktop session id already), stop it, and open it in
+    Claude Desktop. Returns the session id."""
+    worktree = row["worktree"]
+    claude = harness_bin("claude")
+    if not os.path.isdir(worktree):
+        raise cannot_start("desktop session", worktree, "worktree does not exist")
+    if ref:
+        sid = ref
+        desktop_cli_stop(claude, sid[:8], worktree)
+        desktop_cli_open(claude, sid, worktree)
+        return sid
+    first = ("Your brief for this ticket arrives in the next message. Reply `ready`"
+             " and wait for it.")
+    out = desktop_cli_run([claude, "--bg", "--name", name] + harness_args("claude", cfg)
+                          + [first], worktree, "claude --bg", worktree)
+    m = re.search(r"backgrounded\s+\u00b7\s+([0-9a-f]+)", out)
+    if not m:
+        raise cannot_start("desktop session", worktree,
+                           "no session id in `claude --bg` output: %s" % out.strip()[:200])
+    short = m.group(1)
+    try:
+        entry, deadline = None, time.time() + 60
+        while True:
+            try:
+                data = json.loads(desktop_cli_run([claude, "agents", "--json", "--all"],
+                                                  worktree, "claude agents", worktree))
+            except ValueError as e:
+                raise cannot_start("desktop session", worktree, "claude agents: %s" % e)
+            if not isinstance(data, list):
+                raise cannot_start("desktop session", worktree,
+                                   "claude agents: expected a JSON list")
+            entry = next((a for a in data if isinstance(a, dict) and a.get("id") == short),
+                         None)
+            if entry and entry.get("state") != "working":
+                break
+            if time.time() >= deadline:
+                raise cannot_start("desktop session", worktree,
+                                   "session %s still working after 60s" % short)
+            time.sleep(1)
+        sid = entry.get("sessionId")
+        if not sid:
+            raise cannot_start("desktop session", worktree,
+                               "no sessionId for %s in `claude agents`" % short)
+        desktop_cli_run([claude, "stop", short], worktree, "claude stop", worktree)
+        desktop_cli_open(claude, sid, worktree)
+    except BaseException:
+        desktop_cli_stop(claude, short, worktree)  # do not leave the bg session running
+        raise
+    return sid
+
+
+def desktop_cli_open(claude, sid, worktree):
+    desktop_cli_run([os.environ.get("ORCH_SCRIPT_BIN", "script"), "-q", "/dev/null", claude,
+                     "--desktop", "--resume", sid], worktree, "claude --desktop",
+                    worktree, stdin=subprocess.DEVNULL)
+
+
 def launch_steps(db, sdir, cfg, row, evs, platform, session, prompt_file,
-                 desktop_action, marker):
+                 desktop_action, marker, desktop_cli=False):
     tid = row["id"]
     cur = get_ticket(db, tid)
     old_platform, old_ref = row_platform(row), row_launch_ref(row)
@@ -2595,6 +2694,33 @@ def launch_steps(db, sdir, cfg, row, evs, platform, session, prompt_file,
     if desktop_action == "desktop_resume":
         attempted, err = platform_close(old_platform, old_ref, row["worktree"])
         closed_old = attempted and err is None
+    if platform == "desktop" and desktop_cli:
+        mark_ev = None
+        if cur["worktree"] and os.path.isdir(cur["worktree"]):
+            mark_ev = mark_ticket_trust(db, cur)
+        ref = old_ref.get("desktop") if old_platform == "desktop" and old_ref else None
+        if not (isinstance(ref, str) and SESSION_UUID.match(ref)):
+            ref = None  # e.g. a start_session ref: start a fresh session
+        name = "t" + tid
+        try:
+            sid = desktop_cli_launch(cur, cfg, ref, name)
+        except Refusal:
+            evs = list(evs)
+            if mark_ev is not None and unmark_ticket_trust(db, tid, cur["worktree"],
+                                                           log=False):
+                evs.append(mark_ev)
+            old = [None if c == "launch_ref" and closed_old else row[c]
+                   for c in LAUNCH_COLUMNS]
+            with transaction(db):
+                db.execute("UPDATE tickets SET %s, launching=NULL WHERE id=?" % ", ".join(
+                    "%s=?" % c for c in LAUNCH_COLUMNS), old + [tid])
+                db.executemany("DELETE FROM events WHERE seq=?", [(e,) for e in evs])
+            raise
+        with transaction(db):
+            record_desktop_session(db, tid, cur, sid, sid)
+            db.execute("UPDATE tickets SET launching=NULL WHERE id=?", (tid,))
+        return {"action": "desktop_send", "ref": sid, "name": name, "cwd": cur["worktree"],
+                "prompt_file": prompt_file}, True
     if platform == "desktop":
         # Only a Desktop session ref survives onto Desktop.
         ref = old_ref if old_platform == "desktop" and (old_ref or {}).get("desktop") \
@@ -2936,7 +3062,7 @@ def check_spawnable(row, tid):
 
 
 def spawn_ticket(db, sdir, cfg, tid, brief, platform, worktree=None, wref=None,
-                 harness="claude"):
+                 harness="claude", desktop_cli=False):
     """`spawn` without the printing. With no `worktree`, the platform adapter
     creates one first (and removes it again if the launch fails). Returns
     (output, is_action)."""
@@ -2964,7 +3090,7 @@ def spawn_ticket(db, sdir, cfg, tid, brief, platform, worktree=None, wref=None,
         marker = claim_launch(db, row, "spawn")
     try:
         return spawn_claimed(db, sdir, cfg, tid, brief, platform, worktree, wref, marker,
-                             harness)
+                             harness, desktop_cli)
     finally:
         release_launch(db, tid, marker)
 
@@ -2979,7 +3105,7 @@ def check_name_free(db, tid):
 
 
 def spawn_claimed(db, sdir, cfg, tid, brief, platform, worktree, wref, marker,
-                  harness="claude"):
+                  harness="claude", desktop_cli=False):
     created = worktree is None
     if created:
         worktree, wref = create_worktree(platform, tid)
@@ -3020,7 +3146,7 @@ def spawn_claimed(db, sdir, cfg, tid, brief, platform, worktree, wref, marker,
     try:
         return finish_launch(db, sdir, cfg, row, [ev], platform,
                              {"mode": "start", "sid": sid}, prompt_file, "desktop_start",
-                             marker)
+                             marker, desktop_cli)
     except TrustBlocked:
         raise
     except Refusal:
@@ -3036,6 +3162,10 @@ def print_launch(args, out, is_action, done_text):
             done_text, out["id"], out["platform"], out["pid"], out["session_id"]))
 
 
+def desktop_cli_wanted(args):
+    return bool(args.desktop_cli or os.environ.get("ORCH_DESKTOP_CLI") == "1")
+
+
 def cmd_spawn(args, db, sdir):
     platform = require_platform(args.platform)
     harness = resolve_harness(args.harness)[0]
@@ -3047,7 +3177,8 @@ def cmd_spawn(args, db, sdir):
     except OSError as e:
         raise Refusal(EXIT_USAGE, "cannot read brief file: %s" % e)
     out, is_action = spawn_ticket(db, sdir, cfg, args.ticket, brief, platform,
-                                  args.worktree, harness=harness)
+                                  args.worktree, harness=harness,
+                                  desktop_cli=desktop_cli_wanted(args))
     print_launch(args, out, is_action, "spawned")
 
 
@@ -3094,7 +3225,8 @@ def session_continuable(sdir, row, harness):
     return bool(row["session_seen"]) or session_created(sdir, row["id"], sid, harness)
 
 
-def resume_ticket(db, sdir, cfg, tid, note=None, platform=None, harness=None):
+def resume_ticket(db, sdir, cfg, tid, note=None, platform=None, harness=None,
+                  desktop_cli=False):
     """`resume` without the printing. Returns (output, is_action)."""
     with transaction(db):
         row = get_ticket(db, tid)
@@ -3168,7 +3300,7 @@ def resume_ticket(db, sdir, cfg, tid, note=None, platform=None, harness=None):
                                  "" if harness == old_harness else " harness=" + harness,
                                  (" note=" + note) if note else "")))
     return finish_launch(db, sdir, cfg, row, evs, platform, session, prompt_file,
-                         "desktop_resume", marker)
+                         "desktop_resume", marker, desktop_cli)
 
 
 def cmd_resume(args, db, sdir):
@@ -3176,7 +3308,8 @@ def cmd_resume(args, db, sdir):
     if not args.platform:
         platform = None  # the ticket's own platform
     out, is_action = resume_ticket(db, sdir, load_config(sdir), args.ticket, args.note,
-                                   platform, args.harness)
+                                   platform, args.harness,
+                                   desktop_cli=desktop_cli_wanted(args))
     print_launch(args, out, is_action, "resumed")
 
 
@@ -3189,18 +3322,7 @@ def cmd_attach(args, db, sdir):
     row = get_ticket(db, args.ticket)
     if row["retired_at"] is not None:
         raise Refusal(EXIT_GATE, "ticket %s is retired" % args.ticket)
-    detail = []
-    if args.ref:
-        db.execute("UPDATE tickets SET launch_ref=? WHERE id=?",
-                   (json.dumps({"desktop": args.ref}), args.ticket))
-        detail.append("ref=" + args.ref)
-    if args.session_id:
-        if args.session_id != row["session_id"]:
-            # A different session: the old process identity no longer applies.
-            db.execute("UPDATE tickets SET session_id=?, pid=NULL, pid_start=NULL,"
-                       " activity=NULL WHERE id=?", (args.session_id, args.ticket))
-        detail.append("session=" + args.session_id)
-    log_event(db, args.ticket, "attach", row["phase"], row["phase"], " ".join(detail))
+    detail = record_desktop_session(db, args.ticket, row, args.ref, args.session_id)
     emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
          "%s attached %s" % (args.ticket, " ".join(detail)))
 
@@ -5720,10 +5842,14 @@ def build_parser():
     sp.add_argument("--brief-file", required=True)
     sp.add_argument("--platform", choices=PLATFORMS)
     sp.add_argument("--harness", choices=HARNESSES)
+    sp.add_argument("--desktop-cli", action="store_true",
+                    help="desktop platform: start the session with claude --bg and open it in Desktop")
     sp = add("resume", cmd_resume, "ticket")
     sp.add_argument("--note")
     sp.add_argument("--platform", choices=PLATFORMS)
     sp.add_argument("--harness", choices=HARNESSES)
+    sp.add_argument("--desktop-cli", action="store_true",
+                    help="desktop platform: start the session with claude --bg and open it in Desktop")
     sp = add("attach", cmd_attach, "ticket")
     sp.add_argument("--ref")
     sp.add_argument("--session-id")
