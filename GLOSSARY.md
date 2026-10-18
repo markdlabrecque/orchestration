@@ -39,3 +39,23 @@ _Avoid_: project config, local workflow
 **Ticket**:
 The unit of work a workflow runs over: one issue in the project's tracker.
 _Avoid_: task, job
+
+**Run**:
+One ticket's walk through its workflow, from first start to merge or abort, surviving pauses and crashes.
+_Avoid_: session, job, execution
+
+**Pause**:
+Stopping an engine cleanly so its run can be resumed later from the same step.
+_Avoid_: stop, suspend, interrupt
+
+**Abort**:
+Ending a run for good: its agents are stopped and the ticket is marked aborted.
+_Avoid_: cancel, kill, stop
+
+**Human step**:
+A step that waits for a person to answer before the workflow continues, such as merge approval.
+_Avoid_: approval gate, manual step, prompt
+
+**Wrapper folder**:
+The per-project folder beside the checkouts, `.agents/orchestration/`, that holds runs and anything not committed to the repo.
+_Avoid_: state dir, orchestration dir
