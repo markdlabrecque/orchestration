@@ -45,12 +45,24 @@ A check in code that must pass before the next step may run, such as every test 
 _Avoid_: check, guard
 
 **Global workflow**:
-The workflow that applies to every project on a machine unless a project overrides it.
-_Avoid_: default pipeline
+The full workflow a machine runs for every project unless a project overrides it. Installed from the shipped default and editable.
+_Avoid_: default pipeline, built-in workflow
+
+**Shipped default**:
+The global workflow v2 installs on a fresh machine, and restores on request.
+_Avoid_: factory settings, built-in
 
 **Project override**:
-A project's committed set of changes to the global workflow: insert, drop, reorder or re-run steps, or start from scratch.
-_Avoid_: project config, local workflow
+A project's committed patch over the global workflow: insert, drop, replace, move or adjust steps, and set settings.
+_Avoid_: project config, local workflow, scratch workflow
+
+**Effective workflow**:
+The workflow a project actually runs: the global workflow with the project override applied.
+_Avoid_: resolved workflow, merged workflow
+
+**Setting**:
+A named value in a workflow that `when:` lines and step options may read, with a default in the global workflow and a project's value in its override.
+_Avoid_: variable, flag, config key
 
 **Ticket**:
 The unit of work a workflow runs over: one issue in the project's tracker.
