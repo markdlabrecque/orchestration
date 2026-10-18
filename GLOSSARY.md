@@ -80,6 +80,26 @@ _Avoid_: resolved workflow, merged workflow
 A named value in a workflow that `when:` lines and step options may read, with a default in the global workflow and a project's value in its override.
 _Avoid_: variable, flag, config key
 
+**Repair**:
+A step, or ordered list of steps, that runs when a detecting step reports a problem; the detecting step then runs again, scoped to what the repair changed.
+_Avoid_: fix step, bounce step, retry
+
+**Budget**:
+A named count of how many times repairs may be taken in one run. Spent when a repair edge is taken; never refilled except by a grant.
+_Avoid_: cap, limit, retries
+
+**Grant**:
+A person's answer at a spent budget that adds one more slot.
+_Avoid_: exception, extra repair, override
+
+**Park**:
+Ending a run without a merge by opening a draft PR that lists the open findings.
+_Avoid_: shelve, abandon, defer
+
+**Lane**:
+The path a ticket takes through the workflow: standard, trivial or no-code. Reported by the spec step, forced by a ticket label.
+_Avoid_: skip lane, mode, track
+
 **Ticket**:
 The unit of work a workflow runs over: one issue in the project's tracker.
 _Avoid_: task, job
