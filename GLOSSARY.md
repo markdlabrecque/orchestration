@@ -36,6 +36,22 @@ _Avoid_: output, report, answer
 A runner's continuation handle for an agent step's conversation, so a later step may pick up where that agent left off.
 _Avoid_: conversation, thread, context
 
+**Agent step**:
+A step that puts a role in front of a model through a runner and reads back its handoff and typed result.
+_Avoid_: stage agent, subagent step
+
+**Preflight**:
+The checks a run performs before its first step: the effective workflow loads, every named setting, tool, runner and role is present, and the project is set up. Any miss stops the run with a reason.
+_Avoid_: validation pass, sanity check
+
+**Pickup**:
+Making and provisioning a ticket's worktree before its first step. Engine work, not a step.
+_Avoid_: setup, checkout
+
+**Retirement**:
+Removing a ticket's worktree and local site after its merge, or on request after an abort. Engine work, not a step.
+_Avoid_: cleanup, teardown
+
 **Engine**:
 The deterministic loop that walks a workflow step by step and holds its gates. Code decides the order, never a model.
 _Avoid_: orchestrator, supervisor, ticket orchestrator
