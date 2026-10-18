@@ -27,8 +27,8 @@ Start in the same repository with a separate skill and entry point. Share useful
 | Cheap local checks before review | Project test command, selected by the Lite workflow |
 | Full and expensive automated test suites | Remote CI |
 | Read current-commit CI evidence before an authorized merge | Small CLI helper called by the Lite workflow |
-| DDEV teardown and project resource checks before worktree removal | Project scripts and shared Lite CLI helpers |
-| Git worktree removal | T3, coordinated with project teardown |
+| Remove orphaned Lite DDEV environments after checkout deletion | Local Lite collector, run hourly by a user-level systemd timer |
+| Git worktree removal | T3 |
 
 The skill decides what work to perform. Helpers execute narrow operations and return evidence. They do not become another agent supervisor.
 
@@ -135,15 +135,23 @@ Reuse the existing provision-only engine where practical. Check its project-root
 
 ## Cleanup
 
-Reuse project teardown helpers for DDEV and other local resources. T3 continues to own the Git worktree lifecycle.
+T3 owns Git worktree removal. Lite cleans up leftover DDEV environments afterwards through an hourly local collector. This also covers checkouts removed outside T3 and does not depend on a T3 pre-removal hook or settle action.
 
-Before teardown, establish that owned tasks and other writers have stopped, verify the exact checkout/resource identity, and inspect dirty work. Cancellation requests, thread interruption and archival are not interchangeable with proof that all work has stopped.
+Worktree databases are disposable. Once their checkout is gone, the collector deletes the associated DDEV containers, database volumes and registration without creating a snapshot or backup. Setup still preserves existing databases while their checkout exists.
 
-Run project teardown from a safe context before T3 removes the worktree. Preserve resources if identity, activity or ownership is uncertain. Never delete the checkout of a still-active coordinator.
+Provide a user-level systemd oneshot service and an hourly timer. The service invokes a small local script from a stable installation outside worktrees, without an agent or T3 session. Each sweep should:
 
-**An appropriate pre-removal integration has not yet been established.** Do not assume T3's automatic cleanup invokes DDEV teardown. Its settle action is not equivalent to a deletion hook and can run while a terminal command remains active. Begin with explicit, supervised teardown; enable automatic removal for DDEV worktrees only after the ordering is supported and validated.
+1. Read DDEV registrations and their recorded checkout paths.
+2. Select only environments provisioned and marked as owned by Lite. Retain the minimal identity/path mapping outside the disposable checkout.
+3. Confirm that the checkout is absent. Skip unavailable mounts, permission errors and uncertain ownership or identity.
+4. Recheck the path and DDEV identity immediately before deleting that exact environment. Preserve environments whose checkout still exists.
+5. Log removals, skips and failures to the systemd journal. Leave failed cleanup eligible for a later sweep.
 
-Small saved resource identities and existing teardown progress records are acceptable. They must not expand into a ticket-stage database or a recovery supervisor.
+Support a dry-run command for inspection. Use targeted DDEV cleanup without snapshots or unrelated global container pruning. Validate removal when the original project directory is already missing; the collector must not depend on scripts or configuration inside that directory.
+
+Resources can remain until the next successful sweep. The timer runs while the user's systemd manager is active; unattended cleanup while logged out is not required. The collector never removes Git worktrees and does not make an otherwise ineligible worktree eligible for T3 cleanup.
+
+Saved resource identities are cleanup metadata only. They must not expand into a ticket-stage database or a recovery supervisor. Existing full Orchestration cleanup services remain unchanged.
 
 ## Initial deliverables
 
@@ -167,7 +175,8 @@ Small saved resource identities and existing teardown progress records are accep
 - Connect T3 setup actions to the existing project provisioner or a small extracted helper.
 - Validate plain-repository startup and a representative DDEV project's configuration.
 - Cover repeat setup, preservation of an existing database, failed database inspection, wrong resource identity and required-step failure.
-- Define explicit teardown ownership and ordering before enabling automatic cleanup.
+- Add the local DDEV collector, user-level systemd oneshot service and hourly timer described above.
+- Cover missing and existing checkouts, unrelated DDEV projects, unavailable filesystems, identity mismatches, dry runs and repeat sweeps with cheap fixture-based tests. Validate targeted cleanup of a disposable environment after its checkout is removed.
 - Keep this deliverable independent of the initial plain-repository pilot.
 
 For Lite itself, run its unit and other cheap checks before review. Leave the full repository suite to CI. A source-only or fake-tool test does not prove that live T3 delegation or a real DDEV startup works; record focused pilot evidence separately, with project setup authorization where required.
@@ -199,6 +208,6 @@ After a successful pilot, document the two entry points and their tradeoffs. Rem
 - The default supervised repair limit; two repair attempts is the proposal above.
 - Each project's cheap local check command and CI requirements.
 - Whether each project uses an environment default startup action or its own override.
-- The supported teardown connection to T3's worktree removal lifecycle.
+- The collector's ownership metadata format and systemd unit installation paths.
 
 These details can be resolved during ticket refinement without reopening the agreed ownership boundaries.
