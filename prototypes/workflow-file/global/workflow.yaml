@@ -1,15 +1,21 @@
 # Global workflow: one per machine, at ~/.config/orchestration/workflow.yaml
-# PROTOTYPE (#128). Reproduces v1's ticket pipeline as data. Throwaway.
+# PROTOTYPE (#128), round 2. Reproduces v1's ticket pipeline as data. Throwaway.
 version: 1
 
 # A repair edge spends one slot of a named budget each time it is taken.
 # A spent budget blocks the ticket for a human. Nothing refills it.
 budgets:
-  bounces:    { max: 3 }   # review -> fix, plus anything a project adds that shares it
+  bounces:    { max: 3 }   # review -> fix and verify -> fix, combined (v1's "bounces")
   ci_repairs: { max: 2 }   # ci -> fix
 
-settings:                  # defaults a project override may change
-  merge: auto              # auto | human
+# Repairs run only when a step reports a problem; then that step runs again.
+# Declared once here, named from the steps below. Not part of the ordered list.
+repairs:
+  fix: { kind: agent, runner: pi, options: { agent: implementor, fresh: true }, gate: tests-green }
+
+settings:                    # defaults a project override may change
+  verification: local-tests  # local-tests | ddev | docker
+  merge: auto                # auto | human
 
 steps:
   - id: spec
@@ -38,12 +44,15 @@ steps:
     on:
       findings: { repair: fix, budget: bounces }   # run fix, then run review again
 
-  - id: fix
+  - id: verify             # the verifier reads settings.verification (ddev or docker)
     kind: agent
     runner: pi
-    options: { agent: implementor, fresh: true }
-    trigger: repair        # never runs in the plain walk; only through a repair edge
-    gate: tests-green
+    options: { agent: verifier }
+    when:                  # a list: every line must hold
+      - lane == standard
+      - settings.verification != local-tests
+    on:
+      findings: { repair: fix, budget: bounces }   # shares the review budget, as in v1
 
   - id: report
     kind: agent
@@ -59,7 +68,10 @@ steps:
     on:
       failed: { repair: fix, budget: ci_repairs }
 
+  - id: merge-approval     # a person says go before the merge
+    kind: human
+    options: { ask: "CI is green on the head commit. Merge?" }
+    when: settings.merge == human
+
   - id: merge              # squash-merge, pinned to the SHA ci passed on
     kind: merge
-    when: settings.merge == auto
-    else: { block: awaiting human merge }

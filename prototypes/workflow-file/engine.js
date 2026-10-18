@@ -1,4 +1,4 @@
-// PROTOTYPE (#128): the logic under test. Pure module: no DOM, no I/O, no clock.
+// PROTOTYPE (#128), round 2: the logic under test. Pure module: no DOM, no I/O, no clock.
 // The page and check.ts are throwaway shells around it; this is the liftable part.
 //
 // Two jobs:
@@ -6,6 +6,10 @@
 //      workflow and validate the result. Any problem rejects the whole override.
 //   2. start(workflow, ...) / reduce(state, action): walk the effective workflow one
 //      step run at a time, taking repair edges and spending budgets.
+//
+// Round 2 changes after Mark's reactions: repairs are declared once under `repairs:`
+// and are not in the ordered step list; `when:` may be a list (all must hold);
+// `else:` is gone, a `human` step kind waits for a person instead.
 
 // ---------- step kinds ------------------------------------------------------
 
@@ -24,6 +28,7 @@ export const builtinKinds = [
   defineStepKind({ name: "mr", outcomes: ["pass", "failed"] }),
   defineStepKind({ name: "ci", outcomes: ["pass", "failed"] }),
   defineStepKind({ name: "merge", outcomes: ["pass", "failed"] }),
+  defineStepKind({ name: "human", outcomes: ["pass", "declined"] }), // waits for a person; pass = go
 ];
 
 export function createRegistry(kinds = builtinKinds) {
@@ -45,6 +50,7 @@ export function createRegistry(kinds = builtinKinds) {
 // ---------- when expressions -----------------------------------------------
 // Grammar, on purpose tiny:  <path> == <word> | <path> != <word>
 //                            <path> in [a, b] | <path> not in [a, b]
+// A step's `when:` is one expression or a list of them; every one must hold.
 
 const WHEN = /^\s*([A-Za-z_][\w.]*)\s+(==|!=|not in|in)\s+(.+?)\s*$/;
 
@@ -64,6 +70,10 @@ export function evalWhen(expr, context) {
   const hit = expr.values.includes(String(value));
   return expr.op === "==" || expr.op === "in" ? hit : !hit;
 }
+
+const whenList = (when) => (when === undefined ? [] : Array.isArray(when) ? when : [when]);
+export const whenHolds = (when, context) => whenList(when).every((w) => evalWhen(parseWhen(w), context));
+export const whenText = (when) => whenList(when).join(" and ");
 
 // ---------- resolve: global + override -> effective workflow ----------------
 
@@ -86,6 +96,7 @@ function resolveOrThrow(global, override, registry) {
   }
   const steps = clone(fromScratch ? override.steps ?? [] : global.steps ?? []);
   const budgets = { ...clone(global.budgets ?? {}), ...clone(override?.budgets ?? {}) };
+  const repairs = { ...clone(global.repairs ?? {}), ...clone(override?.repairs ?? {}) };
   const settings = { ...clone(global.settings ?? {}), ...clone(override?.settings ?? {}) };
 
   const ids = () => steps.map((s) => s.id).join(", ");
@@ -137,9 +148,12 @@ function resolveOrThrow(global, override, registry) {
     }
   });
 
-  validate(steps, budgets, registry);
-  const outcomes = Object.fromEntries(steps.map((s) => [s.id, registry.get(s.kind).outcomes]));
-  return { version: global.version ?? 1, budgets, settings, steps, outcomes };
+  validate(steps, repairs, budgets, registry);
+  const outcomes = Object.fromEntries([
+    ...steps.map((s) => [s.id, registry.get(s.kind).outcomes]),
+    ...Object.entries(repairs).map(([name, r]) => [name, registry.get(r.kind).outcomes]),
+  ]);
+  return { version: global.version ?? 1, budgets, repairs, settings, steps, outcomes };
 }
 
 // RFC 7396 style: objects merge, null deletes, anything else replaces.
@@ -153,30 +167,31 @@ function merge(base, patch) {
   return out;
 }
 
-function validate(steps, budgets, registry) {
+function validate(steps, repairs, budgets, registry) {
   const seen = new Set();
   for (const s of steps) {
     if (!s || !s.id) throw new Error("every step needs an id");
     if (seen.has(s.id)) throw new Error(`step id "${s.id}" appears twice`);
     seen.add(s.id);
   }
-  const byId = new Map(steps.map((s) => [s.id, s]));
+  const notRegistered = (kind) => `kind "${kind}" is not registered (registered: ${registry.names().join(", ")}). A project module listed under "uses:" can register it.`;
+  for (const [name, r] of Object.entries(repairs)) {
+    if (!r || typeof r !== "object") throw new Error(`repairs.${name}: needs kind, runner and options, like a step`);
+    if (!registry.has(r.kind)) throw new Error(`repairs.${name}: ${notRegistered(r.kind)}`);
+    if (seen.has(name)) throw new Error(`"${name}" is both a step id and a repair name; pick one`);
+  }
   for (const s of steps) {
     const kind = registry.get(s.kind);
-    if (!kind) {
-      throw new Error(`step "${s.id}": kind "${s.kind}" is not registered (registered: ${registry.names().join(", ")}). A project module listed under "uses:" can register it.`);
-    }
-    if (s.when !== undefined) parseWhen(s.when);
-    if (s.else !== undefined && s.when === undefined) throw new Error(`step "${s.id}": "else" needs a "when"`);
-    if (s.else !== undefined && typeof s.else?.block !== "string") throw new Error(`step "${s.id}": "else" must be { block: <reason> }`);
+    if (!kind) throw new Error(`step "${s.id}": ${notRegistered(s.kind)}`);
+    for (const w of whenList(s.when)) parseWhen(w);
+    if (s.trigger !== undefined) throw new Error(`step "${s.id}": "trigger" is gone; repairs are declared under "repairs:" at the top of the file`);
+    if (s.else !== undefined) throw new Error(`step "${s.id}": "else" is gone; add a step of kind "human" with its own "when" instead`);
     for (const [outcome, edge] of Object.entries(s.on ?? {})) {
       const at = `step "${s.id}": on.${outcome}`;
       if (outcome === "pass") throw new Error(`${at}: "pass" always falls through; map the other outcomes only`);
       if (!kind.outcomes.includes(outcome)) throw new Error(`${at}: kind "${s.kind}" has no such outcome (outcomes: ${kind.outcomes.join(", ")})`);
-      if (!edge || typeof edge.repair !== "string") throw new Error(`${at}: needs "repair: <step id>"`);
-      const target = byId.get(edge.repair);
-      if (!target) throw new Error(`${at}: repair "${edge.repair}" names no step (steps: ${[...byId.keys()].join(", ")})`);
-      if (target.trigger !== "repair") throw new Error(`${at}: repair "${edge.repair}": that step must carry "trigger: repair"`);
+      if (!edge || typeof edge.repair !== "string") throw new Error(`${at}: needs "repair: <name>"`);
+      if (!repairs[edge.repair]) throw new Error(`${at}: repair "${edge.repair}" is not declared under repairs: (declared: ${Object.keys(repairs).join(", ") || "none"})`);
       if (typeof edge.budget !== "string") throw new Error(`${at}: needs "budget: <name>" so the loop ends`);
       const b = budgets[edge.budget];
       if (!b || !Number.isInteger(b.max) || b.max < 0) {
@@ -184,18 +199,13 @@ function validate(steps, budgets, registry) {
       }
     }
   }
-  for (const s of steps) {
-    if (s.trigger === "repair" && !steps.some((t) => Object.values(t.on ?? {}).some((e) => e && e.repair === s.id))) {
-      throw new Error(`step "${s.id}" has "trigger: repair" but no step repairs through it`);
-    }
-  }
 }
 
 // ---------- engine: walk the effective workflow -----------------------------
 //
-// State is plain data. One "step run" is one dispatch of a step; its key is
-// "<id>#<n>", the n-th run of that step on this ticket. In v2 proper each step
-// run is one Pi Durable task owned by the ticket task.
+// State is plain data. One "step run" is one dispatch of a step or a repair; its
+// key is "<id>#<n>", the n-th run of that id on this ticket. In v2 proper each
+// step run is one Pi Durable task owned by the ticket task.
 
 export function start(workflow, { project = "global", lane = "standard" } = {}) {
   const budgets = Object.fromEntries(Object.entries(workflow.budgets).map(([k, v]) => [k, { used: 0, max: v.max }]));
@@ -221,7 +231,9 @@ export function reduce(state, action) {
 }
 
 export function currentStep(state) {
-  return state.current ? state.workflow.steps.find((s) => s.id === state.current.id) : null;
+  if (!state.current) return null;
+  if (state.current.repair) return { id: state.current.id, ...state.workflow.repairs[state.current.id], repair: true };
+  return state.workflow.steps.find((s) => s.id === state.current.id);
 }
 
 export function currentOutcomes(state) {
@@ -233,19 +245,16 @@ const nextKey = (state, id) => `${id}#${state.runs.filter((r) => r.id === id && 
 
 function dispatch(state, id, note) {
   const key = nextKey(state, id);
-  return { ...state, current: { id, key }, lastChange: `${note} Now running ${key}.`.trim() };
+  const repair = id in state.workflow.repairs;
+  return { ...state, current: { id, key, repair }, lastChange: `${note} Now running ${key}.`.trim() };
 }
 
 function advance(state, from, note) {
   const s = { ...state, runs: [...state.runs] };
   for (let i = from; i < s.workflow.steps.length; i++) {
     const step = s.workflow.steps[i];
-    if (step.trigger === "repair") continue; // reachable only through a repair edge
-    if (step.when !== undefined && !evalWhen(parseWhen(step.when), context(s))) {
-      if (step.else) {
-        return { ...s, cursor: i, current: null, status: "blocked", reason: step.else.block, lastChange: `${note} "${step.when}" is false, so ${step.id} stops for a human: ${step.else.block}.`.trim() };
-      }
-      s.runs.push({ id: step.id, key: step.id, skipped: true, note: `skipped: "${step.when}" is false` });
+    if (!whenHolds(step.when, context(s))) {
+      s.runs.push({ id: step.id, key: step.id, skipped: true, note: `skipped: "${whenText(step.when)}" does not hold` });
       continue;
     }
     return dispatch({ ...s, cursor: i }, step.id, note);
@@ -256,7 +265,7 @@ function advance(state, from, note) {
 function applyOutcome(state, outcome) {
   if (state.status !== "running" || !state.current) return { ...state, lastChange: `Nothing to do: the ticket is ${state.status}.` };
   const { id, key } = state.current;
-  const step = state.workflow.steps.find((x) => x.id === id);
+  const step = currentStep(state);
   const s = { ...state, runs: [...state.runs, { id, key, outcome }], current: null };
 
   if (outcome === "pass") {

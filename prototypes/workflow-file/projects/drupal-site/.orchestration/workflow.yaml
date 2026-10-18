@@ -1,5 +1,5 @@
 # Project override for a Drupal site, committed at <repo>/.orchestration/workflow.yaml
-# PROTOTYPE (#128). Throwaway.
+# PROTOTYPE (#128), round 2. Throwaway.
 version: 1
 extends: global            # or `from: scratch` with a full `steps:` list
 
@@ -7,20 +7,17 @@ uses:
   - ./.orchestration/steps/a11y-scan.step.ts   # registers step kind a11y-scan
 
 settings:
+  verification: ddev       # switches the global verify step on, against the ticket's DDEV site
   merge: human             # a person presses merge on client sites
 
 patch:
-  - insert_after: review
+  - insert_after: spec     # the same human kind, used as an early gate
     step:
-      id: verify
-      kind: agent
-      runner: pi
-      options: { agent: verifier, env: ddev }
-      when: lane == standard
-      on:
-        findings: { repair: fix, budget: bounces }   # shares the review budget, as in v1
+      id: spec-approval
+      kind: human
+      options: { ask: "Spec is written. OK to build it?" }
 
-  - insert_before: verify  # ops apply in order: verify exists by now
+  - insert_before: verify
     step:
       id: ddev-up
       kind: shell

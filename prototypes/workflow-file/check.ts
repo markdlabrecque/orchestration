@@ -1,10 +1,10 @@
-// PROTOTYPE (#128): load the files, resolve each project, show the loader's errors,
+// PROTOTYPE (#128), round 2: load the files, resolve each project, show the loader's errors,
 // run the scripted walks. Run with: node check.ts
 import { readdirSync, readFileSync } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parse } from "yaml";
-import { createRegistry, resolve, start, reduce } from "#engine";
+import { createRegistry, resolve, start, reduce, whenText } from "#engine";
 import { scenarios } from "./scenarios.js";
 
 const here: string = import.meta.dirname;
@@ -21,16 +21,17 @@ async function registryFor(projectRoot: string, override: any) {
 }
 
 function describe(workflow: any): string {
-  return workflow.steps
+  const repairs = Object.entries<any>(workflow.repairs).map(([n, r]) => `${n} (${r.kind}${r.gate ? `, gate ${r.gate}` : ""})`).join(", ");
+  const steps = workflow.steps
     .map((s: any) => {
       const bits = [s.id];
-      if (s.trigger === "repair") bits.push("(repair only)");
-      if (s.when !== undefined) bits.push(`[when ${s.when}]`);
+      if (s.kind !== "agent") bits.push(`<${s.kind}>`);
+      if (s.when !== undefined) bits.push(`[when ${whenText(s.when)}]`);
       for (const [outcome, edge] of Object.entries<any>(s.on ?? {})) bits.push(`{${outcome} -> ${edge.repair} via ${edge.budget}}`);
-      if (s.else) bits.push(`[else block: ${s.else.block}]`);
       return bits.join(" ");
     })
     .join("\n    ");
+  return `repairs: ${repairs}\n    ${steps}`;
 }
 
 let failures = 0;

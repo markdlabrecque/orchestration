@@ -3,4 +3,4 @@ version: 1
 extends: global
 patch:
   - insert_after: review
-    step: { id: fix, kind: agent, runner: pi, options: { agent: verifier } }
+    step: { id: report, kind: agent, runner: pi, options: { agent: verifier } }

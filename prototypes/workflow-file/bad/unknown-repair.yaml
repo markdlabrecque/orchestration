@@ -1,0 +1,8 @@
+# Rejected: the edge names a repair nobody declared under repairs:.
+version: 1
+extends: global
+patch:
+  - set: review
+    with:
+      on:
+        findings: { repair: patch-up, budget: bounces }

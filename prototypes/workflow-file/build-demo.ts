@@ -16,7 +16,7 @@ for (const rel of ["global/workflow.yaml", "projects/orchestration/.orchestratio
 for (const f of readdirSync(join(here, "bad")).sort()) files[`bad/${f}`] = text(`bad/${f}`);
 
 const global = data("global/workflow.yaml");
-const effective = (wf: any) => stringify({ version: wf.version, budgets: wf.budgets, settings: wf.settings, steps: wf.steps }, { lineWidth: 0 });
+const effective = (wf: any) => stringify({ version: wf.version, budgets: wf.budgets, repairs: wf.repairs, settings: wf.settings, steps: wf.steps }, { lineWidth: 0 });
 
 const projects: Record<string, any> = {};
 const g = resolve(global, undefined, createRegistry());

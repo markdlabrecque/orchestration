@@ -1,4 +1,4 @@
-# PROTOTYPE: the v2 workflow file (#128)
+# PROTOTYPE: the v2 workflow file (#128), round 2
 
 Throwaway. It answers one question for wayfinder map #125: **how should a workflow
 file and a project override look and read?** Nothing here is production code.
@@ -7,9 +7,11 @@ file and a project override look and read?** Nothing here is production code.
 ## What is here
 
 - `global/workflow.yaml`: the global workflow, one per machine. Reproduces v1's ticket
-  pipeline: spec, tests, implement, review, a fix loop with a cap, report, mr, ci, merge.
+  pipeline: spec, tests, implement, review, verify (behind a setting), a fix loop with a cap,
+  report, mr, ci, a human merge approval (behind a setting), merge. Repairs are declared once
+  under `repairs:`, outside the ordered list.
 - `projects/orchestration/.orchestration/workflow.yaml`: this repository's override.
-  Tests-only verification, so there is nothing to patch.
+  Tests-only verification and automatic merge are settings, so there is nothing to patch.
 - `projects/drupal-site/.orchestration/workflow.yaml`: a Drupal site's override. Inserts
   DDEV verify and an accessibility scan after review; merge waits for a human.
 - `projects/drupal-site/.orchestration/steps/a11y-scan.step.ts`: a custom step kind

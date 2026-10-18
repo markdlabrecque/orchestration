@@ -1,4 +1,4 @@
-// PROTOTYPE (#128): guided walkthroughs, shared by check.ts and demo.html. Pure data.
+// PROTOTYPE (#128), round 2: guided walkthroughs, shared by check.ts and demo.html. Pure data.
 // Each step is a button: { label, outcome } presses an outcome on the running step;
 // { label, restart: true } simulates the owning process dying and coming back.
 
@@ -7,7 +7,7 @@ export const scenarios = [
     id: "happy",
     title: "Happy path",
     project: "orchestration", lane: "standard",
-    blurb: "This repository, a normal ticket. Every step passes first time. Watch the run keys count up and the budgets stay at zero.",
+    blurb: "This repository, a normal ticket. Every step passes first time. Verify and the merge approval are skipped by this repo's settings; they still show in the history as skipped.",
     presses: [
       { label: "Spec written", outcome: "pass" },
       { label: "Tests red for the right reason", outcome: "pass" },
@@ -24,7 +24,7 @@ export const scenarios = [
     id: "bounces",
     title: "Three bounces, then stop",
     project: "orchestration", lane: "standard",
-    blurb: "The reviewer keeps finding problems. Each findings verdict spends one bounce and runs a fresh fix, then review again. The fourth findings verdict has no budget left: the ticket blocks for a human.",
+    blurb: "The reviewer keeps finding problems. Each findings verdict spends one bounce and runs the fix repair, then review again. The fourth findings verdict has no budget left: the ticket blocks for a human.",
     presses: [
       { label: "Spec written", outcome: "pass" },
       { label: "Tests red", outcome: "pass" },
@@ -63,7 +63,7 @@ export const scenarios = [
     id: "trivial",
     title: "Trivial lane",
     project: "orchestration", lane: "trivial",
-    blurb: "A typo fix. The when: conditions skip tests and review. The skipped steps still show in the history so nobody wonders where they went.",
+    blurb: "A typo fix. The when: conditions skip tests, review and verify. The skipped steps still show in the history so nobody wonders where they went.",
     presses: [
       { label: "Spec written", outcome: "pass" },
       { label: "Suite green", outcome: "pass" },
@@ -76,11 +76,12 @@ export const scenarios = [
   },
   {
     id: "drupal",
-    title: "Drupal: verify and a11y share the budget",
+    title: "Drupal: two human gates, three steps share one budget",
     project: "drupal-site", lane: "standard",
-    blurb: "The Drupal override inserted ddev-up, verify and a11y after review. Verify findings and a11y violations both repair through fix and both spend the same bounces budget as review. At the end, merge waits for a human because this project set merge: human.",
+    blurb: "The Drupal site set verification: ddev and merge: human, and inserted a spec approval, ddev-up and an a11y scan. Review, verify and a11y all repair through the one fix and all spend the same bounces budget. Two human steps wait for a person: after the spec and before the merge.",
     presses: [
       { label: "Spec written", outcome: "pass" },
+      { label: "Person: OK to build", outcome: "pass" },
       { label: "Tests red", outcome: "pass" },
       { label: "Suite green", outcome: "pass" },
       { label: "Reviewer: findings", outcome: "findings" },
@@ -96,8 +97,10 @@ export const scenarios = [
       { label: "Report written", outcome: "pass" },
       { label: "MR open", outcome: "pass" },
       { label: "CI green on head", outcome: "pass" },
+      { label: "Person: merge it", outcome: "pass" },
+      { label: "Merged", outcome: "pass" },
     ],
-    expect: { status: "blocked", reasonIncludes: "awaiting human merge" },
+    expect: { status: "done" },
   },
   {
     id: "crash",

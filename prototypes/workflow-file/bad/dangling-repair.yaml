@@ -1,5 +1,0 @@
-# Rejected: review (and ci) still repair through fix, but fix is gone.
-version: 1
-extends: global
-patch:
-  - drop: fix
