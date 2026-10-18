@@ -271,8 +271,10 @@
 <!-- ===================== 5. rejects ===================== -->
 <section id="rejects" class="space-y-4">
   <h2 class="text-2xl font-semibold">What the loader rejects</h2>
-  <p class="max-w-3xl">Every merge-style override format surveyed in the prior-art research turns a typo into a silent new key. This shape refuses
-    the whole file at the first problem and says which line and why. Four overrides that must fail:</p>
+  <p class="max-w-3xl">Most tools let a project change a shared config by <em>merging</em> a second file on top. Misspell a name there and nothing
+    complains: the tool quietly adds a new entry with the wrong name and ignores what you meant. This file format does the opposite.
+    If anything in an override is wrong, the engine refuses the whole file and says which operation failed and why. Here are four broken
+    overrides and what the engine says about each:</p>
   <div id="bad" class="grid md:grid-cols-2 gap-5"></div>
 </section>
 
