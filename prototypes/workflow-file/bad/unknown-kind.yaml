@@ -1,0 +1,11 @@
+# Rejected: a11y-scan is a custom kind, and nothing under `uses:` registers it.
+version: 1
+extends: global
+patch:
+  - insert_after: review
+    step:
+      id: a11y
+      kind: a11y-scan
+      options: { pages: ["/"] }
+      on:
+        violations: { repair: fix, budget: bounces }

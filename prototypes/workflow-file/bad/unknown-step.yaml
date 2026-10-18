@@ -1,0 +1,6 @@
+# Rejected: the op names a step that does not exist (a typo).
+version: 1
+extends: global
+patch:
+  - insert_after: reviw
+    step: { id: verify, kind: agent, runner: pi, options: { agent: verifier } }

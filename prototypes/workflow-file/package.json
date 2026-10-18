@@ -1,0 +1,16 @@
+{
+  "name": "workflow-file-prototype",
+  "private": true,
+  "description": "PROTOTYPE (#128): throwaway. How should a v2 workflow file and a project override look and read?",
+  "type": "module",
+  "imports": {
+    "#engine": "./engine.js"
+  },
+  "scripts": {
+    "check": "node check.ts",
+    "demo": "node build-demo.ts"
+  },
+  "dependencies": {
+    "yaml": "2.9.1"
+  }
+}

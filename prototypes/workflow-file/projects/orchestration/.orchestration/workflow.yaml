@@ -1,0 +1,13 @@
+# Project override for this repository, committed at <repo>/.orchestration/workflow.yaml
+# PROTOTYPE (#128). Throwaway.
+#
+# This repo verifies with its automated tests only (AGENTS.md): review goes
+# straight to report, and merge waits for CI green on the exact head SHA.
+# The global workflow already does both, so there is nothing to patch.
+version: 1
+extends: global
+
+settings:
+  merge: auto
+
+patch: []

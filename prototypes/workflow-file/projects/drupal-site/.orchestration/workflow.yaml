@@ -1,0 +1,37 @@
+# Project override for a Drupal site, committed at <repo>/.orchestration/workflow.yaml
+# PROTOTYPE (#128). Throwaway.
+version: 1
+extends: global            # or `from: scratch` with a full `steps:` list
+
+uses:
+  - ./.orchestration/steps/a11y-scan.step.ts   # registers step kind a11y-scan
+
+settings:
+  merge: human             # a person presses merge on client sites
+
+patch:
+  - insert_after: review
+    step:
+      id: verify
+      kind: agent
+      runner: pi
+      options: { agent: verifier, env: ddev }
+      when: lane == standard
+      on:
+        findings: { repair: fix, budget: bounces }   # shares the review budget, as in v1
+
+  - insert_before: verify  # ops apply in order: verify exists by now
+    step:
+      id: ddev-up
+      kind: shell
+      options: { command: "ddev start && ddev drush cim -y" }
+      when: lane == standard
+
+  - insert_after: verify
+    step:
+      id: a11y
+      kind: a11y-scan
+      options: { pages: ["/", "/node/1"], standard: WCAG2AA }
+      when: lane == standard
+      on:
+        violations: { repair: fix, budget: bounces }

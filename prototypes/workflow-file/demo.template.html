@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="en" data-theme="luxury">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PROTOTYPE #128 – the v2 workflow file</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/daisyui.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/themes.css">
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4/dist/index.global.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  :where(.grid, .flex) > * { min-width: 0; }
+  :where(p, h1, h2, h3, h4, li, dd, td, th, .badge, .label) { overflow-wrap: anywhere; }
+  :where(img, svg, video, canvas, iframe) { max-width: 100%; height: auto; }
+  html, body { background: var(--color-base-200); color: var(--color-base-content); }
+  .code-mount { border-radius: var(--radius-box, 0.5rem); overflow: hidden; border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent); }
+  .code-mount pre.fallback { margin: 0; padding: 1rem; font-size: 0.8rem; line-height: 1.45; white-space: pre-wrap; background: var(--color-base-100); }
+  .step-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.5rem; align-items: center; padding: 0.35rem 0.6rem; border-radius: 0.4rem; }
+  .step-row.current { background: color-mix(in oklab, var(--color-primary) 22%, transparent); outline: 1px solid var(--color-primary); }
+  .step-row.skipped { opacity: 0.45; }
+  .step-row.repair-only { border-left: 3px dashed color-mix(in oklab, var(--color-base-content) 35%, transparent); }
+  .edge { fill: none; stroke: var(--color-primary); stroke-width: 2; }
+  .node { fill: var(--color-base-100); stroke: var(--color-base-content); stroke-width: 1.2; }
+  .node.conditional { stroke-dasharray: 5 4; }
+  .node.repair { stroke: var(--color-primary); stroke-dasharray: 2 3; }
+  .lbl { font: 600 13px ui-sans-serif, system-ui, sans-serif; fill: var(--color-base-content); text-anchor: middle; }
+  .edge-lbl { font: 12px ui-sans-serif, system-ui, sans-serif; fill: var(--color-primary); text-anchor: middle; }
+  .note { font: italic 12px ui-sans-serif, system-ui, sans-serif; fill: color-mix(in oklab, var(--color-base-content) 70%, transparent); }
+</style>
+</head>
+<body>
+<main class="max-w-6xl mx-auto px-5 py-8 space-y-14">
+
+<header class="space-y-4">
+  <div class="flex flex-wrap items-center gap-2">
+    <span class="badge badge-warning badge-lg">PROTOTYPE · throwaway</span>
+    <span class="badge badge-ghost">wayfinder #128 · map #125</span>
+  </div>
+  <h1 class="text-3xl md:text-4xl font-bold leading-tight">How should a workflow file and a project override look and read?</h1>
+  <p class="text-lg max-w-3xl">The v2 engine walks a ticket through steps written in a data file. Below are the real files: the global workflow that
+    reproduces v1's pipeline, this repository's override, a Drupal site's override, and one custom step kind in TypeScript.
+    Then a model you can press buttons on, so the loop and the budgets can be felt rather than read.</p>
+  <div role="alert" class="alert alert-info alert-soft max-w-3xl"><span><strong>Three things to react to:</strong> is the fix loop readable?
+    Are the patch operations obvious? What is missing? Answer at the bottom, or click any line to annotate it.</span></div>
+</header>
+
+<!-- ===================== 1. the shape ===================== -->
+<section id="shape" class="space-y-4">
+  <h2 class="text-2xl font-semibold">The shape, in one picture</h2>
+  <p class="max-w-3xl">The list is the order. A step that finds a problem names a <em>repair edge</em>: run <code>fix</code>, then run me again,
+    spending one slot of a named budget each time. Budgets live at the top of the file and never refill. Dashed boxes run only when their
+    <code>when:</code> holds; the dotted box runs only through a repair edge.</p>
+  <figure class="card bg-base-100 card-border">
+    <div class="card-body">
+      <svg viewBox="0 0 1000 300" width="100%" role="img" aria-labelledby="shape-title">
+        <title id="shape-title">The global workflow: nine steps in a row, with two repair loops through fix</title>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--color-primary)"/>
+          </marker>
+        </defs>
+        <!-- plain walk -->
+        <g id="walk">
+          <path class="edge" d="M120 62 H140 M240 62 H260 M360 62 H380 M480 62 H500 M600 62 H620 M720 62 H740 M840 62 H860" stroke="var(--color-base-content)" stroke-opacity="0.6" marker-end="url(#arrow)"/>
+          <g id="n-spec"><title>spec: agent, runner pi</title><rect class="node" x="20" y="40" width="100" height="44" rx="8"/><text class="lbl" x="70" y="67">spec</text></g>
+          <g id="n-tests"><title>tests: when lane not in [trivial, no-code]; gate tests-red</title><rect class="node conditional" x="140" y="40" width="100" height="44" rx="8"/><text class="lbl" x="190" y="67">tests</text></g>
+          <g id="n-implement"><title>implement: gate tests-green</title><rect class="node" x="260" y="40" width="100" height="44" rx="8"/><text class="lbl" x="310" y="67">implement</text></g>
+          <g id="n-review"><title>review: when lane != trivial; on findings repair fix via bounces</title><rect class="node conditional" x="380" y="40" width="100" height="44" rx="8"/><text class="lbl" x="430" y="67">review</text></g>
+          <g id="n-report"><title>report</title><rect class="node" x="500" y="40" width="100" height="44" rx="8"/><text class="lbl" x="550" y="67">report</text></g>
+          <g id="n-mr"><title>mr: commit, rebase, push, open the MR</title><rect class="node" x="620" y="40" width="100" height="44" rx="8"/><text class="lbl" x="670" y="67">mr</text></g>
+          <g id="n-ci"><title>ci: gate ci-green-on-head; on failed repair fix via ci_repairs</title><rect class="node" x="740" y="40" width="100" height="44" rx="8"/><text class="lbl" x="790" y="67">ci</text></g>
+          <g id="n-merge"><title>merge: when settings.merge == auto, else block awaiting human merge</title><rect class="node conditional" x="860" y="40" width="100" height="44" rx="8"/><text class="lbl" x="910" y="67">merge</text></g>
+        </g>
+        <!-- fix, reachable only through repair edges -->
+        <g id="n-fix"><title>fix: trigger repair; fresh implementor; gate tests-green</title><rect class="node repair" x="560" y="200" width="100" height="44" rx="8"/><text class="lbl" x="610" y="227">fix</text></g>
+        <!-- review <-> fix -->
+        <g id="e-review-fix"><title>review: on findings, repair fix, budget bounces (max 3)</title>
+          <path class="edge" d="M420 84 C 400 170, 480 222, 560 222" marker-end="url(#arrow)"/>
+          <text class="edge-lbl" x="400" y="150">findings</text>
+          <text class="edge-lbl" x="400" y="166">spend 1 of bounces (3)</text>
+        </g>
+        <g id="e-fix-review"><title>after fix passes, review runs again</title>
+          <path class="edge" d="M580 200 C 560 140, 500 100, 450 84" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+          <text class="edge-lbl" x="540" y="132">then review again</text>
+        </g>
+        <!-- ci <-> fix -->
+        <g id="e-ci-fix"><title>ci: on failed, repair fix, budget ci_repairs (max 2)</title>
+          <path class="edge" d="M800 84 C 820 170, 740 222, 660 222" marker-end="url(#arrow)"/>
+          <text class="edge-lbl" x="840" y="150">failed</text>
+          <text class="edge-lbl" x="840" y="166">spend 1 of ci_repairs (2)</text>
+        </g>
+        <g id="e-fix-ci"><title>after fix passes, ci runs again</title>
+          <path class="edge" d="M640 200 C 660 140, 720 100, 770 84" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+          <text class="edge-lbl" x="690" y="132">then ci again</text>
+        </g>
+        <text class="note" x="20" y="285">dashed border: runs only when its when: holds · dotted border: runs only through a repair edge · a spent budget blocks the ticket for a human</text>
+      </svg>
+    </div>
+  </figure>
+</section>
+
+<!-- ===================== 2. the files ===================== -->
+<section id="files" class="space-y-4">
+  <h2 class="text-2xl font-semibold">The files</h2>
+  <p class="max-w-3xl">Real text, not sketches. The two overrides are shown next to the change they make to the global workflow, so a patch op can be
+    judged by what it does.</p>
+
+  <div class="tabs tabs-lift" id="file-tabs">
+    <input type="radio" name="file-tab" class="tab" aria-label="Global workflow" checked>
+    <div class="tab-content bg-base-100 border-base-300 p-5 space-y-4">
+      <div class="grid lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] gap-6">
+        <div class="space-y-2">
+          <p class="text-sm opacity-70"><code>~/.config/orchestration/workflow.yaml</code> · one per machine · reproduces v1's pipeline</p>
+          <div class="code-mount" data-code-file="global/workflow.yaml"></div>
+        </div>
+        <aside class="space-y-3 text-sm">
+          <h3 class="font-semibold text-base">What to look at</h3>
+          <ul class="list-disc pl-5 space-y-2">
+            <li><strong>Budgets first.</strong> <code>bounces: 3</code> and <code>ci_repairs: 2</code> are v1's numbers. A repair edge must name one, or the loader refuses the file.</li>
+            <li><strong>The loop is one line</strong> on the step that detects the problem: <code>findings: { repair: fix, budget: bounces }</code>. Read it as "run fix, then run me again".</li>
+            <li><strong><code>fix</code> sits in the list but carries <code>trigger: repair</code>.</strong> It never runs in the plain walk. Three different steps can repair through the one fix step.</li>
+            <li><strong>Skip lanes are <code>when:</code></strong> on tests and review. Nothing else changes for a trivial or no-code ticket.</li>
+            <li><strong>"Merges wait for a human"</strong> is <code>when: settings.merge == auto</code> plus <code>else: { block: ... }</code>. Is that readable, or does it want its own step?</li>
+            <li><strong>Gates are names</strong> (<code>tests-green</code>, <code>ci-green-on-head</code>). They are code in the engine; the file only says which one applies.</li>
+            <li><strong>runner</strong> appears only on agent steps. mr, ci and merge are built-in kinds that imply how they run.</li>
+          </ul>
+        </aside>
+      </div>
+    </div>
+
+    <input type="radio" name="file-tab" class="tab" aria-label="This repo's override">
+    <div class="tab-content bg-base-100 border-base-300 p-5 space-y-4">
+      <div class="grid lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] gap-6">
+        <div class="space-y-2">
+          <p class="text-sm opacity-70"><code>&lt;repo&gt;/.orchestration/workflow.yaml</code> · committed in this repository</p>
+          <div class="code-mount" data-code-file="projects/orchestration/.orchestration/workflow.yaml"></div>
+          <div role="alert" class="alert alert-soft"><span><strong>Effective workflow: identical to the global one.</strong> Tests-only verification and the exact-SHA CI gate are already how the global workflow behaves, so this file patches nothing.</span></div>
+        </div>
+        <aside class="space-y-3 text-sm">
+          <h3 class="font-semibold text-base">What to look at</h3>
+          <ul class="list-disc pl-5 space-y-2">
+            <li><strong>Almost empty.</strong> <code>extends: global</code>, one setting, <code>patch: []</code>. Most projects will look like this.</li>
+            <li><strong>Question:</strong> should a project with nothing to change commit a file at all, or does "no file" mean "global as is"?</li>
+            <li><strong>settings</strong> are the knobs the global workflow already reads in its <code>when:</code> conditions. Patch ops change the list; settings change how the existing list behaves.</li>
+          </ul>
+        </aside>
+      </div>
+    </div>
+
+    <input type="radio" name="file-tab" class="tab" aria-label="Drupal site's override">
+    <div class="tab-content bg-base-100 border-base-300 p-5 space-y-4">
+      <div class="grid lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] gap-6">
+        <div class="space-y-2">
+          <p class="text-sm opacity-70"><code>&lt;repo&gt;/.orchestration/workflow.yaml</code> · committed in a Drupal site's repository</p>
+          <div class="code-mount" data-code-file="projects/drupal-site/.orchestration/workflow.yaml"></div>
+        </div>
+        <aside class="space-y-3 text-sm">
+          <h3 class="font-semibold text-base">What to look at</h3>
+          <ul class="list-disc pl-5 space-y-2">
+            <li><strong>Three ops, each addressed by a step id:</strong> <code>insert_after: review</code>, <code>insert_before: verify</code>, <code>insert_after: verify</code>. Ops apply in order, so the second one can name the step the first one made.</li>
+            <li><strong>verify shares <code>bounces</code> with review</strong>, as in v1. a11y shares it too. Three senders, one budget of three. Tight? (The Drupal walkthrough below ends at 3/3.)</li>
+            <li><strong><code>uses:</code></strong> points at the TypeScript module that registers <code>a11y-scan</code>. Forget it and the loader says so (see "What the loader rejects").</li>
+            <li><strong><code>merge: human</code></strong> is a setting, not a patch. The global merge step reads it.</li>
+            <li><strong>Not shown here:</strong> <code>drop</code>, <code>replace</code>, <code>set</code> (merge fields; null deletes), <code>move</code> (before/after) and <code>from: scratch</code>. Same addressing, same loud failures.</li>
+          </ul>
+        </aside>
+      </div>
+      <div class="space-y-2">
+        <h3 class="font-semibold">What the override does to the global workflow</h3>
+        <p class="text-sm opacity-70">Left: the global workflow as the engine sees it. Right: the Drupal site's effective workflow. Comments are gone because this is the loaded data, not the file.</p>
+        <div class="code-mount" data-code-diff="global:drupal-site"></div>
+      </div>
+    </div>
+
+    <input type="radio" name="file-tab" class="tab" aria-label="Custom step kind">
+    <div class="tab-content bg-base-100 border-base-300 p-5 space-y-4">
+      <div class="grid lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] gap-6">
+        <div class="space-y-2">
+          <p class="text-sm opacity-70"><code>&lt;repo&gt;/.orchestration/steps/a11y-scan.step.ts</code> · the escape hatch</p>
+          <div class="code-mount" data-code-file="projects/drupal-site/.orchestration/steps/a11y-scan.step.ts"></div>
+        </div>
+        <aside class="space-y-3 text-sm">
+          <h3 class="font-semibold text-base">What to look at</h3>
+          <ul class="list-disc pl-5 space-y-2">
+            <li><strong>Registered by name</strong>, like Pi Durable extensions. The file says <code>kind: a11y-scan</code>; the engine resolves kinds when it loads the file, not per run.</li>
+            <li><strong>A kind declares its outcomes.</strong> The first one falls through. Every other outcome must be mapped under <code>on:</code>, or the ticket blocks when it happens. Nothing fails open.</li>
+            <li><strong>Question for the step-kind ticket:</strong> built-in agent steps all share kind <code>agent</code> with outcomes pass / findings / failed. Is one kind right, or should review be its own kind with its own outcomes?</li>
+          </ul>
+        </aside>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== 3. drive it ===================== -->
+<section id="drive" class="space-y-4">
+  <h2 class="text-2xl font-semibold">Press the buttons</h2>
+  <p class="max-w-3xl">Pick a project and a lane. The engine runs the effective workflow for that project; each button is an outcome a step could
+    come back with. No agent runs; you are the agent.</p>
+
+  <div class="grid lg:grid-cols-[minmax(0,2fr)_minmax(0,3fr)] gap-6">
+    <div class="space-y-4">
+      <div class="card bg-base-100 card-border">
+        <div class="card-body gap-4">
+          <fieldset class="fieldset">
+            <legend class="fieldset-legend">Project</legend>
+            <div class="flex flex-wrap gap-2">
+              <label class="label cursor-pointer gap-2"><input type="radio" name="project" value="global" class="radio radio-sm"> Global only</label>
+              <label class="label cursor-pointer gap-2"><input type="radio" name="project" value="orchestration" class="radio radio-sm" checked> This repo</label>
+              <label class="label cursor-pointer gap-2"><input type="radio" name="project" value="drupal-site" class="radio radio-sm"> Drupal site</label>
+            </div>
+          </fieldset>
+          <fieldset class="fieldset">
+            <legend class="fieldset-legend">Lane</legend>
+            <div class="flex flex-wrap gap-2">
+              <label class="label cursor-pointer gap-2"><input type="radio" name="lane" value="standard" class="radio radio-sm" checked> standard</label>
+              <label class="label cursor-pointer gap-2"><input type="radio" name="lane" value="trivial" class="radio radio-sm"> trivial</label>
+              <label class="label cursor-pointer gap-2"><input type="radio" name="lane" value="no-code" class="radio radio-sm"> no-code</label>
+            </div>
+          </fieldset>
+          <p class="text-xs opacity-70">Open question: who sets the lane? In v1 the ticket orchestrator (a model) chose it while writing the spec.</p>
+        </div>
+      </div>
+
+      <div class="card bg-base-100 card-border">
+        <div class="card-body gap-3">
+          <h3 class="card-title text-base">Effective workflow</h3>
+          <div id="steps" class="space-y-1 text-sm"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="space-y-4">
+      <div class="card bg-base-100 card-border">
+        <div class="card-body gap-4">
+          <div class="flex flex-wrap items-center gap-3">
+            <h3 class="card-title text-base">Ticket state</h3>
+            <span id="status" class="badge"></span>
+            <span id="current" class="font-mono text-sm"></span>
+          </div>
+          <div id="last-change" role="status" class="alert alert-soft text-sm"></div>
+          <div id="budgets" class="grid sm:grid-cols-2 gap-3"></div>
+          <div>
+            <h4 class="font-semibold text-sm mb-2">What the step could come back with</h4>
+            <div id="buttons" class="flex flex-wrap gap-2"></div>
+          </div>
+          <div class="flex flex-wrap gap-2 pt-2 border-t border-base-300">
+            <button class="btn btn-sm btn-outline" data-restart>Process dies and restarts</button>
+            <button class="btn btn-sm btn-ghost" data-reset>Reset this ticket</button>
+          </div>
+        </div>
+      </div>
+      <div class="card bg-base-100 card-border">
+        <div class="card-body gap-2">
+          <h3 class="card-title text-base">Step runs so far</h3>
+          <p class="text-xs opacity-70">One line per step run; in v2 proper each is one Pi Durable task owned by the ticket task. Skipped steps are listed so nobody wonders where they went.</p>
+          <ol id="runs" class="text-sm space-y-1 font-mono"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== 4. walkthroughs ===================== -->
+<section id="walkthroughs" class="space-y-4">
+  <h2 class="text-2xl font-semibold">Guided walkthroughs</h2>
+  <p class="max-w-3xl">Each tab sets up one situation. Press Start, then the buttons in order, and watch the state above change. The awkward cases are the point.</p>
+  <div class="tabs tabs-lift" id="walk-tabs"></div>
+</section>
+
+<!-- ===================== 5. rejects ===================== -->
+<section id="rejects" class="space-y-4">
+  <h2 class="text-2xl font-semibold">What the loader rejects</h2>
+  <p class="max-w-3xl">Every merge-style override format surveyed in the prior-art research turns a typo into a silent new key. This shape refuses
+    the whole file at the first problem and says which line and why. Four overrides that must fail:</p>
+  <div id="bad" class="grid md:grid-cols-2 gap-5"></div>
+</section>
+
+<!-- ===================== 6. questions ===================== -->
+<section id="questions" class="space-y-6">
+  <h2 class="text-2xl font-semibold">Your reactions</h2>
+  <p class="max-w-3xl">Pick, then press <em>Queue answer</em>. Nothing is sent until you press <em>Send to Agent</em> in the Lavish bar. The first option in each pair is my recommendation.</p>
+
+  <div class="grid md:grid-cols-2 gap-5">
+    <form class="card bg-base-100 card-border" data-lavish-question="loop" onsubmit="event.preventDefault(); answer(this, 'loop', 'Is the fix loop readable')">
+      <div class="card-body gap-3">
+        <h3 class="card-title text-base">1. Is the fix loop readable?</h3>
+        <p class="text-sm opacity-80">One line on the detecting step, a named budget, and a <code>fix</code> step marked <code>trigger: repair</code>.</p>
+        <label class="label cursor-pointer justify-start gap-3"><input type="radio" name="loop" value="Yes, keep the repair edge and the trigger: repair step" class="radio radio-sm"> <span>Yes. Keep it.</span></label>
+        <label class="label cursor-pointer justify-start gap-3"><input type="radio" name="loop" value="No, the fix step with trigger: repair trips me up; try an inline repair block under each detecting step" class="radio radio-sm"> <span>No. <code>fix</code> sitting in the list but never running in order trips me up.</span></label>
+        <div class="card-actions items-center justify-between"><span class="queued text-xs opacity-70"></span><button type="submit" class="btn btn-sm btn-primary">Queue answer</button></div>
+      </div>
+    </form>
+
+    <form class="card bg-base-100 card-border" data-lavish-question="ops" onsubmit="event.preventDefault(); answer(this, 'ops', 'Are the patch operations obvious')">
+      <div class="card-body gap-3">
+        <h3 class="card-title text-base">2. Are the patch operations obvious?</h3>
+        <p class="text-sm opacity-80"><code>insert_after: review</code> plus a <code>step:</code>, addressed by id, applied in order, whole file rejected on any bad id.</p>
+        <label class="label cursor-pointer justify-start gap-3"><input type="radio" name="ops" value="Yes, keep the short op keys (insert_after: review)" class="radio radio-sm"> <span>Yes. Keep the short keys.</span></label>
+        <label class="label cursor-pointer justify-start gap-3"><input type="radio" name="ops" value="No, use the explicit RFC 6902 style (op: insert_after, step: review, value: ...)" class="radio radio-sm"> <span>No. Spell it out: <code>op: insert_after</code>, <code>step: review</code>, <code>value:</code>.</span></label>
+        <div class="card-actions items-center justify-between"><span class="queued text-xs opacity-70"></span><button type="submit" class="btn btn-sm btn-primary">Queue answer</button></div>
+      </div>
+    </form>
+
+    <form class="card bg-base-100 card-border" data-lavish-question="verify" onsubmit="event.preventDefault(); answer(this, 'verify', 'Where does verify live')">
+      <div class="card-body gap-3">
+        <h3 class="card-title text-base">3. Where does verify live?</h3>
+        <p class="text-sm opacity-80">Shown: the global has no verify; the Drupal site inserts it. v1 carried verify globally and preflight decided whether it ran.</p>
+        <label class="label cursor-pointer justify-start gap-3"><input type="radio" name="verify" value="Projects insert verify (as shown); the global stays minimal" class="radio radio-sm"> <span>Projects insert it. Global stays minimal.</span></label>
+        <label class="label cursor-pointer justify-start gap-3"><input type="radio" name="verify" value="The global carries verify behind a setting (settings.verification: local-tests | ddev | docker); projects set one line" class="radio radio-sm"> <span>Global carries it behind <code>settings.verification</code>; a project sets one line.</span></label>
+        <div class="card-actions items-center justify-between"><span class="queued text-xs opacity-70"></span><button type="submit" class="btn btn-sm btn-primary">Queue answer</button></div>
+      </div>
+    </form>
+
+    <form class="card bg-base-100 card-border" data-lavish-question="human-merge" onsubmit="event.preventDefault(); answer(this, 'human-merge', 'How does merge wait for a human')">
+      <div class="card-body gap-3">
+        <h3 class="card-title text-base">4. How does merge wait for a human?</h3>
+        <p class="text-sm opacity-80">Shown: <code>when: settings.merge == auto</code> with <code>else: { block: awaiting human merge }</code>. The ticket ends blocked; a person merges by hand.</p>
+        <label class="label cursor-pointer justify-start gap-3"><input type="radio" name="human-merge" value="Keep when + else: block for phase 1" class="radio radio-sm"> <span>Keep <code>when</code> + <code>else: block</code> for phase 1.</span></label>
+        <label class="label cursor-pointer justify-start gap-3"><input type="radio" name="human-merge" value="Add a human step kind that waits for a person, usable for other gates too" class="radio radio-sm"> <span>Add a <code>human</code> step kind that waits for a person. Usable elsewhere too.</span></label>
+        <div class="card-actions items-center justify-between"><span class="queued text-xs opacity-70"></span><button type="submit" class="btn btn-sm btn-primary">Queue answer</button></div>
+      </div>
+    </form>
+  </div>
+
+  <form class="card bg-base-100 card-border" data-lavish-question="missing" onsubmit="event.preventDefault(); answerText(this, 'missing', 'What is missing')">
+    <div class="card-body gap-3">
+      <h3 class="card-title text-base">5. What is missing?</h3>
+      <p class="text-sm opacity-80">Things I already know the file does not say: model routing per step, the review findings ledger, how the lane is chosen, a human granting one extra repair, a loop whose body is longer than one step. Anything else?</p>
+      <textarea name="missing" class="textarea w-full" rows="3" placeholder="Write anything. Short is fine."></textarea>
+      <div class="card-actions items-center justify-between"><span class="queued text-xs opacity-70"></span><button type="submit" class="btn btn-sm btn-primary">Queue answer</button></div>
+    </div>
+  </form>
+</section>
+
+<footer class="text-xs opacity-60 pb-8">Prototype files live on branch <code>prototype/workflow-file</code> under <code>prototypes/workflow-file/</code>. Run <code>node check.ts</code> there to see the same loader errors and walks in a terminal.</footer>
+</main>
+
+<script>
+  window.DATA = /* @DATA */;
+  function queued(form, text) { const el = form.querySelector('.queued'); if (el) el.textContent = text; }
+  function send(form, qid, title, choice) {
+    const text = title + ': ' + choice;
+    if (window.lavish && window.lavish.queuePrompt) {
+      window.lavish.queuePrompt('#128 reaction. ' + text, { tag: 'choice', text, element: form, queueKey: qid, data: { question: qid, answer: choice } });
+      queued(form, 'Queued: ' + choice);
+    } else {
+      queued(form, 'Picked: ' + choice + ' (open through Lavish to send it back)');
+    }
+  }
+  function answer(form, qid, title) { const c = new FormData(form).get(qid); if (c) send(form, qid, title, c); }
+  function answerText(form, qid, title) { const c = (new FormData(form).get(qid) || '').trim(); if (c) send(form, qid, title, c); }
+</script>
+
+<script type="module">
+/* @ENGINE */
+/* @SCENARIOS */
+
+const DATA = window.DATA;
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+const LABELS = {
+  agent: { pass: "Passes", findings: "Has findings", failed: "Fails (crash or red gate)" },
+  shell: { pass: "Command ok", failed: "Command failed" },
+  mr: { pass: "MR open", failed: "Could not open the MR" },
+  ci: { pass: "CI green on head", failed: "CI red" },
+  merge: { pass: "Merged", failed: "Merge failed" },
+  "a11y-scan": { pass: "Clean", violations: "Violations" },
+};
+
+let state = null;
+let walk = null; // { scenario, index }
+
+const picked = (name) => document.querySelector(`input[name="${name}"]:checked`).value;
+const pick = (name, value) => { const el = document.querySelector(`input[name="${name}"][value="${value}"]`); if (el) el.checked = true; };
+
+function reset() {
+  state = start(DATA.projects[picked("project")].workflow, { project: picked("project"), lane: picked("lane") });
+  render();
+}
+function act(action) { state = reduce(state, action); render(); }
+function startWalk(sc) {
+  pick("project", sc.project); pick("lane", sc.lane);
+  state = start(DATA.projects[sc.project].workflow, { project: sc.project, lane: sc.lane });
+  walk = { scenario: sc, index: 0 };
+  render();
+  $("drive").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+function pressWalk(sc, i) {
+  if (!walk || walk.scenario !== sc || walk.index !== i) return;
+  const p = sc.presses[i];
+  state = p.restart ? reduce(state, { type: "restart" }) : reduce(state, { type: "outcome", outcome: p.outcome });
+  walk.index++;
+  render();
+}
+
+function render() {
+  const statusClass = { running: "badge-primary", blocked: "badge-error", done: "badge-success" }[state.status];
+  $("status").className = `badge ${statusClass}`;
+  $("status").textContent = state.status === "blocked" ? "blocked for a human" : state.status;
+  $("current").textContent = state.current ? `running ${state.current.key}` : (state.reason ? state.reason : "");
+  $("last-change").className = `alert alert-soft text-sm ${state.status === "blocked" ? "alert-error" : state.status === "done" ? "alert-success" : "alert-info"}`;
+  $("last-change").innerHTML = `<span>${esc(state.lastChange)}</span>`;
+
+  $("budgets").innerHTML = Object.entries(state.budgets).map(([name, b]) => `
+    <div class="space-y-1">
+      <div class="flex justify-between text-sm"><span class="font-mono">${esc(name)}</span><span>${b.used} of ${b.max} spent</span></div>
+      <progress class="progress ${b.used >= b.max ? "progress-error" : "progress-primary"} w-full" value="${b.used}" max="${b.max}"></progress>
+    </div>`).join("");
+
+  const step = currentStep(state);
+  $("buttons").innerHTML = step
+    ? currentOutcomes(state).map((o) => {
+        const label = (LABELS[step.kind] || {})[o] || o;
+        const mapped = o === "pass" ? "" : (step.on && step.on[o] ? ` → repair ${step.on[o].repair}` : " → no mapping: blocks");
+        return `<button class="btn btn-sm ${o === "pass" ? "btn-success btn-outline" : "btn-warning btn-outline"}" data-outcome="${esc(o)}" title="${esc(state.current.key)} comes back with ${esc(o)}">${esc(label)}<span class="opacity-60 font-mono text-xs">${esc(o)}${esc(mapped)}</span></button>`;
+      }).join("")
+    : `<span class="text-sm opacity-70">${state.status === "done" ? "Nothing left to run." : "Blocked. A person has to act; the engine stays stopped. Reset to start over."}</span>`;
+
+  $("runs").innerHTML = state.runs.length
+    ? state.runs.map((r) => r.skipped
+        ? `<li class="opacity-50">${esc(r.key)} <span class="badge badge-ghost badge-xs">${esc(r.note)}</span></li>`
+        : `<li>${esc(r.key)} <span class="badge badge-xs ${r.outcome === "pass" ? "badge-success" : "badge-warning"}">${esc(r.outcome)}</span></li>`).join("")
+    : `<li class="opacity-50 font-sans">none yet</li>`;
+
+  $("steps").innerHTML = state.workflow.steps.map((s) => {
+    const classes = ["step-row"];
+    if (state.current && state.current.id === s.id) classes.push("current");
+    if (s.trigger === "repair") classes.push("repair-only");
+    if (state.runs.some((r) => r.skipped && r.id === s.id)) classes.push("skipped");
+    const tags = [];
+    if (s.kind !== "agent") tags.push(`<span class="badge badge-ghost badge-xs">${esc(s.kind)}</span>`);
+    if (s.trigger === "repair") tags.push(`<span class="badge badge-outline badge-xs">repair only</span>`);
+    if (s.when !== undefined) tags.push(`<span class="badge badge-ghost badge-xs" title="${esc(s.when)}">when</span>`);
+    for (const [o, e] of Object.entries(s.on || {})) tags.push(`<span class="badge badge-primary badge-outline badge-xs">${esc(o)} → ${esc(e.repair)} · ${esc(e.budget)}</span>`);
+    return `<div class="${classes.join(" ")}"><span class="font-mono">${esc(s.id)}</span><span class="flex flex-wrap gap-1 justify-end">${tags.join("")}</span></div>`;
+  }).join("");
+
+  $("walk-tabs").innerHTML = scenarios.map((sc, n) => {
+    const active = walk && walk.scenario === sc;
+    const buttons = sc.presses.map((p, i) => {
+      const done = active && i < walk.index;
+      const next = active && i === walk.index;
+      const cls = done ? "btn-success btn-outline" : next ? "btn-primary" : "btn-ghost btn-disabled";
+      return `<button class="btn btn-sm ${cls}" data-walk-press="${sc.id}:${i}" ${done || !next ? 'tabindex="-1" aria-disabled="true"' : ""}>${done ? "✓ " : `${i + 1}. `}${esc(p.label)}</button>`;
+    }).join("");
+    const finished = active && walk.index >= sc.presses.length;
+    return `
+      <input type="radio" name="walk-tab" class="tab" aria-label="${esc(sc.title)}" ${(active || (!walk && n === 0)) ? "checked" : ""}>
+      <div class="tab-content bg-base-100 border-base-300 p-5 space-y-4">
+        <p class="max-w-3xl">${esc(sc.blurb)}</p>
+        <p class="text-xs opacity-70">Project: <span class="font-mono">${esc(sc.project)}</span> · lane: <span class="font-mono">${esc(sc.lane)}</span></p>
+        <div class="flex flex-wrap gap-2 items-center">
+          <button class="btn btn-sm ${active ? "btn-outline" : "btn-primary"}" data-walk-start="${sc.id}">${active ? "Restart this walkthrough" : "Start"}</button>
+          ${finished ? `<span class="badge badge-success">walkthrough complete: ${esc(state.status)}</span>` : ""}
+        </div>
+        <div class="flex flex-wrap gap-2">${buttons}</div>
+      </div>`;
+  }).join("");
+}
+
+$("bad").innerHTML = DATA.bad.map((b, i) => `
+  <div class="card bg-base-100 card-border">
+    <div class="card-body gap-3">
+      <h3 class="card-title text-base font-mono">${esc(b.file)}</h3>
+      <div class="code-mount" data-code-file="${esc(b.file)}"></div>
+      <div role="alert" class="alert alert-error alert-soft text-sm"><span class="font-mono">${esc(b.error)}</span></div>
+    </div>
+  </div>`).join("");
+
+document.addEventListener("click", (e) => {
+  const t = e.target.closest("[data-outcome],[data-restart],[data-reset],[data-walk-start],[data-walk-press]");
+  if (!t) return;
+  if (t.dataset.outcome !== undefined) { walk = null; act({ type: "outcome", outcome: t.dataset.outcome }); }
+  else if (t.dataset.restart !== undefined) act({ type: "restart" });
+  else if (t.dataset.reset !== undefined) { walk = null; reset(); }
+  else if (t.dataset.walkStart !== undefined) startWalk(scenarios.find((s) => s.id === t.dataset.walkStart));
+  else if (t.dataset.walkPress !== undefined) { const [id, i] = t.dataset.walkPress.split(":"); pressWalk(scenarios.find((s) => s.id === id), Number(i)); }
+});
+document.querySelectorAll('input[name="project"], input[name="lane"]').forEach((el) => el.addEventListener("change", () => { walk = null; reset(); }));
+
+reset();
+
+// ---- code rendering: @pierre/diffs, with a plain fallback if the CDN is unreachable ----
+const mounts = [...document.querySelectorAll("[data-code-file]")];
+const diffs = [...document.querySelectorAll("[data-code-diff]")];
+const fallback = (el, text) => { el.innerHTML = `<pre class="fallback">${esc(text)}</pre>`; };
+try {
+  const { File, FileDiff } = await import("https://esm.sh/@pierre/diffs@1.2.10?bundle");
+  const options = { theme: { light: "github-light", dark: "github-dark" }, themeType: "dark", overflow: "wrap" };
+  for (const el of mounts) new File(options).render({ containerWrapper: el, file: { name: el.dataset.codeFile, contents: DATA.files[el.dataset.codeFile] } });
+  for (const el of diffs) {
+    const [a, b] = el.dataset.codeDiff.split(":");
+    new FileDiff({ ...options, diffStyle: "split" }).render({
+      containerWrapper: el,
+      oldFile: { name: `effective workflow (${a}).yaml`, contents: DATA.projects[a].effectiveYaml },
+      newFile: { name: `effective workflow (${b}).yaml`, contents: DATA.projects[b].effectiveYaml },
+    });
+  }
+} catch (err) {
+  console.warn("code renderer unavailable, using plain text", err);
+  for (const el of mounts) fallback(el, DATA.files[el.dataset.codeFile]);
+  for (const el of diffs) { const [a, b] = el.dataset.codeDiff.split(":"); fallback(el, `--- effective (${a})\n+++ effective (${b})\n\n${DATA.projects[b].effectiveYaml}`); }
+}
+</script>
+</body>
+</html>

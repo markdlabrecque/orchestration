@@ -1,0 +1,6 @@
+# Rejected: the inserted step reuses an id the workflow already has.
+version: 1
+extends: global
+patch:
+  - insert_after: review
+    step: { id: fix, kind: agent, runner: pi, options: { agent: verifier } }
