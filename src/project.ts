@@ -59,12 +59,41 @@ export async function discoverProject(
         await git(["add", "--all"], worktree);
         await git(["commit", "-m", title], worktree);
       }
+      const ref = `refs/heads/${ticket}`;
+      const leaseRef = `refs/orchestration/publish/${ticket}`;
+      const observed = await git(
+        ["ls-remote", "--refs", "origin", ref],
+        worktree,
+      );
+      const previousHead = observed.split(/\s+/)[0];
+      if (previousHead) {
+        await git(["fetch", "origin", ref], worktree);
+        const savedHead = await git(
+          ["for-each-ref", "--format=%(objectname)", leaseRef],
+          worktree,
+        );
+        // A failed push may leave HEAD rebased. Retain the approved old head
+        // across retries, but never authorize replacing a different remote head.
+        if (savedHead !== previousHead)
+          await git(
+            ["merge-base", "--is-ancestor", previousHead, "HEAD"],
+            worktree,
+          );
+        await git(["update-ref", leaseRef, previousHead], worktree);
+      }
       await git(["fetch", "origin", base], worktree);
       await git(["rebase", `origin/${base}`], worktree);
       await git(
-        ["push", "--set-upstream", "origin", `HEAD:refs/heads/${ticket}`],
+        [
+          "push",
+          `--force-with-lease=${ref}:${previousHead}`,
+          "--set-upstream",
+          "origin",
+          `HEAD:${ref}`,
+        ],
         worktree,
       );
+      await git(["update-ref", "-d", leaseRef], worktree);
       return git(["rev-parse", "HEAD"], worktree);
     },
     async retire() {

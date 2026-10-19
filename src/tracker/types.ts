@@ -1,3 +1,4 @@
+export type MergeOutcome = "merged" | "conflict";
 export type Identity = { id: string; url: string };
 export type Ticket = Identity & {
   title: string;
@@ -29,6 +30,8 @@ export interface Tracker {
   // Mark aborted without closing the ticket; repeat calls must be safe.
   abort(ticket: string, marker: string): Promise<void>;
   // Squash with a server-side SHA precondition; return only after confirmed
-  // merge, including reconciliation of an already-completed merge.
-  merge(id: string, sha: string): Promise<void>;
+  // merge, including reconciliation of an already-completed merge. Conflict
+  // requires an open, unmerged, exact-head forge observation before writing.
+  // Unknown state, transport errors and ambiguous writes throw, never conflict.
+  merge(id: string, sha: string): Promise<MergeOutcome>;
 }

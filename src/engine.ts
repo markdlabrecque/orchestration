@@ -11,12 +11,14 @@ import {
   type TaskId,
 } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
+import { agentStep } from "./agent-step.ts";
 import { checked, type Exec, exec } from "./command.ts";
 import {
   ContractError,
   FilingError,
   type Finding,
   Findings,
+  linkFinding,
   openFindings,
   recordResult,
 } from "./findings.ts";
@@ -34,7 +36,6 @@ import {
   type RunnerEvent,
   type RunnerResult,
   roleResultSchema,
-  validateResult,
 } from "./runners/types.ts";
 import type { Identity, Ticket, Tracker } from "./tracker/types.ts";
 import { matchesWhen, type Workflow } from "./workflow.ts";
@@ -399,16 +400,10 @@ export async function runWorkflow(
                   (f) => f.id === finding.id,
                 );
                 if (!item) throw new Error("Missing finding");
-                item.filing = "linked";
-                item.link = link;
-                if (item.deferralReason) item.status = "deferred";
+                linkFinding(item, link);
                 return undefined;
               }, context);
-              Object.assign(finding, {
-                filing: "linked",
-                link,
-                ...(finding.deferralReason ? { status: "deferred" } : {}),
-              });
+              linkFinding(finding, link);
             } catch (error) {
               throw new FilingError(String(error));
             }
@@ -701,60 +696,31 @@ export async function runWorkflow(
             return;
           }
           if (step.kind === "agent") {
-            const role = step.role ?? String(step.options?.role);
-            const mode =
-              state.repair?.phase === "body"
-                ? "repair"
-                : state.repair?.phase === "recheck" &&
-                    ["reviewer", "verifier"].includes(role)
-                  ? "recheck"
-                  : "normal";
-            const schema = roleResultSchema(role, mode);
             const runner = getRunner(step.runner ?? "");
-            const session =
-              step.session && mode !== "repair"
-                ? state.sessions?.[step.session]
-                : undefined;
-            if (
-              step.session &&
-              mode !== "repair" &&
-              (!session || !runner.resumable)
-            )
-              throw new Error(`${step.id}: missing session ${step.session}`);
+            const agent = agentStep(step, {
+              resumable: runner.resumable,
+              ticket: state.ticket,
+              lane: state.lane,
+              implementationTier: state.implementationTier,
+              handoffs: state.handoffs,
+              results: state.results,
+              sessions: state.sessions,
+              repair: state.repair,
+              detector: detector.id,
+              findings: ledger.items,
+            });
             const result =
               state.cached ??
-              (await runner.run({
-                ...(session ? { session } : {}),
-                prompt: `Execution mode: ${mode}. ${mode === "recheck" ? "Confirm only the supplied IDs and repair diff. New discoveries are follow-ups." : mode === "repair" ? "Respond to every supplied ID with changed or disagreed and a reason." : ""}\nOpen findings:\n${JSON.stringify(openFindings(ledger.items, mode === "normal" ? step.id : detector.id))}\nRepair diff:\n${state.repair?.diff ?? ""}\nRepair responses:\n${JSON.stringify(ledger.items.filter((f) => f.detector === detector.id).map((f) => ({ id: f.id, responses: f.responses })))}\n\n${state.ticket.title}\n${state.ticket.body}\n\nResolved options:\n${JSON.stringify(step.options ?? {})}\nLane: ${state.lane}\nPrevious results:\n${JSON.stringify(state.results)}\nPrevious handoffs:\n${JSON.stringify(state.handoffs)}`,
-                role: `${await options.role(role)}\n\nThe engine owns order, state and tracker writes. Return this JSON schema through submit_result on Pi or ORCH_RESULT_FILE on shell:\n${JSON.stringify(schema)}`,
-                cwd: project.worktree,
-                model: {
-                  tier:
-                    role === "implementor" && mode !== "repair"
-                      ? state.implementationTier
-                      : (step.model?.tier ?? "standard"),
-                  effort: step.model?.effort ?? "medium",
-                },
-                tools:
-                  step.tools ??
-                  (step.runner === "shell"
-                    ? ["read", "edit", "shell"]
-                    : ["read"]),
-                timeoutMs: step.timeoutMs ?? 60 * 60 * 1000,
-                resultSchema: schema,
-                signal: runtime.signal,
-                onEvent: (event) => options.onEvent?.(event),
-              }));
+              (await runner.run(
+                await agent.request({
+                  cwd: project.worktree,
+                  role: options.role,
+                  signal: runtime.signal,
+                  onEvent: (event) => options.onEvent?.(event),
+                }),
+              ));
             if (runtime.signal.aborted || paused) return;
-            if (result.status === "done") {
-              try {
-                validateResult(schema, result.result);
-              } catch (error) {
-                throw new ContractError(String(error));
-              }
-            }
-            failureOutcome =
-              result.result?.outcome === "findings" ? "findings" : "failed";
+            failureOutcome = agent.validate(result);
             if (!state.cached) {
               options.onEvent?.({
                 type: "status",
@@ -767,7 +733,7 @@ export async function runWorkflow(
                     (await tx.doc(Findings)).items,
                     result.result,
                     detector.id,
-                    mode,
+                    agent.mode,
                     state.runId,
                     step.id,
                   );
@@ -786,52 +752,23 @@ export async function runWorkflow(
               }, context);
               return;
             }
-            if (
-              ["reviewer", "verifier"].includes(role) &&
-              mode !== "repair" &&
-              openFindings(ledger.items, step.id).length
-            ) {
-              failureOutcome = "findings";
-              throw new Error(`${step.id}: open must-fix findings`);
+            const interpreted = agent.interpret(result);
+            if (interpreted.reason) {
+              failureOutcome = interpreted.outcome;
+              throw new Error(interpreted.reason);
             }
-            if (
-              mode !== "recheck" &&
-              result.result?.outcome === "pass" &&
-              result.result.findings?.some(
-                (f) => f.classification === "must-fix",
-              )
-            )
-              throw new Error(`${step.id}: must-fix findings cannot pass`);
-            if (
-              result.status !== "done" ||
-              (result.result?.outcome !== "pass" &&
-                !(
-                  result.result?.outcome === "findings" &&
-                  ["reviewer", "verifier"].includes(role) &&
-                  mode !== "repair"
-                ))
-            )
-              throw new Error(
-                `${step.id}: agent ${result.status}: ${result.result?.summary ?? "missing passing result"}`,
-              );
             notify({ step: name, handoff: result.handoff });
             await advance({
               handoffs: { ...state.handoffs, [step.id]: result.handoff },
-              results: { ...state.results, [step.id]: result.result },
+              results: {
+                ...state.results,
+                ...(result.result ? { [step.id]: result.result } : {}),
+              },
               sessions: {
                 ...state.sessions,
                 ...(result.session ? { [step.id]: result.session } : {}),
               },
-              ...(role === "spec-writer" && mode !== "repair"
-                ? {
-                    lane: state.ticket.labels?.some((l) =>
-                      l.startsWith("lane:"),
-                    )
-                      ? state.lane
-                      : result.result.lane,
-                    implementationTier: result.result.implementationTier,
-                  }
-                : {}),
+              ...interpreted.selection,
             });
             return;
           }
@@ -895,7 +832,13 @@ export async function runWorkflow(
           const pr = await tracker.readPullRequest(state.pr.id);
           if (pr.head !== state.ciHead)
             throw new Error("PR head differs from CI-passed SHA");
-          if (!pr.merged) await tracker.merge(pr.id, state.ciHead);
+          if (
+            !pr.merged &&
+            (await tracker.merge(pr.id, state.ciHead)) === "conflict"
+          ) {
+            failureOutcome = "conflict";
+            throw new Error("Forge confirmed merge conflict on CI-passed head");
+          }
           const confirmed = await tracker.readPullRequest(pr.id);
           if (!confirmed.merged || confirmed.head !== state.ciHead)
             throw new Error("Merge not confirmed on CI-passed head");

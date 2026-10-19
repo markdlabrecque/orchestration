@@ -49,7 +49,7 @@ function fixture(yaml: string): RunOptions {
         merged: false,
       }),
       ci: async () => "passed",
-      merge: async () => {},
+      merge: async () => "merged",
     },
   };
 }
@@ -321,6 +321,7 @@ test("park publishes a draft listing open findings and never merges or retires",
   };
   f.tracker.merge = async () => {
     trace.push("merge");
+    return "merged";
   };
   const result = await runWorkflow(f);
   expect(result.status, result.reason).toBe("parked");
@@ -364,6 +365,7 @@ steps:
   f.tracker.merge = async (_id, sha) => {
     trace.push(`merge:${sha}`);
     merged = true;
+    return "merged";
   };
   const result = await runWorkflow(f);
   expect(result.status, result.reason).toBe("merged");
@@ -551,6 +553,7 @@ steps:
   f.tracker.ci = async () => (++polls === 1 ? "failed" : "passed");
   f.tracker.merge = async () => {
     merges++;
+    return "merged";
   };
   const result = await runWorkflow(f);
   expect(result.status).toBe("blocked");

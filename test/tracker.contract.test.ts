@@ -151,7 +151,8 @@ for (const forge of ["github", "gitlab"] as const) {
       await expect(tracker.merge("7", "stale")).rejects.toThrow(/head/);
       expect(fake.state.mergeBody).toBeUndefined();
       fake.state.conflict = true;
-      await expect(tracker.merge("7", "abc")).rejects.toThrow(/conflict/);
+      expect(await tracker.merge("7", "abc")).toBe("conflict");
+      expect(fake.state.mergeBody).toBeUndefined();
       fake.state.conflict = false;
       await tracker.merge("7", "abc");
       expect(fake.state.mergeBody).toEqual(
@@ -274,5 +275,64 @@ for (const forge of ["github", "gitlab"] as const) {
         labels: ["lane:trivial"],
       });
     });
+  });
+}
+
+for (const forge of ["github", "gitlab"] as const) {
+  test.each([
+    "transport",
+    "ambiguous-success",
+    "unknown-mergeability",
+  ])(`${forge} %s is never a confirmed conflict`, async (failure) => {
+    const fake = fakeForge(forge);
+    const execute: Exec = async (request) => {
+      if (request.argv[2]?.endsWith("/merge")) {
+        if (failure === "transport")
+          throw new Error("409 conflict: response lost");
+        return {
+          status: "done",
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({ message: "conflict" }),
+        };
+      }
+      const response = await fake.execute(request);
+      if (failure === "unknown-mergeability") {
+        const data = JSON.parse(response.stdout);
+        data.mergeable = null;
+        data.has_conflicts = false;
+        data.detailed_merge_status = "checking";
+        return { ...response, stdout: JSON.stringify(data) };
+      }
+      return response;
+    };
+    const tracker =
+      forge === "github"
+        ? createGitHubTracker("team/repo", "/tmp", execute)
+        : createGitLabTracker("team/repo", "/tmp", execute);
+    await expect(tracker.merge("7", "abc")).rejects.toThrow();
+  });
+}
+
+for (const forge of ["github", "gitlab"] as const) {
+  test(`${forge} a lost successful merge response throws and retry confirms without another write`, async () => {
+    const fake = fakeForge(forge);
+    let writes = 0;
+    const execute: Exec = async (request) => {
+      const response = await fake.execute(request);
+      if (request.argv[2]?.endsWith("/merge")) {
+        writes++;
+        throw new Error("response lost");
+      }
+      return response;
+    };
+    const tracker =
+      forge === "github"
+        ? createGitHubTracker("team/repo", "/tmp", execute)
+        : createGitLabTracker("team/repo", "/tmp", execute);
+    await expect(tracker.merge("7", "abc")).rejects.toThrow("response lost");
+    fake.state.conflict = true;
+    expect(await tracker.merge("7", "abc")).toBe("merged");
+    expect(writes).toBe(1);
   });
 }

@@ -11,6 +11,8 @@ type Remote = {
   labels?: { name: string }[];
   head: { sha: string };
   merged: boolean;
+  state?: string;
+  mergeable?: boolean | null;
 };
 const identity = (r: Remote): Identity =>
   remoteIdentity(r?.number ?? r?.id, r?.html_url);
@@ -185,16 +187,20 @@ export function createGitHubTracker(
       );
     },
     async merge(id, sha) {
-      const pr = await readPullRequest(id);
-      if (pr.head !== sha)
+      const pr: Remote = await api(`pulls/${id}`);
+      identity(pr);
+      if (pr.head.sha !== sha)
         throw new Error("PR head differs from CI-passed SHA");
-      if (pr.merged) return;
+      if (pr.merged === true) return "merged";
+      if (pr.merged === false && pr.state === "open" && pr.mergeable === false)
+        return "conflict";
       const result = await api(`pulls/${id}/merge`, "PUT", {
         merge_method: "squash",
         sha,
       });
       if (result.merged !== true)
         throw new Error("GitHub did not confirm merge");
+      return "merged";
     },
   };
 }

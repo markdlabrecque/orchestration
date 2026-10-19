@@ -103,6 +103,7 @@ export function fakeForge(forge: "github" | "gitlab") {
         ...(gitlab
           ? {
               sha: state.head,
+              has_conflicts: state.conflict,
               state: state.merged ? "merged" : "opened",
               head_pipeline:
                 state.ci === "missing"
@@ -117,7 +118,12 @@ export function fakeForge(forge: "github" | "gitlab") {
                       }[state.ci],
                     },
             }
-          : { head: { sha: state.head }, merged: state.merged, state: "open" }),
+          : {
+              head: { sha: state.head },
+              merged: state.merged,
+              state: "open",
+              mergeable: !state.conflict,
+            }),
         draft: state.draft,
       });
     }

@@ -115,10 +115,10 @@ export function createGitLabTracker(
     comment,
     readPullRequest,
     async merge(id, sha) {
-      const mr = await readPullRequest(id);
-      if (mr.head !== sha)
-        throw new Error("MR head differs from CI-passed SHA");
-      if (mr.merged) return;
+      const mr = await readMR(id);
+      if (mr.sha !== sha) throw new Error("MR head differs from CI-passed SHA");
+      if (mr.state === "merged") return "merged";
+      if (mr.state === "opened" && mr.has_conflicts === true) return "conflict";
       const result = await api(`merge_requests/${id}/merge`, "PUT", {
         squash: true,
         sha,
@@ -129,6 +129,7 @@ export function createGitLabTracker(
         identity(result).id !== id
       )
         throw new Error("GitLab did not confirm merge");
+      return "merged";
     },
     async ci(id, sha) {
       const mr = await readMR(id);

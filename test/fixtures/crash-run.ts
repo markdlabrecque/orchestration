@@ -62,6 +62,7 @@ const tracker: Tracker = {
   ci: async () => "passed",
   merge: async () => {
     merged = true;
+    return "merged";
   },
 };
 const state = await runWorkflow({

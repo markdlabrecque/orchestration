@@ -61,6 +61,7 @@ async function fixture() {
       expect(sha).toBe(head);
       trace.push("merge");
       merged = true;
+      return "merged";
     },
   };
   const project = {
@@ -1314,4 +1315,74 @@ test("confirmed merge survives retirement failure and resume never merges twice"
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("a confirmed merge conflict routes its repair edge and rechecks before retirement", async () => {
+  const f = await fixture();
+  f.workflow.steps = f.workflow.steps.filter((s) =>
+    ["mr", "ci", "merge"].includes(s.kind),
+  );
+  f.workflow.budgets.conflicts = { max: 1 };
+  f.workflow.repairs.resolve = {
+    id: "resolve",
+    kind: "shell",
+    options: { command: "true" },
+  };
+  const step = f.workflow.steps.find((s) => s.kind === "merge");
+  if (!step) throw new Error("missing merge");
+  step.on = { conflict: { repair: "resolve", budget: "conflicts" } };
+  const merge = f.tracker.merge;
+  let attempts = 0;
+  f.tracker.merge = async (id, sha) =>
+    ++attempts === 1 ? "conflict" : merge(id, sha);
+  const state = await runWorkflow({
+    ...f,
+    execute: async () => ({
+      status: "done",
+      code: 0,
+      stdout: "tree",
+      stderr: "",
+    }),
+  });
+  expect(state.status, state.reason).toBe("merged");
+  expect(state.budgets.conflicts.spent).toBe(1);
+  expect(attempts).toBe(2);
+  expect(f.trace.at(-1)).toBe("retire");
+});
+
+test.each([
+  "error",
+  "changed-head",
+])("merge %s cannot use a conflict edge to bypass exact-SHA checks", async (failure) => {
+  const f = await fixture();
+  f.workflow.steps = f.workflow.steps.filter((s) =>
+    ["mr", "ci", "merge"].includes(s.kind),
+  );
+  f.workflow.budgets.conflicts = { max: 1 };
+  f.workflow.repairs.resolve = {
+    id: "resolve",
+    kind: "shell",
+    options: { command: "true" },
+  };
+  const step = f.workflow.steps.find((s) => s.kind === "merge");
+  if (!step) throw new Error("missing merge");
+  step.on = { conflict: { repair: "resolve", budget: "conflicts" } };
+  let attempts = 0;
+  f.tracker.merge = async () => {
+    attempts++;
+    if (failure === "error") throw new Error("409 conflict: response lost");
+    return "conflict";
+  };
+  const state = await runWorkflow({
+    ...f,
+    execute: async (request) => {
+      if (request.argv.includes("true")) f.setHead("changed");
+      return { status: "done", code: 0, stdout: "tree", stderr: "" };
+    },
+  });
+  expect(state.status).toBe("blocked");
+  expect(state.outcomes.merge).toBe("failed");
+  expect(attempts).toBe(1);
+  expect(f.trace).not.toContain("retire");
+  expect(state.budgets.conflicts?.spent ?? 0).toBe(failure === "error" ? 0 : 1);
 });

@@ -91,3 +91,9 @@ export function recordResult(
     });
   }
 }
+
+export function linkFinding(finding: Finding, link: Identity) {
+  finding.filing = "linked";
+  finding.link = link;
+  if (finding.deferralReason) finding.status = "deferred";
+}
