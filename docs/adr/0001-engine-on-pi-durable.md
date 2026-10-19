@@ -10,7 +10,6 @@ v1 built its own durability so a ticket survives a dead process: SQLite state be
 ## Considered options
 
 - Keep the Python `orch` and treat Pi Durable as one more runner. Rejected: keeps the durability burden and two state models.
-- Orchestration Lite on T3 Code (plan of 2026-10-09). Superseded: bound to one host and without durability.
 
 ## Consequences
 
