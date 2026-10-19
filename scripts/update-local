@@ -10,5 +10,6 @@ if [[ -n "$(git status --porcelain)" ]]; then
 fi
 git pull --ff-only
 pnpm install --frozen-lockfile
+bash scripts/install-pi-skill
 ./bin/orch --version
 printf '%s\n' 'Global workflow preserved. Use orch workflow diff to review shipped changes.'

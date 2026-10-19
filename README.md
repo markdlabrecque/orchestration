@@ -23,7 +23,10 @@ Installation runs `pnpm install --frozen-lockfile` and `pnpm link --global`,
 creates the global workflow only when absent, and links `~/bin/orch-update`.
 `orch-update` pulls the stable checkout with `--ff-only`, installs dependencies
 and prints the version and commit. It refuses uncommitted work and preserves
-your global workflow. See [installation and workflow configuration](docs/v2/usage.md).
+your global workflow. Both commands copy `skills/orch/SKILL.md` to
+`~/.pi/agent/skills/orch/SKILL.md`, overwriting local skill edits. No Claude Code
+configuration is changed. In Pi, run `/reload`, then `/skill:orch <ticket>`.
+See [installation and workflow configuration](docs/v2/usage.md).
 
 ## Configure and run
 

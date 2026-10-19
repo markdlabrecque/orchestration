@@ -47,6 +47,7 @@ test("stable install links a working CLI, preserves global edits and rejects tic
       "src",
       "bin",
       "scripts",
+      "skills",
       "roles",
       "workflow.default.yaml",
       "package.json",
@@ -71,6 +72,7 @@ test("stable install links a working CLI, preserves global edits and rejects tic
       "src",
       "bin",
       "scripts",
+      "skills",
       "roles",
       "workflow.default.yaml",
       "package.json",
@@ -80,7 +82,13 @@ test("stable install links a working CLI, preserves global edits and rejects tic
     const global = join(home, ".config/orchestration/workflow.yaml");
     await mkdir(join(home, ".config/orchestration"), { recursive: true });
     await writeFile(global, "user edits\n");
+    const skill = join(home, ".pi/agent/skills/orch/SKILL.md");
+    const bundledSkill = await readFile(
+      join(stable, "skills/orch/SKILL.md"),
+      "utf8",
+    );
     await run(["bash", "scripts/install-local"]);
+    expect(await readFile(skill, "utf8")).toBe(bundledSkill);
     expect(await readFile(global, "utf8")).toBe("user edits\n");
     expect(await realpath(join(home, "bin/orch-update"))).toBe(
       join(stable, "scripts/update-local"),
@@ -101,7 +109,9 @@ test("stable install links a working CLI, preserves global edits and rejects tic
     await run(["orch", "workflow", "reset", "--force"], dir);
     expect(await readFile(`${global}.bak`, "utf8")).toBe("user edits\n");
     await rm(global);
+    await writeFile(skill, "local skill edits\n");
     await run(["bash", "scripts/install-local"]);
+    expect(await readFile(skill, "utf8")).toBe(bundledSkill);
     const pristine = await readFile(
       join(stable, "workflow.default.yaml"),
       "utf8",
@@ -122,14 +132,21 @@ test("stable install links a working CLI, preserves global edits and rejects tic
       join(publisher, "package.json"),
       `${JSON.stringify(pkg, null, 2)}\n`,
     );
-    await run(["git", "add", "package.json"], publisher);
+    const updatedSkill = `${bundledSkill}\nUpdated fixture instructions.\n`;
+    await writeFile(join(publisher, "skills/orch/SKILL.md"), updatedSkill);
+    await run(
+      ["git", "add", "package.json", "skills/orch/SKILL.md"],
+      publisher,
+    );
     await run(["git", "commit", "-m", "fixture update"], publisher);
     await run(["git", "push"], publisher);
     const updated = await run(
       ["git", "rev-parse", "--short", "HEAD"],
       publisher,
     );
+    await writeFile(skill, "local skill edits before update\n");
     await run([join(home, "bin/orch-update")], dir);
+    expect(await readFile(skill, "utf8")).toBe(updatedSkill);
     expect(await run(["orch", "--version"], dir)).toBe(
       `2.0.0-alpha.2 ${updated}`,
     );

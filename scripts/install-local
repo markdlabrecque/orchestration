@@ -6,6 +6,7 @@ source scripts/stable-checkout.sh
 orch_require_stable_checkout
 pnpm install --frozen-lockfile
 pnpm link --global
+bash scripts/install-pi-skill
 config="${XDG_CONFIG_HOME:-$HOME/.config}/orchestration/workflow.yaml"
 mkdir -p "$(dirname "$config")" "$HOME/bin"
 # Exclusive copy preserves files and symlinks, including dangling symlinks.

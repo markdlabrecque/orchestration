@@ -25,6 +25,12 @@ refused rather than rebased. If dependency installation fails after a pull,
 fix the dependency problem and rerun the command before starting tickets.
 Neither install nor update replaces an existing global workflow.
 
+Both commands install the bundled `skills/orch/SKILL.md` into
+`~/.pi/agent/skills/orch/SKILL.md`, replacing any local edits to that skill on
+every successful install or update. Edit the bundled source to change the skill.
+No Claude Code configuration is changed. Run `/reload` in Pi to discover the
+skill, then use `/skill:orch <ticket>`.
+
 ## Two workflow files
 
 The global file is `${XDG_CONFIG_HOME:-$HOME/.config}/orchestration/workflow.yaml`.

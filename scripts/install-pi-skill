@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+skill="$HOME/.pi/agent/skills/orch/SKILL.md"
+mkdir -p "$(dirname "$skill")"
+cp "$root/skills/orch/SKILL.md" "$skill"
