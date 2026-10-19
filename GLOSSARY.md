@@ -25,8 +25,12 @@ The job a model does in an agent step, given by one of the stage prompts: spec-w
 _Avoid_: agent, persona, runner
 
 **Model tier**:
-A named level used to select a model: light, standard, heavy or frontier. A tier can correspond to different models for different runners.
+A named level used to select a model: light, standard, heavy or frontier. A tier can correspond to different models for different model families and runners.
 _Avoid_: model family, model name
+
+**Model family**:
+A named set of models, one per tier, from one provider, such as claude or openai. The workflow's `model-family` setting picks it; a project can change it. Default: claude.
+_Avoid_: provider, tier, vendor
 
 **Brief**:
 The finished prompt an agent step hands its runner: the ticket, the role prompt and the handoffs so far.

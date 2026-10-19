@@ -39,8 +39,9 @@ Acceptance:
 - Wrongly failing tests cannot satisfy the red gate; failed tests cannot satisfy green.
 - Human pause/resume asks again; timeouts/cancellation stop the conversation or process group.
 - A lost session handle fails clearly, without silently starting fresh.
+- Both runners resolve tiers through `settings.model-family`: `claude` (`pi-claude-subscription`) by default, `openai` when a project patch sets it. The shipped shell command runs `pi -p` and receives `ORCH_MODEL_PROVIDER`, `ORCH_MODEL` and `ORCH_MODEL_EFFORT`. Preflight rejects a family that a used runner does not declare, or that lacks a tier, and `ranOn` records the provider and model that ran.
 
-Depends on: 2. Source: ADRs 0003, 0005, 0009.
+Depends on: 2. Source: ADRs 0003, 0005, 0009, 0011.
 
 ## 4. [Add repair budgets and the findings ledger](https://github.com/markdlabrecque/orchestration/issues/142)
 

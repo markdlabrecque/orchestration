@@ -86,6 +86,8 @@ Lanes are standard, trivial and no-code. Tests are conditional; review is skippe
 
 The spec result chooses the implementation tier. Other roles and repairs have static tier/effort assignments. Keep light, standard, heavy and frontier, configurable through each runner's mappings; no automatic repair escalation. See [ADR 0009](../adr/0009-spec-selects-the-implementation-tier.md).
 
+Each runner declares tier tables per model family under `families`, each tier giving `provider` and `model`, and names the active family as `family: $settings.model-family`. The shipped default is `model-family: claude` (Pi's `pi-claude-subscription` provider); `openai` is the shipped alternative. A project switches with one setting in its patch. Preflight fails when the selected family is undeclared by a runner the effective workflow uses, or lacks a tier. See [ADR 0011](../adr/0011-project-selects-the-model-family.md).
+
 ## Runner contract
 
 A runner receives `prompt`, `role`, `cwd`, `model: { tier, effort }`, `tools`, `timeoutMs`, `resultSchema`, a cancellation signal and an event callback. It returns status `done | failed | aborted | timeout`, handoff, typed result, artifacts, actual provider/model/effort in `ranOn`, usage and any opaque session handle.
@@ -94,7 +96,7 @@ Tool words are `read`, `edit`, `shell`, `web`, `mcp:<name>`. Unsupported words f
 
 Pi uses an owned subagent conversation and a schema-backed `submit_result` tool. Stopping without submitting fails. On crash, continue the same conversation.
 
-Shell runs the configured agent command. Stdin contains role text, a blank line and the brief; `ORCH_ROLE_FILE` contains the role, stdout supplies the handoff, and `ORCH_RESULT_FILE` supplies validated JSON. A successful exit without the required valid result does not pass. Cancellation kills the process group. After a crash, rerun on the existing dirty worktree without resetting it.
+Shell runs the configured agent command under bash; the shipped command runs `pi -p`, not Codex. Stdin contains role text, a blank line and the brief; `ORCH_ROLE_FILE` contains the role, `ORCH_MODEL_PROVIDER`, `ORCH_MODEL` and `ORCH_MODEL_EFFORT` carry the resolved family, tier and effort, `ORCH_RESULT_SCHEMA` the result schema, stdout supplies the handoff, and `ORCH_RESULT_FILE` supplies validated JSON. A successful exit without the required valid result does not pass. Cancellation kills the process group. After a crash, rerun on the existing dirty worktree without resetting it.
 
 Fresh sessions are the default. `session: <step id>` continues a previous session only when the runner supports it; a missing handle fails at step start. Store handles in run state, not the findings ledger.
 

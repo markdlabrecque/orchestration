@@ -11,13 +11,13 @@ Keep the four tiers `light`, `standard`, `heavy` and `frontier`. A tier names a 
 
 The existing assignments are the starting table:
 
-| Tier | Claude alias | GPT model |
+| Tier | `claude` family (`pi-claude-subscription`) | `openai` family (`openai`) |
 |---|---|---|
-| light | haiku | gpt-6-luna |
-| standard | sonnet | gpt-6.1-sol |
-| heavy | opus | gpt-6-astra |
-| frontier | fable | gpt-6-astra |
+| light | claude-haiku-5-5 | gpt-6-luna |
+| standard | claude-sonnet-5-5 | gpt-6.1-sol |
+| heavy | claude-opus-5-5 | gpt-6-astra |
+| frontier | claude-fable-5-1 | gpt-6-astra |
 
-Heavy and frontier currently map to the same GPT model. The table is configuration, not a permanent list of supported models. The spec chooses a tier rather than a provider-specific model identifier; implementation effort remains a static workflow assignment.
+Heavy and frontier currently map to the same OpenAI model. Which family runs is the `model-family` setting, `claude` by default and switchable per project ([ADR 0011](0011-project-selects-the-model-family.md)). The table is configuration, not a permanent list of supported models. The spec chooses a tier rather than a provider-specific model identifier; implementation effort remains a static workflow assignment.
 
 Decision: [Model routing per step](https://github.com/markdlabrecque/orchestration/issues/135).
