@@ -1163,3 +1163,155 @@ test("custom kinds route Pi from the runner request tier", async () => {
   });
   expect(selected).toBe("large");
 });
+
+test("clean pauses never spend crash retries and a stopped run can be aborted without restarting work", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { openNodeSqliteStorage } = await import(
+    "@earendil-works/pi-durable/storage/sqlite/node"
+  );
+  const dir = await mkdtemp(join(tmpdir(), "orch-controls-"));
+  const f = await fixture();
+  f.workflow.steps = [
+    {
+      id: "approval",
+      kind: "human",
+      options: { ask: "Proceed?", choices: ["yes", "no"] },
+    },
+  ];
+  const markers: string[] = [];
+  f.tracker.abort = async (_ticket, marker) => {
+    markers.push(marker);
+  };
+  const run = async (extra = {}) =>
+    runWorkflow({
+      ...f,
+      storage: await openNodeSqliteStorage(join(dir, "run.sqlite")),
+      ask: async () => {
+        throw new Error("must not restart approval");
+      },
+      ...extra,
+    });
+  try {
+    for (let i = 0; i < 4; i++) {
+      const controller = new AbortController();
+      expect(
+        await run({
+          signal: controller.signal,
+          ask: async (_q: string, _c: string[], signal: AbortSignal) => {
+            controller.abort();
+            return new Promise((_, reject) =>
+              signal.addEventListener(
+                "abort",
+                () => reject(new Error("pause")),
+                { once: true },
+              ),
+            );
+          },
+        }),
+      ).toMatchObject({ status: "paused", crashes: {}, resumptions: i });
+    }
+    expect(await run({ command: "abort" })).toMatchObject({
+      status: "aborted",
+      outcomes: { pickup: "pass" },
+    });
+    expect(markers).toHaveLength(1);
+    expect(await run()).toMatchObject({ status: "aborted" });
+    expect(markers).toHaveLength(1);
+    expect(f.trace).toEqual(["assigned", "pickup"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("retirement failure can be retried without restarting an aborted run or losing history", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { openNodeSqliteStorage } = await import(
+    "@earendil-works/pi-durable/storage/sqlite/node"
+  );
+  const dir = await mkdtemp(join(tmpdir(), "orch-retire-"));
+  const f = await fixture();
+  f.workflow.steps = [
+    { id: "stop", kind: "shell", options: { command: "exit 1" } },
+  ];
+  let attempts = 0;
+  f.project.retire = async () => {
+    if (++attempts === 1) throw new Error("site removal failed");
+  };
+  const run = async (extra = {}) =>
+    runWorkflow({
+      ...f,
+      storage: await openNodeSqliteStorage(join(dir, "run.sqlite")),
+      ...extra,
+    });
+  try {
+    expect(await run()).toMatchObject({ status: "blocked" });
+    expect(await run({ command: "abort" })).toMatchObject({
+      status: "aborted",
+    });
+    expect(await run({ command: "retire" })).toMatchObject({
+      status: "blocked",
+      reason: expect.stringContaining("site removal failed"),
+      retirement: { from: "aborted", status: "pending" },
+    });
+    expect(await run({ command: "retire" })).toMatchObject({
+      status: "aborted",
+      retirement: { from: "aborted", status: "done" },
+      outcomes: { pickup: "pass", stop: "failed" },
+    });
+    expect(await run()).toMatchObject({ status: "aborted" });
+    expect(await run({ command: "retire" })).toMatchObject({
+      status: "aborted",
+    });
+    expect(attempts).toBe(2);
+    expect(f.trace).toEqual(["assigned", "pickup"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("confirmed merge survives retirement failure and resume never merges twice", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { openNodeSqliteStorage } = await import(
+    "@earendil-works/pi-durable/storage/sqlite/node"
+  );
+  const dir = await mkdtemp(join(tmpdir(), "orch-merged-retire-"));
+  const f = await fixture();
+  let attempts = 0;
+  f.project.retire = async () => {
+    if (++attempts === 1) throw new Error("retry retirement");
+  };
+  const run = async (extra = {}) =>
+    runWorkflow({
+      ...f,
+      storage: await openNodeSqliteStorage(join(dir, "run.sqlite")),
+      ...extra,
+    });
+  try {
+    expect(await run()).toMatchObject({
+      status: "blocked",
+      currentStep: "retire",
+      outcomes: { merge: "merged" },
+    });
+    await expect(run({ command: "abort" })).rejects.toThrow(/completed|merged/);
+    expect(
+      await run({
+        prepare: async () => {
+          throw new Error("execution tools no longer installed");
+        },
+      }),
+    ).toMatchObject({ status: "merged" });
+    expect(f.trace.filter((s) => s === "merge")).toHaveLength(1);
+    expect(await run({ command: "retire" })).toMatchObject({
+      status: "merged",
+    });
+    expect(attempts).toBe(2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

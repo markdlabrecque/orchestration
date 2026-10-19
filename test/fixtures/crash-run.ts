@@ -13,12 +13,14 @@ import { runWorkflow } from "../../src/engine.ts";
 import type { Tracker } from "../../src/tracker/types.ts";
 import { resolveWorkflow } from "../../src/workflow.ts";
 
-const [dir, mode] = process.argv.slice(2);
+const [dir, mode, retry] = process.argv.slice(2);
 const workflow = resolveWorkflow(
   await readFile(new URL("./slice-workflow.yaml", import.meta.url), "utf8"),
 );
 workflow.runners.pi = { provider: "faux", model: "fixture" };
 workflow.runners.shell.command = `if [ ! -f dirty ]; then printf saved > dirty; printf crash-shell; else test "$(cat dirty)" = saved || exit 1; fi; printf '{"outcome":"pass","summary":"implemented"}' > "$ORCH_RESULT_FILE"`;
+if (mode === "shell-limit")
+  workflow.runners.shell.command = `printf crash-shell; printf '{"outcome":"pass","summary":"implemented"}' > "$ORCH_RESULT_FILE"`;
 const models = createModels(),
   faux = fauxProvider({ models: [{ id: "fixture" }] });
 models.setProvider(faux.provider);
@@ -64,6 +66,7 @@ const tracker: Tracker = {
 };
 const state = await runWorkflow({
   workflow,
+  retry: retry.startsWith("retry"),
   models,
   storage: await openNodeSqliteStorage(join(dir, "run.sqlite")),
   tracker,
@@ -83,7 +86,8 @@ const state = await runWorkflow({
   },
   role: async () => "Do work",
   onEvent: (event) => {
-    if (existsSync(join(dir, "crashed"))) return;
+    if (mode !== "shell-limit" && existsSync(join(dir, "crashed"))) return;
+    if (retry === "retry") return;
     const piEnd =
       event.type === "tool" &&
       typeof event.data === "object" &&
@@ -92,7 +96,7 @@ const state = await runWorkflow({
       event.data.type === "tool_execution_end";
     if (
       (["pi", "pi-mid"].includes(mode) && piEnd) ||
-      (mode === "shell" && event.data === "crash-shell")
+      (["shell", "shell-limit"].includes(mode) && event.data === "crash-shell")
     ) {
       writeFileSync(join(dir, "crashed"), "yes");
       process.kill(process.pid, "SIGKILL");

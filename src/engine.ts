@@ -64,6 +64,13 @@ type Repair = {
   diff: string;
 };
 export type RunState = {
+  retirement: { from: string; status: "pending" | "done" } | null;
+  crashes: Record<string, number>;
+  resumptions: number;
+  crashBlocked: boolean;
+  currentStep: string | null;
+  startedAt: string;
+  updatedAt: string;
   findings?: Finding[];
   control: "park" | "abort" | null;
   cached: Pick<
@@ -79,7 +86,8 @@ export type RunState = {
     | "merged"
     | "completed"
     | "parked"
-    | "aborted";
+    | "aborted"
+    | "retired";
   reason: string;
   index: number;
   handoffs: Record<string, string>;
@@ -103,6 +111,13 @@ const Run = defineDoc<RunState>({
   scope: "session",
   initial: () => ({
     status: "running",
+    retirement: null,
+    crashes: {},
+    resumptions: 0,
+    crashBlocked: false,
+    currentStep: null,
+    startedAt: "",
+    updatedAt: "",
     control: null,
     cached: null,
     budgets: {},
@@ -127,6 +142,12 @@ const Run = defineDoc<RunState>({
 });
 export type RunOptions = {
   workflow: Workflow;
+  prepare?: (
+    saved: Workflow | null,
+    control: boolean,
+  ) => Promise<Pick<RunOptions, "workflow" | "registrations" | "tracker">>;
+  retry?: boolean;
+  command?: "run" | "abort" | "retire";
   storage: Storage;
   models: Models;
   tracker: Tracker;
@@ -135,6 +156,7 @@ export type RunOptions = {
   signal?: AbortSignal;
   ask?: Ask;
   onEvent?: (event: RunnerEvent) => void;
+  onState?: (state: RunState) => void;
   runner?: (name: string) => Runner;
   execute?: Exec;
   registrations?: Registrations;
@@ -146,12 +168,40 @@ export type RunOptions = {
 
 // Pi Durable documents and tasks are the only authoritative run state.
 export async function runWorkflow(options: RunOptions): Promise<RunState> {
-  const { tracker, project } = options;
-  const registrations = options.registrations ?? createRegistrations();
-  await preflight(options);
+  const { project } = options;
+  let tracker = options.tracker;
+  let registrations = options.registrations ?? createRegistrations();
   let checkedWorkflow = JSON.stringify(options.workflow);
   let harness: Harness;
   let observed: RunState | undefined;
+  let paused = false;
+  let closing: Promise<void> | undefined;
+  const publishState = async () => {
+    const state = await harness.snapshot(Run, ctx);
+    if (state) {
+      observed = state;
+      options.onState?.({ ...state, updatedAt: new Date().toISOString() });
+    }
+  };
+  const resumeState = (doc: RunState, ignoreLimit = false) => {
+    doc.crashes ??= {};
+    doc.resumptions ??= 0;
+    doc.crashBlocked ??= false;
+    if (doc.runId) {
+      if (doc.status === "running" && doc.currentStep) {
+        doc.crashes[doc.currentStep] = (doc.crashes[doc.currentStep] ?? 0) + 1;
+        doc.crashBlocked = doc.crashes[doc.currentStep] >= 3;
+      }
+    }
+    if (doc.crashBlocked && !options.retry && !ignoreLimit) {
+      doc.status = "blocked";
+      doc.reason = `Three crashes at ${doc.currentStep}; use orch run ${project.ticket} --retry for another attempt`;
+      return false;
+    }
+    if (doc.runId) doc.resumptions++;
+    doc.crashBlocked = false;
+    return true;
+  };
   const notify = (data: unknown) => options.onEvent?.({ type: "status", data });
   const Task = defineTask<
     Record<string, never>,
@@ -185,7 +235,7 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
           state.repair?.phase === "body"
             ? repairBody[state.repair.cursor]
             : detector;
-        const name = step?.id ?? stages[state.index];
+        const name = state.control ?? step?.id ?? stages[state.index];
         const checkpoint = (current: typeof task) => ({
           status: "running" as const,
           checkpoint: {
@@ -193,11 +243,26 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
             revision: current.state.checkpoint.revision + 1,
           },
         });
+        await runtime.commit(async (tx) => {
+          const doc = await tx.doc(Run);
+          doc.currentStep = name ?? null;
+          doc.updatedAt = new Date().toISOString();
+          return undefined;
+        }, context);
+        await publishState();
         notify({ step: name, status: "running" });
         const advance = async (
           change: Partial<RunState> = {},
           outcome?: string,
         ) => {
+          if (paused) return;
+          const resolvedOutcome =
+            outcome ??
+            (step?.kind === "merge"
+              ? "merged"
+              : step?.kind === "ci"
+                ? "passed"
+                : "pass");
           const gated = step;
           if (outcome !== "skipped" && gated?.gate?.startsWith("tests-"))
             await testGate(
@@ -248,10 +313,11 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
               signal: runtime.signal,
             });
           }
-          return runtime.commit(async (tx, current) => {
+          await runtime.commit(async (tx, current) => {
             const doc = await tx.doc(Run);
             Object.assign(doc, change);
             doc.cached = null;
+            doc.currentStep = null;
             if (doc.repair?.phase === "body") {
               doc.repair.publishedTree = publishedTree;
               doc.repair.cursor++;
@@ -263,10 +329,7 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
               doc.index++;
               doc.repair = null;
             }
-            const kind = step?.kind;
-            doc.outcomes[name] =
-              outcome ??
-              (kind === "merge" ? "merged" : kind === "ci" ? "passed" : "pass");
+            doc.outcomes[name] = resolvedOutcome;
             if (doc.index === stages.length) {
               doc.status = workflow.steps.some(
                 (s) => s.kind === "merge" && doc.outcomes[s.id] === "merged",
@@ -286,9 +349,31 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
               },
             };
           }, context);
+          notify({ step: name, outcome: resolvedOutcome });
         };
         let failureOutcome = "failed";
         try {
+          if (state.control === "abort") {
+            try {
+              await tracker.abort(
+                project.ticket,
+                `<!-- orch:${state.runId}:abort -->`,
+              );
+            } catch (error) {
+              throw new FilingError(String(error));
+            }
+            await runtime.commit(async (tx) => {
+              Object.assign(await tx.doc(Run), {
+                status: "aborted",
+                currentStep: null,
+              });
+              return {
+                status: "terminal",
+                outcome: { status: "completed", result: null },
+              };
+            }, context);
+            return;
+          }
           for (const finding of ledger.items.filter(
             (f) => f.filing === "pending",
           )) {
@@ -339,6 +424,7 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
               await runtime.commit(async (tx) => {
                 Object.assign(await tx.doc(Run), {
                   status: "parked",
+                  currentStep: null,
                   pr,
                   head,
                   ciHead: "",
@@ -351,24 +437,6 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
             } catch (error) {
               throw new FilingError(String(error));
             }
-            return;
-          }
-          if (state.control === "abort") {
-            try {
-              await tracker.abort(
-                project.ticket,
-                `<!-- orch:${state.runId}:abort -->`,
-              );
-            } catch (error) {
-              throw new FilingError(String(error));
-            }
-            await runtime.commit(async (tx) => {
-              (await tx.doc(Run)).status = "aborted";
-              return {
-                status: "terminal",
-                outcome: { status: "completed", result: null },
-              };
-            }, context);
             return;
           }
           const savedWorkflow = JSON.stringify(workflow);
@@ -413,9 +481,10 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
               workflow.steps.some(
                 (s) => s.kind === "merge" && state.outcomes[s.id] === "merged",
               )
-            )
+            ) {
               await project.retire();
-            await advance();
+              await advance({ retirement: { from: "merged", status: "done" } });
+            } else await advance();
             return;
           }
 
@@ -452,7 +521,7 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
                 ["grant", "defer", "park", "abort"],
                 runtime.signal,
               );
-              if (runtime.signal.aborted) return;
+              if (runtime.signal.aborted || paused) return;
               if (answer === "defer") {
                 const ids = (
                   await (options.ask ?? askHuman)(
@@ -470,7 +539,7 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
                     runtime.signal,
                   )
                 ).trim();
-                if (runtime.signal.aborted) return;
+                if (runtime.signal.aborted || paused) return;
                 const open = openFindings(ledger.items);
                 if (
                   !reason ||
@@ -548,7 +617,7 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
               choices,
               runtime.signal,
             );
-            if (runtime.signal.aborted) return;
+            if (runtime.signal.aborted || paused) return;
             if (!choices.includes(answer))
               throw new Error(`${step.id}: invalid human choice`);
             if (answer !== choices[0]) failureOutcome = answer;
@@ -610,6 +679,8 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
               failureOutcome = result.outcome;
             if (result.outcome !== custom.outcomes[0])
               throw new Error(`${step.id}: ${result.outcome}`);
+            if (result.handoff !== undefined)
+              notify({ step: name, handoff: result.handoff });
             await advance(
               result.handoff === undefined
                 ? {}
@@ -665,7 +736,7 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
                 signal: runtime.signal,
                 onEvent: (event) => options.onEvent?.(event),
               }));
-            if (runtime.signal.aborted) return;
+            if (runtime.signal.aborted || paused) return;
             if (result.status === "done") {
               try {
                 validateResult(schema, result.result);
@@ -734,7 +805,7 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
               throw new Error(
                 `${step.id}: agent ${result.status}: ${result.result?.summary ?? "missing passing result"}`,
               );
-            options.onEvent?.({ type: "text", data: result.handoff });
+            notify({ step: name, handoff: result.handoff });
             await advance({
               handoffs: { ...state.handoffs, [step.id]: result.handoff },
               results: { ...state.results, [step.id]: result.result },
@@ -821,7 +892,12 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
             throw new Error("Merge not confirmed on CI-passed head");
           await advance();
         } catch (error) {
-          if (runtime.signal.aborted) return;
+          if (runtime.signal.aborted || paused) return;
+          notify({
+            step: name,
+            outcome: failureOutcome,
+            reason: String(error),
+          });
           const edge =
             error instanceof ContractError || error instanceof FilingError
               ? undefined
@@ -864,6 +940,8 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
               outcome: { status: "failed", error: { message: String(error) } },
             };
           }, context);
+        } finally {
+          if (!paused) await publishState();
         }
       },
     },
@@ -903,18 +981,177 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
     },
     ctx,
   );
-  let paused = false;
   const pause = () => {
+    if (paused) return;
     paused = true;
-    void harness.close(ctx);
+    closing = (async () => {
+      const root = await harness.root(ctx);
+      await root.commit(async (tx) => {
+        const doc = await tx.doc(Run);
+        if (doc.status === "running") {
+          doc.status = "paused";
+          doc.reason = "Paused by operator";
+        }
+      }, ctx);
+      await publishState();
+      await harness.close(ctx);
+    })();
   };
   try {
     const root = await harness.root(ctx);
+    let existing = await harness.snapshot(Run, ctx);
+    const autoRetire =
+      options.command !== "abort" &&
+      existing?.workflow &&
+      existing.index === existing.workflow.steps.length + 3 &&
+      existing.status !== "merged" &&
+      existing.workflow.steps.some(
+        (step) =>
+          step.kind === "merge" && existing?.outcomes[step.id] === "merged",
+      );
+    if (
+      options.command === "retire" ||
+      autoRetire ||
+      existing?.retirement?.status === "pending"
+    ) {
+      if (!existing?.runId) throw new Error("No existing run to retire");
+      if (existing.retirement?.status === "done") {
+        await publishState();
+        return existing;
+      }
+      if (
+        !existing.retirement &&
+        !autoRetire &&
+        !["blocked", "aborted", "parked", "merged", "completed"].includes(
+          existing.status,
+        )
+      )
+        throw new Error(
+          "Retire requires a stopped blocked, aborted, parked or completed run",
+        );
+      const allowed = await root.commit(async (tx) => {
+        const doc = await tx.doc(Run);
+        if ((doc.retirement || autoRetire) && !resumeState(doc)) return false;
+        doc.crashBlocked = false;
+        doc.retirement ??= { from: doc.status, status: "pending" };
+        doc.currentStep = "retire";
+        doc.status = "running";
+        doc.reason = "";
+        return true;
+      }, ctx);
+      await publishState();
+      if (!allowed) {
+        if (!observed) throw new Error("Missing retirement state");
+        return observed;
+      }
+      if (existing.task) {
+        await harness.abortTask(existing.task, ctx);
+        await harness.waitForTask(existing.task, ctx);
+      }
+      try {
+        await project.retire();
+        await root.commit(async (tx) => {
+          const doc = await tx.doc(Run);
+          if (!doc.retirement) throw new Error("Missing retirement intent");
+          doc.retirement.status = "done";
+          doc.status =
+            doc.retirement.from === "aborted"
+              ? "aborted"
+              : doc.retirement.from === "merged" ||
+                  Object.values(doc.outcomes).includes("merged")
+                ? "merged"
+                : "retired";
+          doc.currentStep = null;
+          doc.outcomes.retire = "pass";
+        }, ctx);
+      } catch (error) {
+        await root.commit(async (tx) => {
+          const doc = await tx.doc(Run);
+          doc.status = "blocked";
+          doc.reason = `Retirement failed: ${String(error)}. Retry orch retire ${project.ticket}`;
+        }, ctx);
+      }
+      await publishState();
+      if (!observed) throw new Error("Missing retirement state");
+      return observed;
+    }
+    if (
+      existing &&
+      ["merged", "completed", "parked", "aborted", "retired"].includes(
+        existing.status,
+      ) &&
+      (options.command !== "abort" || existing.status === "aborted")
+    ) {
+      await publishState();
+      return {
+        ...existing,
+        findings: (await harness.snapshot(Findings, ctx))?.items ?? [],
+      };
+    }
+    if (options.prepare) {
+      options = {
+        ...options,
+        ...(await options.prepare(
+          existing?.workflow ?? null,
+          Boolean(existing?.control) || options.command === "abort",
+        )),
+      };
+      tracker = options.tracker;
+      registrations = options.registrations ?? createRegistrations();
+      checkedWorkflow = JSON.stringify(options.workflow);
+    }
+    if (options.command === "abort" && existing?.status !== "aborted") {
+      if (!existing?.runId) throw new Error("No existing run to abort");
+      if (
+        ["merged", "completed", "retired"].includes(existing.status) ||
+        existing.workflow?.steps.some(
+          (step) =>
+            step.kind === "merge" && existing?.outcomes[step.id] === "merged",
+        )
+      )
+        throw new Error(
+          "Pause the run before aborting; completed runs cannot be aborted",
+        );
+      await root.commit(async (tx) => {
+        const doc = await tx.doc(Run);
+        doc.control = "abort";
+        if (doc.status === "parked") doc.status = "paused";
+      }, ctx);
+      existing = await harness.snapshot(Run, ctx);
+    }
+    if (
+      existing?.control === "abort" &&
+      existing.task &&
+      existing.status !== "aborted"
+    ) {
+      await harness.abortTask(existing.task, ctx);
+      await harness.waitForTask(existing.task, ctx);
+    }
+    if (
+      !existing ||
+      (!existing.control &&
+        !["merged", "completed", "parked", "aborted", "retired"].includes(
+          existing.status,
+        ))
+    )
+      await preflight(options);
     const id = await root.commit(async (tx) => {
       const doc = await tx.doc(Run);
-      if (["merged", "completed", "parked", "aborted"].includes(doc.status))
+      if (
+        ["merged", "completed", "parked", "aborted", "retired"].includes(
+          doc.status,
+        )
+      )
+        return null;
+      if (
+        !resumeState(
+          doc,
+          Boolean(doc.control) && doc.currentStep !== doc.control,
+        )
+      )
         return null;
       if (!doc.workflow) {
+        doc.startedAt = new Date().toISOString();
         doc.workflow = options.workflow;
         doc.runId = randomUUID();
       }
@@ -931,7 +1168,7 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
       );
       return doc.task;
     }, ctx);
-    observed = await harness.snapshot(Run, ctx);
+    await publishState();
     if (id) {
       options.signal?.addEventListener("abort", pause, { once: true });
       if (options.signal?.aborted) pause();
@@ -949,8 +1186,9 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
       }
     }
     if (paused) {
+      await closing;
       if (!observed) throw new Error("Paused before the run started");
-      return { ...observed, status: "paused" };
+      return observed;
     }
     const state = await harness.snapshot(Run, ctx);
     if (!state) throw new Error("Missing run state");
@@ -960,6 +1198,7 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
     };
   } finally {
     options.signal?.removeEventListener("abort", pause);
+    await closing;
     await harness.close(ctx);
   }
 }

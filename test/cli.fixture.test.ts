@@ -101,10 +101,12 @@ test.each([
       `
       import { defineRunner } from ${JSON.stringify(registrationsUrl)};
       export default defineRunner({ name: 'custom', resumable: false, tools: ['read'],
-        create: (config) => ({ resumable: false, run: async (request) => ({
+        create: (config) => ({ resumable: false, run: async (request) => {
+          request.onEvent({type: 'text', data: 'intermediate transcript'});
+          return ({
           status: 'done', handoff: config.message, result: {outcome: 'pass', summary: request.role},
           artifacts: [], ranOn: {provider:'fixture', model:'fixture', effort:'medium'}, usage:null
-        }) })
+        }); } })
       });
     `,
     );
@@ -238,6 +240,39 @@ patch:
       output.join("\n"),
     ).toBe(0);
     expect(output.at(-1)).toBe("merged");
+    expect(output).not.toContain("intermediate transcript");
+    const statusOutput: string[] = [];
+    await runCli(["show", "139"], {
+      cwd: main,
+      execute,
+      output: (s) => statusOutput.push(s),
+    });
+    expect(JSON.parse(statusOutput[0])).toMatchObject({
+      version: 1,
+      status: "merged",
+      currentStep: null,
+      outcomes: { merge: "merged", retire: "pass" },
+      resumptions: 0,
+    });
+    const events = (
+      await readFile(
+        join(root, ".agents/orchestration/runs/139.events.jsonl"),
+        "utf8",
+      )
+    )
+      .trim()
+      .split("\n")
+      .map((s) => JSON.parse(s));
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        version: 1,
+        type: "text",
+        data: "intermediate transcript",
+      }),
+    );
+    expect(
+      events.every((e) => e.runId && e.timestamp && e.ticket === "139"),
+    ).toBe(true);
     expect(output).toContain("custom runner handoff");
     expect(await git(["show", "139:custom.txt"])).toBe("registered");
     expect(merges).toHaveLength(1);
