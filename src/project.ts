@@ -18,19 +18,19 @@ export async function discoverProject(
     argv: [
       "bash",
       "-c",
-      'source "$1"; orch_resolve || exit; printf "%s\\0%s\\0%s\\0%s\\0" "$ORCH_ROOT" "$MAIN_CHECKOUT" "$WORKTREE_ROOT" "$(orch_get "$ORCH_ROOT" BASE_BRANCH)"',
+      'source "$1"; orch_resolve || exit; printf "%s\\0%s\\0%s\\0%s\\0%s\\0" "$ORCH_ROOT" "$MAIN_CHECKOUT" "$WORKTREE_ROOT" "$(orch_get "$ORCH_ROOT" BASE_BRANCH)" "$ORCH_STATE"',
       "orch",
       library,
     ],
   });
-  const [root, main, worktrees, base] = resolved.split("\0");
+  const [root, main, worktrees, base, state] = resolved.split("\0");
   if (!base) throw new Error("Missing BASE_BRANCH in .orch");
   const git = (args: string[], dir = main) =>
     checked(execute, { cwd: dir, argv: ["git", ...args] });
   const origin = await git(["config", "--get", "remote.origin.url"]);
   const repository = repositoryFromOrigin(origin);
   const worktree = resolve(worktrees, ticket),
-    runs = join(root, ".agents/orchestration/runs");
+    runs = join(state || join(root, ".agents/orchestration"), "runs");
   return {
     root,
     ...repository,
