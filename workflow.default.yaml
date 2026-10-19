@@ -1,0 +1,105 @@
+version: 1
+settings:
+  tests: pnpm test
+  verification: local-tests
+  merge-approval: false
+runners:
+  pi:
+    models:
+      light: { provider: openai, model: gpt-6-luna }
+      standard: { provider: openai, model: gpt-6.1-sol }
+      heavy: { provider: openai, model: gpt-6-astra }
+      frontier: { provider: openai, model: gpt-6-astra }
+  shell:
+    command: codex exec --model "$ORCH_MODEL" -c model_reasoning_effort="$ORCH_MODEL_EFFORT" --sandbox workspace-write --output-schema <(printf '%s' "$ORCH_RESULT_SCHEMA") --output-last-message "$ORCH_RESULT_FILE" -
+    models:
+      light: gpt-6-luna
+      standard: gpt-6.1-sol
+      heavy: gpt-6-astra
+      frontier: gpt-6-astra
+budgets:
+  bounces: { max: 3 }
+  ci_repairs: { max: 2 }
+repairs:
+  fix:
+    - id: fix-findings
+      kind: agent
+      runner: shell
+      options: { role: implementor }
+      model: { tier: heavy, effort: high }
+      tools: [read, edit, shell]
+    - id: check-fix
+      kind: shell
+      options: { command: $settings.tests }
+      when: lane == standard
+  ci-fix:
+    - id: fix-ci
+      kind: agent
+      runner: shell
+      options: { role: implementor }
+      model: { tier: heavy, effort: high }
+      tools: [read, edit, shell]
+    - id: check-ci-fix
+      kind: shell
+      options: { command: $settings.tests }
+      when: lane == standard
+    - { id: publish-ci-fix, kind: mr }
+steps:
+  - id: spec
+    kind: agent
+    runner: pi
+    options: { role: spec-writer }
+    model: { tier: standard, effort: high }
+    tools: [read, shell]
+  - id: tests
+    kind: agent
+    runner: pi
+    options: { role: test-writer }
+    model: { tier: standard, effort: high }
+    tools: [read, edit, shell]
+    when: lane == standard
+    gate: tests-red
+  - id: implement
+    kind: agent
+    runner: shell
+    options: { role: implementor }
+    model: { tier: standard, effort: high }
+    tools: [read, edit, shell]
+    when: lane == standard
+    gate: tests-green
+  - id: implement-without-tests
+    kind: agent
+    runner: shell
+    options: { role: implementor }
+    model: { tier: standard, effort: high }
+    tools: [read, edit, shell]
+    when: lane != standard
+  - id: review
+    kind: agent
+    runner: pi
+    options: { role: reviewer }
+    model: { tier: heavy, effort: high }
+    tools: [read, shell]
+    on: { findings: { repair: fix, budget: bounces } }
+    when: lane != trivial
+  - id: verify
+    kind: agent
+    runner: shell
+    options: { role: verifier, verification: $settings.verification }
+    model: { tier: standard, effort: high }
+    tools: [read, shell, web]
+    on: { findings: { repair: fix, budget: bounces } }
+    when: [lane == standard, settings.verification != local-tests]
+  - id: report
+    kind: agent
+    runner: pi
+    options: { role: reporter }
+    model: { tier: light, effort: low }
+    tools: [read]
+  - { id: mr, kind: mr }
+  - { id: ci, kind: ci, on: { failed: { repair: ci-fix, budget: ci_repairs } } }
+  - id: human
+    kind: human
+    options: { ask: "Merge the CI-passed commit?", choices: [approve, stop] }
+    when: settings.merge-approval == true
+  - { id: merge, kind: merge, gate: ci-green-on-head }

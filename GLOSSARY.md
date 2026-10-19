@@ -52,8 +52,21 @@ _Avoid_: stage agent, subagent step
 The checks a run performs before its first step: the effective workflow loads, every named setting, tool, runner and role is present, and the project is set up. Any miss stops the run with a reason.
 _Avoid_: validation pass, sanity check
 
+**Workspace**:
+The working checkout associated with a run, which may be created for the run or explicitly adopted.
+_Avoid_: session
+
+**Workspace binding**:
+The association between a platform's work context and the workspace where a run's work takes place.
+
+**Adoption**:
+Explicitly associating an existing workspace with a run without granting permission to delete it.
+
+**Provisioning**:
+Preparing a workspace's dependencies and local services so the project is ready for work, separately from creating its checkout.
+
 **Pickup**:
-Making and provisioning a ticket's worktree before its first step. Engine work, not a step.
+Establishing a ticket's workspace and its readiness before the first step, through creation or explicit adoption, required platform binding, and provisioning. Engine work, not a step.
 _Avoid_: setup, checkout
 
 **Retirement**:
@@ -128,8 +141,23 @@ _Avoid_: task, job
 One ticket's walk through its workflow, from first start to merge or abort, surviving pauses and crashes.
 _Avoid_: session, job, execution
 
+**Execution owner**:
+The single engine execution permitted to advance a run, distinct from the interfaces observing or controlling it.
+
+**Control request**:
+An identified instruction to operate a run whose acceptance is distinct from its completion. Retrying the same request does not repeat its effects.
+
+**Control receipt**:
+The durable record that a particular control request was accepted and of its subsequent outcome. Acceptance does not imply completion.
+
+**Human request**:
+An identified question belonging to a run that awaits an explicit human answer about a specific action or revision.
+
+**Recovery needed**:
+A run condition in which safe continuation cannot yet be established because ownership, surviving workers, or interrupted effects remain uncertain.
+
 **Pause**:
-Stopping an engine cleanly so its run can be resumed later from the same step.
+Stopping the engine and its owned workers cleanly and saving recovery state so the same run can be resumed.
 _Avoid_: stop, suspend, interrupt
 
 **Abort**:

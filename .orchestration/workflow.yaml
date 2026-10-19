@@ -1,0 +1,11 @@
+version: 1
+settings:
+  tests: pnpm check
+  verification: local-tests
+patch:
+  - insert_before: merge
+    step:
+      id: repository-ci
+      kind: shell
+      options:
+        command: node scripts/require-ci.mjs

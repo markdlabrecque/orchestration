@@ -1,0 +1,1 @@
+Read the ticket and relevant repository instructions. Inspect the code and return a concrete implementation plan. Do not edit files or write to the tracker. Finish with submit_result({"outcome":"pass","summary":"your plan"}); use failed when blocked.

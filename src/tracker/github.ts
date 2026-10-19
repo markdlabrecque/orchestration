@@ -1,0 +1,206 @@
+import { checked, type Exec, exec } from "../command.ts";
+import { remoteIdentity } from "./identity.ts";
+import type { Identity, Tracker } from "./types.ts";
+
+type Remote = {
+  id: number;
+  number: number;
+  html_url: string;
+  body: string;
+  title: string;
+  labels?: { name: string }[];
+  head: { sha: string };
+  merged: boolean;
+  state?: string;
+  mergeable?: boolean | null;
+};
+const identity = (r: Remote): Identity =>
+  remoteIdentity(r?.number ?? r?.id, r?.html_url);
+export function createGitHubTracker(
+  repo: string,
+  cwd: string,
+  execute: Exec = exec,
+  host = "github.com",
+): Tracker {
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo))
+    throw new Error("Invalid GitHub repository");
+  const hostArgs = host === "github.com" ? [] : ["--hostname", host];
+  const cliRepo = host === "github.com" ? repo : `${host}/${repo}`;
+  const api = async (path: string, method?: string, data?: unknown) =>
+    JSON.parse(
+      await checked(execute, {
+        cwd,
+        argv: [
+          "gh",
+          "api",
+          `repos/${repo}/${path}`,
+          ...hostArgs,
+          ...(method ? ["--method", method, "--input", "-"] : []),
+        ],
+        ...(method ? { input: JSON.stringify(data) } : {}),
+      }),
+    );
+  const pages = async (path: string): Promise<Remote[]> => {
+    const value = JSON.parse(
+      await checked(execute, {
+        cwd,
+        argv: [
+          "gh",
+          "api",
+          `repos/${repo}/${path}`,
+          "--paginate",
+          "--slurp",
+          ...hostArgs,
+        ],
+      }),
+    );
+    if (!Array.isArray(value) || value.some((p) => !Array.isArray(p)))
+      throw new Error("Ambiguous GitHub listing");
+    const rows = value.flat();
+    if (
+      rows.some(
+        (r) =>
+          !r ||
+          typeof r !== "object" ||
+          (r.body !== null && typeof r.body !== "string") ||
+          typeof r.html_url !== "string" ||
+          !r.html_url ||
+          !Number.isSafeInteger(r.number ?? r.id) ||
+          (r.number ?? r.id) <= 0,
+      )
+    )
+      throw new Error("Ambiguous GitHub listing entry");
+    return rows;
+  };
+  const reconcile = async (
+    path: string,
+    marker: string,
+    create: () => Promise<Remote>,
+  ) => {
+    const matches = (await pages(path)).filter(
+      (r) => typeof r.body === "string" && r.body.includes(marker),
+    );
+    if (matches.length > 1)
+      throw new Error("Ambiguous GitHub operation marker");
+    const result = identity(matches[0] ?? (await create()));
+    if (!result.url || result.id === "undefined")
+      throw new Error("GitHub write returned no identity");
+    return result;
+  };
+  const readPullRequest: Tracker["readPullRequest"] = async (id) => {
+    const r: Remote = await api(`pulls/${id}`);
+    return { ...identity(r), head: r.head.sha, merged: r.merged };
+  };
+  return {
+    async readTicket(id) {
+      const r: Remote = await api(`issues/${id}`);
+      return {
+        ...identity(r),
+        title: r.title,
+        body: r.body ?? "",
+        labels: (r.labels ?? []).map((l) => l.name),
+      };
+    },
+    async assign(id) {
+      const user = JSON.parse(
+        await checked(execute, {
+          cwd,
+          argv: ["gh", "api", "user", ...hostArgs],
+        }),
+      );
+      await api(`issues/${id}/assignees`, "POST", { assignees: [user.login] });
+    },
+    comment: (id, body, marker) =>
+      reconcile(`issues/${id}/comments?per_page=100`, marker, () =>
+        api(`issues/${id}/comments`, "POST", { body: `${body}\n\n${marker}` }),
+      ),
+    followUp: (title, body, marker) =>
+      reconcile("issues?state=all&per_page=100", marker, () =>
+        api("issues", "POST", { title, body: `${body}\n\n${marker}` }),
+      ),
+    pullRequest: async (title, body, head, base, marker, options) => {
+      const pr = await reconcile("pulls?state=all&per_page=100", marker, () =>
+        api("pulls", "POST", {
+          title,
+          body: `${body}\n\n${marker}`,
+          head,
+          base,
+          ...(options?.draft ? { draft: true } : {}),
+        }),
+      );
+      if (options?.draft) {
+        const current = await api(`pulls/${pr.id}`);
+        if (current.merged || current.state === "closed")
+          throw new Error("Cannot park a closed PR");
+        if (!current.draft)
+          await checked(execute, {
+            cwd,
+            argv: ["gh", "pr", "ready", pr.id, "--undo", "--repo", cliRepo],
+          });
+        await api(`pulls/${pr.id}`, "PATCH", {
+          title,
+          body: `${body}\n\n${marker}`,
+        });
+      }
+      return pr;
+    },
+    readPullRequest,
+    async ci(id, sha) {
+      if ((await readPullRequest(id)).head !== sha)
+        throw new Error("PR head changed before CI");
+      const result = await execute({
+        cwd,
+        argv: [
+          "gh",
+          "pr",
+          "checks",
+          id,
+          "--repo",
+          cliRepo,
+          "--required",
+          "--json",
+          "name,bucket",
+        ],
+      });
+      if (![0, 1, 8].includes(result.code) || result.status !== "done")
+        throw new Error(`Cannot read required CI: ${result.stderr}`);
+      let checks: { name: string; bucket: string }[];
+      try {
+        checks = JSON.parse(result.stdout);
+      } catch {
+        throw new Error(`Cannot establish required CI: ${result.stderr}`);
+      }
+      if (!Array.isArray(checks) || checks.length === 0)
+        throw new Error("No required CI checks reported");
+      if ((await readPullRequest(id)).head !== sha)
+        throw new Error("PR head changed during CI");
+      if (checks.every((c) => c.bucket === "pass")) return "passed";
+      if (checks.some((c) => ["fail", "cancel"].includes(c.bucket)))
+        return "failed";
+      return "pending";
+    },
+    async abort(id, marker) {
+      await reconcile(`issues/${id}/comments?per_page=100`, marker, () =>
+        api(`issues/${id}/comments`, "POST", {
+          body: `Orchestration run aborted.\n\n${marker}`,
+        }),
+      );
+    },
+    async merge(id, sha) {
+      const pr: Remote = await api(`pulls/${id}`);
+      identity(pr);
+      if (pr.head.sha !== sha)
+        throw new Error("PR head differs from CI-passed SHA");
+      if (pr.merged === true) return "merged";
+      if (pr.merged === false && pr.state === "open" && pr.mergeable === false)
+        return "conflict";
+      const result = await api(`pulls/${id}/merge`, "PUT", {
+        merge_method: "squash",
+        sha,
+      });
+      if (result.merged !== true)
+        throw new Error("GitHub did not confirm merge");
+      return "merged";
+    },
+  };
+}
