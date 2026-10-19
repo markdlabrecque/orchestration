@@ -17,6 +17,13 @@ export type AgentResult = {
   summary: string;
   lane?: "standard" | "trivial" | "no-code";
   implementationTier?: "light" | "standard" | "heavy" | "frontier";
+  followUps?: { summary: string; evidence: string }[];
+  responses?: { id: string; action: "changed" | "disagreed"; reason: string }[];
+  decisions?: {
+    id: string;
+    status: "fixed" | "open" | "withdrawn";
+    reason: string;
+  }[];
   expectedFailures?: { test: string; message: string }[];
   findings?: {
     summary: string;
@@ -24,8 +31,25 @@ export type AgentResult = {
     classification: "must-fix" | "follow-up";
   }[];
 };
-export function roleResultSchema(role: string) {
-  const fields = { ...resultSchema.properties };
+export function roleResultSchema(
+  role: string,
+  mode: "normal" | "repair" | "recheck" = "normal",
+) {
+  const common = {
+    ...resultSchema.properties,
+    followUps: Type.Optional(
+      Type.Array(
+        Type.Object(
+          {
+            summary: Type.String({ minLength: 1 }),
+            evidence: Type.String({ minLength: 1 }),
+          },
+          { additionalProperties: false },
+        ),
+      ),
+    ),
+  };
+  const fields = { ...common };
   if (role === "spec-writer")
     Object.assign(fields, {
       lane: Type.Union(
@@ -59,6 +83,41 @@ export function roleResultSchema(role: string) {
               Type.Literal("must-fix"),
               Type.Literal("follow-up"),
             ]),
+          },
+          { additionalProperties: false },
+        ),
+      ),
+    });
+  if (mode === "repair")
+    return Type.Object(
+      {
+        ...common,
+        responses: Type.Array(
+          Type.Object(
+            {
+              id: Type.String({ minLength: 1 }),
+              action: Type.Union([
+                Type.Literal("changed"),
+                Type.Literal("disagreed"),
+              ]),
+              reason: Type.String({ minLength: 1 }),
+            },
+            { additionalProperties: false },
+          ),
+        ),
+      },
+      { additionalProperties: false },
+    );
+  if (mode === "recheck" && ["reviewer", "verifier"].includes(role))
+    Object.assign(fields, {
+      decisions: Type.Array(
+        Type.Object(
+          {
+            id: Type.String({ minLength: 1 }),
+            status: Type.Union(
+              ["fixed", "open", "withdrawn"].map((v) => Type.Literal(v)),
+            ),
+            reason: Type.String({ minLength: 1 }),
           },
           { additionalProperties: false },
         ),

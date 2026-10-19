@@ -46,6 +46,7 @@ async function fixture() {
       trace.push("comment");
       return { id: "1", url: "comment" };
     },
+    abort: async () => {},
     followUp: async () => ({ id: "2", url: "followup" }),
     pullRequest: async () => {
       trace.push("pr");
@@ -193,7 +194,7 @@ test("an interrupted tracker write is retried with the same durable marker", asy
     const file = join(dir, "run.sqlite");
     expect(
       await runWorkflow({ ...f, storage: await openNodeSqliteStorage(file) }),
-    ).toMatchObject({ status: "blocked" });
+    ).toMatchObject({ status: "paused" });
     expect(
       await runWorkflow({ ...f, storage: await openNodeSqliteStorage(file) }),
     ).toMatchObject({ status: "merged" });

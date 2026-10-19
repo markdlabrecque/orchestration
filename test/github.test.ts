@@ -132,3 +132,57 @@ test("ticket reads retain lane labels for engine selection", async () => {
     labels: ["lane:trivial", "other"],
   });
 });
+
+test("malformed pages cannot establish absence and authorize another create", async () => {
+  let writes = 0;
+  const tracker = createGitHubTracker("a/b", "/tmp", async (request) => {
+    if (request.argv.includes("POST")) writes++;
+    return {
+      status: "done",
+      code: 0,
+      stderr: "",
+      stdout: JSON.stringify([[{}]]),
+    };
+  });
+  await expect(
+    tracker.followUp("title", "body", "<!-- orch:stable -->"),
+  ).rejects.toThrow(/Ambiguous/);
+  expect(writes).toBe(0);
+});
+
+test("parking reconciles an existing PR and converts it to a draft with the open findings", async () => {
+  const requests: CommandRequest[] = [];
+  const tracker = createGitHubTracker("a/b", "/tmp", async (r) => {
+    requests.push(r);
+    let data: unknown = {};
+    if (r.argv.includes("--paginate"))
+      data = [[{ number: 3, html_url: "pr", body: "<!-- orch:run:pr -->" }]];
+    else if (r.argv[1] === "api" && !r.argv.includes("PATCH"))
+      data = {
+        number: 3,
+        html_url: "pr",
+        draft: false,
+        merged: false,
+        state: "open",
+      };
+    return {
+      status: "done",
+      code: 0,
+      stderr: "",
+      stdout: JSON.stringify(data),
+    };
+  });
+  expect(
+    await tracker.pullRequest(
+      "title",
+      "F1: open",
+      "142",
+      "main",
+      "<!-- orch:run:pr -->",
+      { draft: true },
+    ),
+  ).toEqual({ id: "3", url: "pr" });
+  expect(requests.some((r) => r.argv.includes("POST"))).toBe(false);
+  expect(requests.some((r) => r.argv.includes("--undo"))).toBe(true);
+  expect(JSON.parse(requests.at(-1)?.input ?? "{}").body).toContain("F1: open");
+});

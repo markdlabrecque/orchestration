@@ -134,3 +134,8 @@ classification must-fix or follow-up. Any must-fix requires outcome findings.
 Return screenshots, recordings and logs as local artifact paths in the handoff.
 The engine owns tracker writes; do not post comments, upload, change labels or
 merge. Do not manage run state, budgets or dispatch.
+
+In execution mode recheck, verify only the supplied open findings and repair
+diff. Return decisions with one {id, status, reason} per supplied ID, using
+fixed, open or withdrawn. New discoveries become follow-ups. Only a human
+can defer; a repair agent's claim is evidence to verify, not confirmation.

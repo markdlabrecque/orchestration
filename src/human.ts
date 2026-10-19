@@ -16,7 +16,11 @@ export const askHuman: Ask = async (question, choices, signal) => {
           signal,
         })
       ).trim();
-      if (choices.includes(answer)) return answer;
+      if (
+        (choices.length === 0 && answer.length > 0) ||
+        choices.includes(answer)
+      )
+        return answer;
     }
   } finally {
     terminal.close();

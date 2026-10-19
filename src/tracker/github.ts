@@ -44,7 +44,21 @@ export function createGitHubTracker(
     );
     if (!Array.isArray(value) || value.some((p) => !Array.isArray(p)))
       throw new Error("Ambiguous GitHub listing");
-    return value.flat();
+    const rows = value.flat();
+    if (
+      rows.some(
+        (r) =>
+          !r ||
+          typeof r !== "object" ||
+          (r.body !== null && typeof r.body !== "string") ||
+          typeof r.html_url !== "string" ||
+          !r.html_url ||
+          !Number.isSafeInteger(r.number ?? r.id) ||
+          (r.number ?? r.id) <= 0,
+      )
+    )
+      throw new Error("Ambiguous GitHub listing entry");
+    return rows;
   };
   const reconcile = async (
     path: string,
@@ -89,15 +103,32 @@ export function createGitHubTracker(
       reconcile("issues?state=all&per_page=100", marker, () =>
         api("issues", "POST", { title, body: `${body}\n\n${marker}` }),
       ),
-    pullRequest: (title, body, head, base, marker) =>
-      reconcile("pulls?state=all&per_page=100", marker, () =>
+    pullRequest: async (title, body, head, base, marker, options) => {
+      const pr = await reconcile("pulls?state=all&per_page=100", marker, () =>
         api("pulls", "POST", {
           title,
           body: `${body}\n\n${marker}`,
           head,
           base,
+          ...(options?.draft ? { draft: true } : {}),
         }),
-      ),
+      );
+      if (options?.draft) {
+        const current = await api(`pulls/${pr.id}`);
+        if (current.merged || current.state === "closed")
+          throw new Error("Cannot park a closed PR");
+        if (!current.draft)
+          await checked(execute, {
+            cwd,
+            argv: ["gh", "pr", "ready", pr.id, "--undo", "--repo", repo],
+          });
+        await api(`pulls/${pr.id}`, "PATCH", {
+          title,
+          body: `${body}\n\n${marker}`,
+        });
+      }
+      return pr;
+    },
     readPullRequest,
     async ci(id, sha) {
       if ((await readPullRequest(id)).head !== sha)
@@ -132,6 +163,13 @@ export function createGitHubTracker(
       if (checks.some((c) => ["fail", "cancel"].includes(c.bucket)))
         return "failed";
       return "pending";
+    },
+    async abort(id, marker) {
+      await reconcile(`issues/${id}/comments?per_page=100`, marker, () =>
+        api(`issues/${id}/comments`, "POST", {
+          body: `Orchestration run aborted.\n\n${marker}`,
+        }),
+      );
     },
     async merge(id, sha) {
       const pr = await readPullRequest(id);

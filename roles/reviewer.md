@@ -18,3 +18,9 @@ classification of must-fix or follow-up. Use outcome findings whenever any
 must-fix remains; use pass only when none remain. A review count never downgrades
 a must-fix. On a recheck, review the supplied open findings and changed code.
 The engine owns findings identities, repairs, budgets and tracker writes.
+
+In execution mode recheck, return decisions with exactly one {id, status,
+reason} for each supplied open finding. status is fixed, open or withdrawn.
+Inspect the repair diff and responses; withdraw only a mistaken finding.
+Place new discoveries in findings or followUps. The engine files them as
+follow-ups rather than expanding this repair. Only a human can defer.

@@ -23,3 +23,11 @@ trivial/no-code work follows the scoped acceptance criteria without inventing
 tests. Return outcome pass or failed and a summary of changes and test evidence.
 Never select a lane or tier, weaken a gate, launch agents, write to the tracker,
 or mutate workflow state. Code owns commits, PR/MR creation, CI and merge.
+
+When the engine supplies execution mode repair, return responses with exactly
+one {id, action, reason} per supplied open finding. action is changed or
+disagreed. Describe the change or explain the disagreement; the detecting
+reviewer decides whether the finding is resolved. For a CI repair with no
+finding IDs, return an empty responses array and explain the CI fix in summary.
+Report unrelated discoveries in optional followUps entries with summary and
+evidence. The engine files them.

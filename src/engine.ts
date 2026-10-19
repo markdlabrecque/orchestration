@@ -11,11 +11,20 @@ import {
   type TaskId,
 } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
-import { type Exec, exec } from "./command.ts";
+import { checked, type Exec, exec } from "./command.ts";
+import {
+  ContractError,
+  FilingError,
+  type Finding,
+  Findings,
+  openFindings,
+  recordResult,
+} from "./findings.ts";
 import { testGate } from "./gates.ts";
 import { type Ask, askHuman } from "./human.ts";
 import { preflight } from "./preflight.ts";
 import { createRegistrations, type Registrations } from "./registration.ts";
+import { worktreeTree } from "./repair-diff.ts";
 import { piModel } from "./runners/model.ts";
 import { createPiRunner, PiResults, piResultExtension } from "./runners/pi.ts";
 import { createShellRunner } from "./runners/shell.ts";
@@ -23,6 +32,7 @@ import {
   type AgentResult,
   type Runner,
   type RunnerEvent,
+  type RunnerResult,
   roleResultSchema,
   validateResult,
 } from "./runners/types.ts";
@@ -42,8 +52,34 @@ export type Project = {
   publish(title: string): Promise<string>;
   retire(): Promise<void>;
 };
+type Repair = {
+  name: string;
+  budget: string;
+  phase: "ready" | "body" | "recheck";
+  cursor: number;
+  attempt: number;
+  outcome: string;
+  publishedTree: string;
+  baseline: string;
+  diff: string;
+};
 export type RunState = {
-  status: "running" | "paused" | "blocked" | "merged" | "completed";
+  findings?: Finding[];
+  control: "park" | "abort" | null;
+  cached: Pick<
+    RunnerResult,
+    "status" | "result" | "handoff" | "session"
+  > | null;
+  budgets: Record<string, { spent: number; grants: number }>;
+  repair: Repair | null;
+  status:
+    | "running"
+    | "paused"
+    | "blocked"
+    | "merged"
+    | "completed"
+    | "parked"
+    | "aborted";
   reason: string;
   index: number;
   handoffs: Record<string, string>;
@@ -67,6 +103,10 @@ const Run = defineDoc<RunState>({
   scope: "session",
   initial: () => ({
     status: "running",
+    control: null,
+    cached: null,
+    budgets: {},
+    repair: null,
     reason: "",
     index: 0,
     handoffs: {},
@@ -125,7 +165,10 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
       execute: async (task, runtime, context) => {
         const state = await runtime.snapshot(Run, context);
         if (!state?.workflow) throw new Error("Missing durable workflow");
-        observed = state;
+        const ledger = (await runtime.snapshot(Findings, context)) ?? {
+          items: [],
+        };
+        observed = { ...state, findings: ledger.items };
         const workflow = state.workflow;
         const stages = [
           "ticket",
@@ -134,13 +177,28 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
           ...workflow.steps.map((s) => s.id),
           ...(workflow.steps.some((s) => s.kind === "merge") ? ["retire"] : []),
         ];
-        const name = stages[state.index];
+        const detector = workflow.steps[state.index - 3];
+        const repairBody = state.repair
+          ? [workflow.repairs[state.repair.name]].flat()
+          : [];
+        const step =
+          state.repair?.phase === "body"
+            ? repairBody[state.repair.cursor]
+            : detector;
+        const name = step?.id ?? stages[state.index];
+        const checkpoint = (current: typeof task) => ({
+          status: "running" as const,
+          checkpoint: {
+            phase: "execute" as const,
+            revision: current.state.checkpoint.revision + 1,
+          },
+        });
         notify({ step: name, status: "running" });
         const advance = async (
           change: Partial<RunState> = {},
           outcome?: string,
         ) => {
-          const gated = workflow.steps[state.index - 3];
+          const gated = step;
           if (outcome !== "skipped" && gated?.gate?.startsWith("tests-"))
             await testGate(
               gated.gate,
@@ -162,11 +220,50 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
                 "ci-green-on-head: no CI evidence for current PR head",
               );
           }
+          let diff = state.repair?.diff ?? "";
+          let publishedTree = state.repair?.publishedTree ?? "";
+          if (
+            state.repair?.phase === "body" &&
+            (state.repair.cursor === repairBody.length - 1 ||
+              step.kind === "mr")
+          ) {
+            const after = await worktreeTree(
+              project.worktree,
+              options.execute ?? exec,
+              runtime.signal,
+            );
+            if (step.kind === "mr" && outcome !== "skipped")
+              publishedTree = after;
+            if (
+              state.repair.cursor === repairBody.length - 1 &&
+              detector.kind === "ci" &&
+              (!publishedTree || publishedTree !== after)
+            )
+              throw new ContractError(
+                "CI repair must publish its final worktree before rechecking CI",
+              );
+            diff = await checked(options.execute ?? exec, {
+              cwd: project.worktree,
+              argv: ["git", "diff", state.repair.baseline, after],
+              signal: runtime.signal,
+            });
+          }
           return runtime.commit(async (tx, current) => {
             const doc = await tx.doc(Run);
             Object.assign(doc, change);
-            doc.index++;
-            const kind = workflow.steps[state.index - 3]?.kind;
+            doc.cached = null;
+            if (doc.repair?.phase === "body") {
+              doc.repair.publishedTree = publishedTree;
+              doc.repair.cursor++;
+              if (doc.repair.cursor === repairBody.length) {
+                doc.repair.phase = "recheck";
+                doc.repair.diff = diff;
+              }
+            } else {
+              doc.index++;
+              doc.repair = null;
+            }
+            const kind = step?.kind;
             doc.outcomes[name] =
               outcome ??
               (kind === "merge" ? "merged" : kind === "ci" ? "passed" : "pass");
@@ -192,6 +289,88 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
         };
         let failureOutcome = "failed";
         try {
+          for (const finding of ledger.items.filter(
+            (f) => f.filing === "pending",
+          )) {
+            try {
+              const link = await tracker.followUp(
+                finding.summary,
+                `${finding.evidence}\n\nSource: ${state.ticket?.url}\nFinding: ${finding.id}\n${finding.deferralReason ?? ""}`,
+                finding.marker ?? "",
+              );
+              if (!link.id || !link.url)
+                throw new Error("Follow-up returned no identity");
+              await runtime.commit(async (tx) => {
+                const item = (await tx.doc(Findings)).items.find(
+                  (f) => f.id === finding.id,
+                );
+                if (!item) throw new Error("Missing finding");
+                item.filing = "linked";
+                item.link = link;
+                if (item.deferralReason) item.status = "deferred";
+                return undefined;
+              }, context);
+              Object.assign(finding, {
+                filing: "linked",
+                link,
+                ...(finding.deferralReason ? { status: "deferred" } : {}),
+              });
+            } catch (error) {
+              throw new FilingError(String(error));
+            }
+          }
+          if (state.control === "park") {
+            try {
+              const head = await project.publish(
+                `#${project.ticket}: ${state.ticket?.title}`,
+              );
+              const pr = await tracker.pullRequest(
+                `#${project.ticket}: ${state.ticket?.title}`,
+                `Parked orchestration run.\n\nOpen findings:\n${openFindings(
+                  ledger.items,
+                )
+                  .map((f) => `- ${f.id}: ${f.summary}\n  ${f.evidence}`)
+                  .join("\n")}`,
+                project.ticket,
+                project.base,
+                `<!-- orch:${state.runId}:pr -->`,
+                { draft: true },
+              );
+              await runtime.commit(async (tx) => {
+                Object.assign(await tx.doc(Run), {
+                  status: "parked",
+                  pr,
+                  head,
+                  ciHead: "",
+                });
+                return {
+                  status: "terminal",
+                  outcome: { status: "completed", result: null },
+                };
+              }, context);
+            } catch (error) {
+              throw new FilingError(String(error));
+            }
+            return;
+          }
+          if (state.control === "abort") {
+            try {
+              await tracker.abort(
+                project.ticket,
+                `<!-- orch:${state.runId}:abort -->`,
+              );
+            } catch (error) {
+              throw new FilingError(String(error));
+            }
+            await runtime.commit(async (tx) => {
+              (await tx.doc(Run)).status = "aborted";
+              return {
+                status: "terminal",
+                outcome: { status: "completed", result: null },
+              };
+            }, context);
+            return;
+          }
           const savedWorkflow = JSON.stringify(workflow);
           if (savedWorkflow !== checkedWorkflow) {
             await preflight({ ...options, workflow });
@@ -239,8 +418,125 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
             await advance();
             return;
           }
-          const step = workflow.steps[state.index - 3];
+
           if (!state.ticket) throw new Error("Missing ticket");
+          if (state.repair?.phase === "ready") {
+            const repair = state.repair;
+            if (
+              repair.outcome === "findings" &&
+              ledger.items.some(
+                (f) => f.detector === detector.id && f.status === "deferred",
+              ) &&
+              !openFindings(ledger.items, detector.id).length
+            ) {
+              await runtime.commit(async (tx, current) => {
+                const doc = await tx.doc(Run);
+                if (doc.repair) {
+                  doc.repair.phase = "recheck";
+                  doc.repair.attempt++;
+                }
+                return checkpoint(current);
+              }, context);
+              return;
+            }
+            const budget = state.budgets[repair.budget] ?? {
+              spent: 0,
+              grants: 0,
+            };
+            if (
+              budget.spent >=
+              workflow.budgets[repair.budget].max + budget.grants
+            ) {
+              const answer = await (options.ask ?? askHuman)(
+                `Repair budget ${repair.budget} exhausted. Open findings: ${JSON.stringify(openFindings(ledger.items))}`,
+                ["grant", "defer", "park", "abort"],
+                runtime.signal,
+              );
+              if (runtime.signal.aborted) return;
+              if (answer === "defer") {
+                const ids = (
+                  await (options.ask ?? askHuman)(
+                    "Finding IDs to defer, separated by commas",
+                    [],
+                    runtime.signal,
+                  )
+                )
+                  .split(",")
+                  .map((id) => id.trim());
+                const reason = (
+                  await (options.ask ?? askHuman)(
+                    "Reason for deferral",
+                    [],
+                    runtime.signal,
+                  )
+                ).trim();
+                if (runtime.signal.aborted) return;
+                const open = openFindings(ledger.items);
+                if (
+                  !reason ||
+                  !ids.length ||
+                  new Set(ids).size !== ids.length ||
+                  ids.some((id) => !open.some((f) => f.id === id))
+                )
+                  throw new ContractError(
+                    "Deferral requires open finding IDs and a nonempty reason",
+                  );
+                await runtime.commit(async (tx, current) => {
+                  for (const finding of (await tx.doc(Findings)).items.filter(
+                    (f) => ids.includes(f.id),
+                  )) {
+                    finding.deferralReason = reason;
+                    finding.filing = "pending";
+                    finding.marker = `<!-- orch:${state.runId}:finding:${finding.id} -->`;
+                  }
+                  return checkpoint(current);
+                }, context);
+                return;
+              }
+              if (answer === "abort" || answer === "park") {
+                await runtime.commit(async (tx, current) => {
+                  (await tx.doc(Run)).control = answer;
+                  return checkpoint(current);
+                }, context);
+                return;
+              }
+              if (answer !== "grant")
+                throw new ContractError(`Invalid cap choice: ${answer}`);
+              await runtime.commit(async (tx, current) => {
+                (await tx.doc(Run)).budgets[repair.budget] = {
+                  ...budget,
+                  grants: budget.grants + 1,
+                };
+                return checkpoint(current);
+              }, context);
+              notify({ budget: repair.budget, grant: budget.grants + 1 });
+              return;
+            }
+            const baseline =
+              repair.baseline ||
+              (await worktreeTree(
+                project.worktree,
+                options.execute ?? exec,
+                runtime.signal,
+              ));
+            await runtime.commit(async (tx, current) => {
+              const doc = await tx.doc(Run);
+              doc.budgets[repair.budget] = {
+                ...budget,
+                spent: budget.spent + 1,
+              };
+              doc.repair = {
+                ...repair,
+                phase: "body",
+                publishedTree: "",
+                baseline,
+                cursor: 0,
+                attempt: repair.attempt + 1,
+              };
+              return checkpoint(current);
+            }, context);
+            return;
+          }
           if (!matchesWhen(step.when, workflow.settings, state.lane)) {
             await advance({}, "skipped");
             return;
@@ -275,8 +571,11 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
             const injected = options.runner?.(name);
             if (injected) return injected;
             if (name === "pi")
-              return createPiRunner(harness, task.id, step.id, (tier) =>
-                piModel(workflow.runners.pi, tier),
+              return createPiRunner(
+                harness,
+                task.id,
+                `${step.id}:${state.index}:${state.repair?.attempt ?? 0}`,
+                (tier) => piModel(workflow.runners.pi, tier),
               );
             if (name === "shell")
               return createShellRunner(
@@ -308,6 +607,8 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
                 `${step.id}: undeclared outcome ${result.outcome}`,
               );
             if (result.outcome !== custom.outcomes[0])
+              failureOutcome = result.outcome;
+            if (result.outcome !== custom.outcomes[0])
               throw new Error(`${step.id}: ${result.outcome}`);
             await advance(
               result.handoff === undefined
@@ -321,60 +622,115 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
           }
           if (step.kind === "agent") {
             const role = step.role ?? String(step.options?.role);
-            const schema = roleResultSchema(role);
+            const mode =
+              state.repair?.phase === "body"
+                ? "repair"
+                : state.repair?.phase === "recheck" &&
+                    ["reviewer", "verifier"].includes(role)
+                  ? "recheck"
+                  : "normal";
+            const schema = roleResultSchema(role, mode);
             const runner = getRunner(step.runner ?? "");
-            const session = step.session
-              ? state.sessions?.[step.session]
-              : undefined;
-            if (step.session && (!session || !runner.resumable))
+            const session =
+              step.session && mode !== "repair"
+                ? state.sessions?.[step.session]
+                : undefined;
+            if (
+              step.session &&
+              mode !== "repair" &&
+              (!session || !runner.resumable)
+            )
               throw new Error(`${step.id}: missing session ${step.session}`);
-            const result = await runner.run({
-              ...(session ? { session } : {}),
-              prompt: `${state.ticket.title}\n${state.ticket.body}\n\nResolved options:\n${JSON.stringify(step.options ?? {})}\nLane: ${state.lane}\nPrevious results:\n${JSON.stringify(state.results)}\nPrevious handoffs:\n${JSON.stringify(state.handoffs)}`,
-              role: `${await options.role(role)}\n\nThe engine owns order, state and tracker writes. Return this JSON schema through submit_result on Pi or ORCH_RESULT_FILE on shell:\n${JSON.stringify(schema)}`,
-              cwd: project.worktree,
-              model: {
-                tier:
-                  role === "implementor"
-                    ? state.implementationTier
-                    : (step.model?.tier ?? "standard"),
-                effort: step.model?.effort ?? "medium",
-              },
-              tools:
-                step.tools ??
-                (step.runner === "shell"
-                  ? ["read", "edit", "shell"]
-                  : ["read"]),
-              timeoutMs: step.timeoutMs ?? 60 * 60 * 1000,
-              resultSchema: schema,
-              signal: runtime.signal,
-              onEvent: (event) => options.onEvent?.(event),
-            });
+            const result =
+              state.cached ??
+              (await runner.run({
+                ...(session ? { session } : {}),
+                prompt: `Execution mode: ${mode}. ${mode === "recheck" ? "Confirm only the supplied IDs and repair diff. New discoveries are follow-ups." : mode === "repair" ? "Respond to every supplied ID with changed or disagreed and a reason." : ""}\nOpen findings:\n${JSON.stringify(openFindings(ledger.items, mode === "normal" ? step.id : detector.id))}\nRepair diff:\n${state.repair?.diff ?? ""}\nRepair responses:\n${JSON.stringify(ledger.items.filter((f) => f.detector === detector.id).map((f) => ({ id: f.id, responses: f.responses })))}\n\n${state.ticket.title}\n${state.ticket.body}\n\nResolved options:\n${JSON.stringify(step.options ?? {})}\nLane: ${state.lane}\nPrevious results:\n${JSON.stringify(state.results)}\nPrevious handoffs:\n${JSON.stringify(state.handoffs)}`,
+                role: `${await options.role(role)}\n\nThe engine owns order, state and tracker writes. Return this JSON schema through submit_result on Pi or ORCH_RESULT_FILE on shell:\n${JSON.stringify(schema)}`,
+                cwd: project.worktree,
+                model: {
+                  tier:
+                    role === "implementor" && mode !== "repair"
+                      ? state.implementationTier
+                      : (step.model?.tier ?? "standard"),
+                  effort: step.model?.effort ?? "medium",
+                },
+                tools:
+                  step.tools ??
+                  (step.runner === "shell"
+                    ? ["read", "edit", "shell"]
+                    : ["read"]),
+                timeoutMs: step.timeoutMs ?? 60 * 60 * 1000,
+                resultSchema: schema,
+                signal: runtime.signal,
+                onEvent: (event) => options.onEvent?.(event),
+              }));
             if (runtime.signal.aborted) return;
-            if (result.status === "done") validateResult(schema, result.result);
+            if (result.status === "done") {
+              try {
+                validateResult(schema, result.result);
+              } catch (error) {
+                throw new ContractError(String(error));
+              }
+            }
             failureOutcome =
               result.result?.outcome === "findings" ? "findings" : "failed";
-            options.onEvent?.({
-              type: "status",
-              data: { step: step.id, runnerResult: result },
-            });
-            await runtime.commit(async (tx) => {
-              const doc = await tx.doc(Run);
-              if (result.result)
-                doc.results = { ...doc.results, [step.id]: result.result };
-              doc.handoffs[step.id] = result.handoff;
-              if (result.session)
-                doc.sessions = { ...doc.sessions, [step.id]: result.session };
-              return undefined;
-            }, context);
+            if (!state.cached) {
+              options.onEvent?.({
+                type: "status",
+                data: { step: step.id, runnerResult: result },
+              });
+              await runtime.commit(async (tx, current) => {
+                const doc = await tx.doc(Run);
+                if (result.status === "done" && result.result)
+                  recordResult(
+                    (await tx.doc(Findings)).items,
+                    result.result,
+                    detector.id,
+                    mode,
+                    state.runId,
+                    step.id,
+                  );
+                doc.cached = {
+                  status: result.status,
+                  handoff: result.handoff,
+                  ...(result.result ? { result: result.result } : {}),
+                  ...(result.session ? { session: result.session } : {}),
+                };
+                if (result.result)
+                  doc.results = { ...doc.results, [step.id]: result.result };
+                doc.handoffs[step.id] = result.handoff;
+                if (result.session)
+                  doc.sessions = { ...doc.sessions, [step.id]: result.session };
+                return checkpoint(current);
+              }, context);
+              return;
+            }
             if (
+              ["reviewer", "verifier"].includes(role) &&
+              mode !== "repair" &&
+              openFindings(ledger.items, step.id).length
+            ) {
+              failureOutcome = "findings";
+              throw new Error(`${step.id}: open must-fix findings`);
+            }
+            if (
+              mode !== "recheck" &&
               result.result?.outcome === "pass" &&
               result.result.findings?.some(
                 (f) => f.classification === "must-fix",
               )
             )
               throw new Error(`${step.id}: must-fix findings cannot pass`);
-            if (result.status !== "done" || result.result?.outcome !== "pass")
+            if (
+              result.status !== "done" ||
+              (result.result?.outcome !== "pass" &&
+                !(
+                  result.result?.outcome === "findings" &&
+                  ["reviewer", "verifier"].includes(role) &&
+                  mode !== "repair"
+                ))
+            )
               throw new Error(
                 `${step.id}: agent ${result.status}: ${result.result?.summary ?? "missing passing result"}`,
               );
@@ -386,7 +742,7 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
                 ...state.sessions,
                 ...(result.session ? { [step.id]: result.session } : {}),
               },
-              ...(role === "spec-writer"
+              ...(role === "spec-writer" && mode !== "repair"
                 ? {
                     lane: state.ticket.labels?.some((l) =>
                       l.startsWith("lane:"),
@@ -401,22 +757,30 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
           }
           if (step.kind === "mr") {
             // runId was committed before any effect. Every retry reconciles this same marker.
-            await tracker.comment(
-              project.ticket,
-              Object.values(state.handoffs).join("\n\n"),
-              `<!-- orch:${state.runId}:handoff -->`,
-            );
+            await tracker
+              .comment(
+                project.ticket,
+                Object.values(state.handoffs).join("\n\n"),
+                `<!-- orch:${state.runId}:handoff -->`,
+              )
+              .catch((error) => {
+                throw new FilingError(String(error));
+              });
             const head = await project.publish(
               `#${project.ticket}: ${state.ticket.title}`,
             );
-            const pr = await tracker.pullRequest(
-              `#${project.ticket}: ${state.ticket.title}`,
-              `Closes #${project.ticket}\n\n${Object.values(state.handoffs).join("\n\n")}`,
-              project.ticket,
-              project.base,
-              `<!-- orch:${state.runId}:pr -->`,
-            );
-            await advance({ head, pr, ciHead: "" });
+            const pr = await tracker
+              .pullRequest(
+                `#${project.ticket}: ${state.ticket.title}`,
+                `Closes #${project.ticket}\n\n${Object.values(state.handoffs).join("\n\n")}`,
+                project.ticket,
+                project.base,
+                `<!-- orch:${state.runId}:pr -->`,
+              )
+              .catch((error) => {
+                throw new FilingError(String(error));
+              });
+            await advance({ head, pr, ciHead: "", deadline: 0 });
             return;
           }
           if (step.kind !== "ci" && step.kind !== "merge")
@@ -442,9 +806,10 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
               else await runtime.sleep(runtime.now() + 60_000, context);
             }
             failureOutcome = "timeout";
-            failureOutcome = "timeout";
             throw new Error("Required CI timed out");
           }
+          if (openFindings(ledger.items).length)
+            throw new ContractError("Open must-fix findings block merge");
           if (!state.ciHead || state.ciHead !== state.head)
             throw new Error("No CI evidence for this head");
           const pr = await tracker.readPullRequest(state.pr.id);
@@ -457,9 +822,41 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
           await advance();
         } catch (error) {
           if (runtime.signal.aborted) return;
+          const edge =
+            error instanceof ContractError || error instanceof FilingError
+              ? undefined
+              : state.repair?.phase === "ready"
+                ? undefined
+                : state.repair?.phase === "body"
+                  ? { repair: state.repair.name, budget: state.repair.budget }
+                  : step?.on?.[failureOutcome];
+          if (edge) {
+            await runtime.commit(async (tx, current) => {
+              const doc = await tx.doc(Run);
+              doc.cached = null;
+              doc.repair = {
+                name: edge.repair,
+                budget: edge.budget,
+                phase: "ready",
+                publishedTree: "",
+                outcome:
+                  state.repair?.phase === "body"
+                    ? state.repair.outcome
+                    : failureOutcome,
+                cursor: 0,
+                attempt: doc.repair?.attempt ?? 0,
+                baseline:
+                  state.repair?.phase === "body" ? state.repair.baseline : "",
+                diff: state.repair?.diff ?? "",
+              };
+              doc.outcomes[name] = failureOutcome;
+              return checkpoint(current);
+            }, context);
+            return;
+          }
           await runtime.commit(async (tx) => {
             const doc = await tx.doc(Run);
-            doc.status = "blocked";
+            doc.status = error instanceof FilingError ? "paused" : "blocked";
             doc.reason = String(error);
             doc.outcomes[name] = failureOutcome;
             return {
@@ -487,7 +884,14 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
     "verifier",
     "reporter",
   ])
-    registry.install(piResultExtension(roleResultSchema(role)));
+    for (const mode of ["normal", "repair", "recheck"] as const) {
+      const schema = roleResultSchema(role, mode);
+      // Normal/recheck share schemas for non-detecting roles.
+      if (mode === "recheck" && !["reviewer", "verifier"].includes(role))
+        continue;
+      if (mode === "repair" && role !== "implementor") continue;
+      registry.install(piResultExtension(schema));
+    }
   registry.install(defineExtension({ name: "orch.engine", tasks: [Task] }));
   harness = await Harness.open(
     options.storage,
@@ -508,7 +912,8 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
     const root = await harness.root(ctx);
     const id = await root.commit(async (tx) => {
       const doc = await tx.doc(Run);
-      if (doc.status === "merged" || doc.status === "completed") return null;
+      if (["merged", "completed", "parked", "aborted"].includes(doc.status))
+        return null;
       if (!doc.workflow) {
         doc.workflow = options.workflow;
         doc.runId = randomUUID();
@@ -549,7 +954,10 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
     }
     const state = await harness.snapshot(Run, ctx);
     if (!state) throw new Error("Missing run state");
-    return state;
+    return {
+      ...state,
+      findings: (await harness.snapshot(Findings, ctx))?.items ?? [],
+    };
   } finally {
     options.signal?.removeEventListener("abort", pause);
     await harness.close(ctx);

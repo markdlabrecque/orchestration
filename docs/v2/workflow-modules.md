@@ -18,8 +18,7 @@ from `src/registration.ts`. Kind names and runner names have separate namespaces
 each rejects collisions with its built-ins and earlier modules.
 
 A custom kind declares `name`, `outcomes` and an async `run(step, helpers)`.
-Its first declared outcome advances the workflow. Other outcomes block until
-repair execution is implemented. The helper provides the ticket worktree as
+Its first declared outcome advances the workflow. Other outcomes take their configured repair edge or block when unmapped. The helper provides the ticket worktree as
 `cwd`, command execution as `exec`, the cancellation `signal`, `onEvent`, and
 `runAgent(name, request)`. If the kind calls runners, it must declare their names
 in its `runners` list so preflight can check them before pickup.
@@ -43,8 +42,8 @@ The retained Pi/shell agent, GitHub, CI and pinned merge path remains executable
 Custom kinds, custom agent runners, shell steps and conditions execute through
 the same engine. A workflow without a successful merge completes without retirement.
 The role workflow now executes lanes, model routing, human questions, sessions and
-test gates. Unsuccessful outcomes block; repair execution and GitLab remain later
-tickets. See [role execution](role-execution.md) for the shipped workflow and
+test gates. Unsuccessful outcomes take configured repair edges or block. See
+[repair execution](repairs.md). GitLab remains the next tracker ticket. See [role execution](role-execution.md) for the shipped workflow and
 runner/report contracts.
 
 No behavior tests were simplified. The old explicit-unsupported human/test-gate

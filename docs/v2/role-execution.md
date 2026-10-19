@@ -36,7 +36,8 @@ Every role returns outcome (pass, findings or failed) and summary. Spec addition
 requires lane and implementationTier. Test-writer requires expectedFailures,
 an array of {test, message}. Reviewer and verifier require findings, an array of
 {summary, evidence, classification}; classification is must-fix or follow-up.
-A passing result with any must-fix blocks. Other roles cannot add lane or tier.
+A passing result with any must-fix blocks. Other roles cannot add lane or tier. All roles may return optional followUps
+entries with summary and evidence; the engine files these immediately.
 Unknown fields fail schema validation.
 
 Pi exposes the role's exact schema as submit_result and fails if it finishes
@@ -77,7 +78,8 @@ the workflow, including when an agent claimed pass.
 ## Humans and sessions
 
 Human steps ask on stdin without a timeout. The first listed choice advances as
-pass. Other choices retain their named outcome and block pending repair support.
+pass. Other choices retain their named outcome and take a configured repair edge,
+or block when no edge is configured.
 Invalid responses are asked again. Pausing while unanswered does not record an
 answer; resuming asks again.
 
@@ -89,8 +91,8 @@ than creating a new one. Shell rejects session continuation.
 
 Pi resumes its owned conversation after a process crash. Shell reruns on the
 existing dirty worktree. Cancellation and timeout stop the Pi conversation or
-shell process group, including surviving descendants. Repairs, findings-ledger
-management and GitLab execution remain the later tickets' responsibility.
+shell process group, including surviving descendants. Repair and findings recovery is described in [repairs](repairs.md). GitLab
+execution remains the next tracker ticket's responsibility.
 
 ## Validation evidence and test changes
 

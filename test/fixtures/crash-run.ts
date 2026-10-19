@@ -53,6 +53,7 @@ const tracker: Tracker = {
   }),
   assign: async () => {},
   comment: async () => ({ id: "1", url: "comment" }),
+  abort: async () => {},
   followUp: async () => ({ id: "2", url: "ticket" }),
   pullRequest: async () => ({ id: "3", url: "pr" }),
   readPullRequest: async () => ({ id: "3", url: "pr", head: "abc", merged }),
