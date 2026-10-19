@@ -108,3 +108,68 @@ test.each([
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+test("shipped Codex command supplies the schema and captures the structured final response", async () => {
+  const { writeFile, chmod } = await import("node:fs/promises");
+  const { exec } = await import("../src/command.ts");
+  const { resolveWorkflow } = await import("../src/workflow.ts");
+  const cwd = await mkdtemp(join(tmpdir(), "orch-default-shell-"));
+  try {
+    await writeFile(
+      join(cwd, "codex"),
+      `#!/usr/bin/env bash
+set -eu
+result= schema=
+while (( $# )); do
+  case "$1" in
+    --output-schema) schema=$2; shift;;
+    --output-last-message) result=$2; shift;;
+  esac
+  shift
+done
+test -n "$schema" && test -n "$result"
+cat "$schema" > schema.json
+cat > prompt.txt
+printf '%s' '{"outcome":"pass","summary":"structured final answer"}' > "$result"
+printf handoff
+`,
+    );
+    await chmod(join(cwd, "codex"), 0o755);
+    const workflow = resolveWorkflow(
+      await readFile(
+        new URL("../workflow.default.yaml", import.meta.url),
+        "utf8",
+      ),
+    );
+    const runner = createShellRunner(
+      String(workflow.runners.shell.command),
+      (request) =>
+        exec({
+          ...request,
+          env: { ...request.env, PATH: `${cwd}:${process.env.PATH}` },
+        }),
+      { standard: "fixture" },
+    );
+    expect(
+      await runner.run({
+        prompt: "brief",
+        role: "role",
+        cwd,
+        model: { tier: "standard", effort: "high" },
+        tools: ["read"],
+        timeoutMs: 1000,
+        resultSchema,
+        signal: new AbortController().signal,
+        onEvent: () => {},
+      }),
+    ).toMatchObject({
+      status: "done",
+      result: { summary: "structured final answer" },
+    });
+    expect(
+      JSON.parse(await readFile(join(cwd, "schema.json"), "utf8")),
+    ).toEqual(resultSchema);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});

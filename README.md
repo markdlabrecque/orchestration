@@ -1,117 +1,104 @@
 # Orchestration v2
 
-A terminal workflow for one GitHub ticket: read and assign the ticket, pick up its
-worktree, plan with Pi, implement with a shell agent, post the handoff, publish a
-PR, wait for required CI, squash-merge the exact approved head, and retire the
-checkout. Pi Durable 1.3.0 owns task checkpoints and agent conversations.
+`orch` runs one GitHub or GitLab ticket through spec, tests, implementation,
+review, optional site verification, reporting, PR/MR, CI and merge. Pi Durable
+owns checkpoints and agent conversations. The engine owns tracker writes,
+repair budgets and exact-head merge gates.
 
-This branch implements the first slice of [the v2 spec](docs/v2/spec.md), tracked
-in [issue 139](https://github.com/markdlabrecque/orchestration/issues/139).
-The [build plan](docs/v2/build-plan.md) separates the remaining work.
+## Install
 
-## Running this slice
-
-Requires Node >=22.19, pnpm, Git, Bash, Python 3 and an authenticated `gh` command.
-DDEV is needed only for projects whose retained provisioning scripts use it.
-The Pi runner supports the OpenAI and Anthropic providers using their normal
-provider environment variables. The default shell command needs an authenticated
-Codex CLI; replace `runners.shell.command` to use another command.
+Requires Node >=22.19, pnpm, Git, Bash and Python 3. Use a dedicated, stable
+clone on the v2 branch. Keep that clone: the installed command links to its
+source files. Ticket worktrees, detached HEAD and ticket branches are refused.
 
 ```sh
-pnpm install --frozen-lockfile
-mkdir -p ~/.config/orchestration
-# Copy only when you have no global workflow yet.
-test -e ~/.config/orchestration/workflow.yaml || cp workflow.default.yaml ~/.config/orchestration/workflow.yaml
-/path/to/orchestration/bin/orch validate
-/path/to/orchestration/bin/orch run 139
+git clone --branch v2 https://github.com/markdlabrecque/orchestration.git ~/orchestration-cli
+cd ~/orchestration-cli
+scripts/install-local
+# Add pnpm's global bin directory and ~/bin to PATH if needed.
+orch --version
 ```
 
-Run inside a configured project. The retained project resolver expects
-`$ORCH_PROJECTS_DIR/<project>/.orch`, with `ORCH_PROJECTS_DIR` defaulting to
-`~/Projects`. For example:
+Installation runs `pnpm install --frozen-lockfile` and `pnpm link --global`,
+creates the global workflow only when absent, and links `~/bin/orch-update`.
+`orch-update` pulls the stable checkout with `--ff-only`, installs dependencies
+and prints the version and commit. It refuses uncommitted work and preserves
+your global workflow. See [installation and workflow configuration](docs/v2/usage.md).
+
+## Configure and run
+
+Authenticate `gh` for GitHub or `glab` for GitLab. Configure the Pi provider
+credentials and shell agent separately; see [runner setup](docs/v2/usage.md#runners).
+DDEV is needed only when the project uses DDEV provisioning or verification.
+
+A configured project has a wrapper folder and a `.orch` file:
 
 ```text
 ~/Projects/example/
   .orch                     BASE_BRANCH=main, MAIN_CHECKOUT=code/main
-  code/main/                the main Git checkout
-  code/139/                 the ticket worktree, created on pickup
-  .agents/orchestration/runs/139.sqlite
+  code/main/                main Git checkout
+  code/145/                 ticket worktree, created on pickup
+  .agents/orchestration/runs/145.sqlite
 ```
 
-The `.orch` file uses one `KEY=value` per line. The existing project setup engine
-is `scripts/worktree/setup-project/scripts/setup-project.sh`; its Bash tests and
-configuration rules are retained. Origin must identify a GitHub repository.
-Required GitHub checks must be configured: no reported required checks does not
-count as green. Only passed required checks on the unchanged PR head allow a
-SHA-pinned squash merge.
-
-Use one terminal per ticket. A second process opening the same SQLite file can
-corrupt the active execution; there is no lock or daemon. Ctrl-C and SIGHUP pause.
-Run the same command to resume. Completed steps do not replay. An interrupted Pi
-step continues its owned conversation; shell restarts on the existing dirty
-worktree. A hard kill can leave external shell children alive; stop those before
-resuming. Run history stays outside the worktree.
-
-Retirement uses the retained engine with `ORCH_RETIRE_KEEP_BRANCH=1`: remove the
-checkout and local site, retain the local branch, and record the retained branch
-in the existing retirement journal. No branch is deleted. Standalone retirement
-keeps its previous manual-branch-cleanup behavior. Failed teardown blocks and is
-retried by `orch run`; a confirmed remote merge is never repeated.
-
-## Runner and tracker boundaries
-
-`src/workflow.ts` validates the fixed data-file workflow before pickup.
-`src/engine.ts` runs it using Pi Durable tasks and documents. The effective
-workflow is saved at the start of a run, so editing the global file does not
-change a running ticket's sequence.
-
-Runners accept complete role/brief requests, cancellation and event callbacks.
-Pi uses a schema-backed `submit_result` tool. Shell receives role text, a blank
-line and the brief on stdin, with these environment variables:
-
-- `ORCH_ROLE_FILE`: role text file.
-- `ORCH_RESULT_FILE`: write the result JSON here before exiting.
-- `ORCH_RESULT_SCHEMA`: JSON schema for that result.
-- `ORCH_TOOLS`, `ORCH_MODEL_TIER`, `ORCH_MODEL_EFFORT`: requested capabilities and routing.
-
-The first-slice result is `{ "outcome": "pass" | "failed", "summary": "..." }`.
-An exit-zero command with no valid result fails. Stdout is the handoff. Shell tool
-permissions are advisory; the launched agent must enforce its own policy.
-
-`src/tracker/types.ts` defines the forge boundary. The GitHub implementation
-reads/assigns tickets, posts comments, files follow-ups, creates PRs, checks CI
-and pins merge requests. A run UUID is committed before writes and generates
-stable hidden markers. Reconciliation scans all pages before creating anything;
-a failed or ambiguous scan blocks. These markers support recovery, not atomic
-exactly-once delivery.
-
-The fixed workflow supports agent steps followed by `mr`, `ci`, `merge`. The
-complete patch language, role routing and gates, custom registrations, session
-reuse between steps, repairs/findings, GitLab, crash-limit controls, status
-readers and installation/update commands belong to the later build tickets.
-Unsupported workflow fields and project patches fail explicitly. Original role
-prompts remain under `roles/` for the role-workflow ticket; this slice uses the
-two `slice-*` prompts. The v1 runtime, extension, plugin manifests and its tests
-were removed as specified by ADR 0007. The worktree engines and all their Bash
-suites remain, including their Python retirement helpers.
-
-## Verification
+`.orch` uses one `KEY=value` per line. The retained setup command is
+`scripts/worktree/setup-project/scripts/setup-project.sh`.
+`ORCH_PROJECTS_DIR` defaults to `~/Projects`. Run inside the configured project:
 
 ```sh
-pnpm check                 # types, Biome, Vitest, all four retained Bash suites and project safety tests
-pnpm exec vitest run test/cli.fixture.test.ts
+orch validate
+orch explain                # writes and opens HTML
+orch explain --simple       # terminal text; no browser
+orch run 145
+orch show 145                # read-only status
+orch tail 145                # read-only event stream
 ```
 
-The tagged `[fixture]` test crosses the CLI, real worktree scripts, local Git
-remote, SQLite, both real runners, the GitHub adapter, CI and retirement. Only
-the provider and GitHub command responses are fake. No test needs network access
-or credentials. Additional tests use MemoryStorage, a fake runner/clock and
-SQLite restart tests. Separate child processes are killed with SIGKILL during
-Pi and shell execution to verify recovery. The 15 independent Python project-safety tests were also retained. No tests were
-simplified to make failures pass; the removed v1 tests depended on the deleted
-runtime and packaging.
+Use one terminal per ticket. There are no locks or daemon; a second owner can
+corrupt the run. Ctrl-C or SIGHUP pauses; repeat `orch run 145` to resume.
+Stop the process before `orch abort 145` or `orch retire 145`. A hard kill may
+leave shell descendants alive; stop them before resuming. See
+[terminal controls and recovery limits](docs/v2/terminal-controls.md).
 
-Pi Durable's pinned [README](https://github.com/earendil-works/pi/blob/v1.3.0/packages/durable/README.md)
-and [task API](https://github.com/earendil-works/pi/blob/v1.3.0/packages/durable/src/types.ts)
-control the durability integration. The research on `research/pi-durable-engine`
-was checked against the installed 1.3.0 package, rather than its unreleased API.
+The global file is `~/.config/orchestration/workflow.yaml`, or under
+`XDG_CONFIG_HOME`. A committed `.orchestration/workflow.yaml` in the project
+patches it. Configure the project's full test command and its assertion reporter
+before standard-lane work; plain `pnpm test` alone does not supply red-gate
+evidence. [The reporter contract](docs/v2/role-execution.md#red-gate-reporter-contract)
+defines the required JSON. Trivial and no-code lanes skip the test gates.
+
+```sh
+orch workflow diff          # compare global with this installed version
+orch workflow reset         # refuses changed globals
+orch workflow reset --force # keeps a .bak before replacing edits
+```
+
+The first run saves its explanation beside the SQLite file without opening a
+browser. Completed steps do not replay. Pi continues its owned conversation;
+shell restarts in the existing dirty worktree. History survives retirement.
+GitHub requires reported required checks; GitLab requires its head pipeline.
+Missing CI never counts as green. Merge is pinned to the CI-passed SHA.
+
+## Development and verification
+
+```sh
+pnpm install --frozen-lockfile
+pnpm check
+pnpm exec vitest run test/cli.fixture.test.ts test/install.test.ts
+```
+
+`pnpm check` runs TypeScript, Biome, Vitest, retained Bash suites and Python
+project-safety tests. Fixtures use real local Git worktrees, SQLite and runner
+adapters with fake model and forge boundaries. The installation fixture uses
+an isolated HOME and pnpm global directory, tests install/update/version and
+runs the installed executable through a standard workflow. It never changes
+the operator's installed CLI or global workflow.
+
+This repository's project override uses `pnpm check` and requires its `v2 / check`
+CI job before merge. Mark that job required in GitHub branch protection so the
+engine waits for it; the additional project step refuses missing, wrong-workflow,
+failed or stale-head evidence.
+
+[Design spec](docs/v2/spec.md) · [build plan](docs/v2/build-plan.md) ·
+[role execution](docs/v2/role-execution.md) · [repairs](docs/v2/repairs.md) ·
+[terminal controls](docs/v2/terminal-controls.md) · [glossary](GLOSSARY.md)

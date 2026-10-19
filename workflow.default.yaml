@@ -11,7 +11,7 @@ runners:
       heavy: { provider: openai, model: gpt-6-astra }
       frontier: { provider: openai, model: gpt-6-astra }
   shell:
-    command: codex exec --model "$ORCH_MODEL" -c model_reasoning_effort="$ORCH_MODEL_EFFORT" --sandbox workspace-write -
+    command: codex exec --model "$ORCH_MODEL" -c model_reasoning_effort="$ORCH_MODEL_EFFORT" --sandbox workspace-write --output-schema <(printf '%s' "$ORCH_RESULT_SCHEMA") --output-last-message "$ORCH_RESULT_FILE" -
     models:
       light: gpt-6-luna
       standard: gpt-6.1-sol

@@ -1,5 +1,4 @@
-import { access, readFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createModels, type Models } from "@earendil-works/pi-ai/models";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
@@ -7,6 +6,7 @@ import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { checked, type Exec, exec } from "./command.ts";
 import { runWorkflow } from "./engine.ts";
+import { explainHtml, explainText } from "./explain.ts";
 import { observeRun, showRun, tailRun } from "./observability.ts";
 import { preflight } from "./preflight.ts";
 import {
@@ -17,6 +17,7 @@ import {
 import type { RunnerEvent } from "./runners/types.ts";
 import { createTracker, selectForge } from "./tracker/index.ts";
 import { loadWorkflow } from "./workflow.ts";
+import { globalWorkflowPath, workflowConfig } from "./workflow-config.ts";
 
 export type CliOptions = {
   cwd?: string;
@@ -36,7 +37,7 @@ export async function runCli(
     execute = options.execute ?? exec;
   if (argv.length === 0 || argv[0] === "--help") {
     output(
-      "Usage: orch run <ticket> [--retry] | orch show <ticket> | orch tail <ticket> | orch abort <ticket> | orch retire <ticket> | orch validate | orch --version\nOne terminal per ticket. Ctrl-C or SIGHUP pauses; run the same command to resume. Stop the run before abort or retire; these commands do not check liveness.",
+      "Usage: orch run <ticket> [--retry] | orch show <ticket> | orch tail <ticket> | orch abort <ticket> | orch retire <ticket> | orch validate | orch explain [--simple] | orch workflow diff/reset [--force] | orch --version\nOne terminal per ticket. Ctrl-C or SIGHUP pauses; run the same command to resume. Stop the run before abort or retire; these commands do not check liveness.",
     );
     return 0;
   }
@@ -47,6 +48,36 @@ export async function runCli(
     output(
       `${pkg.version} ${await checked(execute, { cwd: packageRoot, argv: ["git", "rev-parse", "--short", "HEAD"] })}`,
     );
+    return 0;
+  }
+  if (argv[0] === "workflow")
+    return workflowConfig(
+      argv.slice(1),
+      options.workflowPath ?? globalWorkflowPath(),
+      execute,
+      output,
+    );
+  if (argv[0] === "explain") {
+    if (argv.length > 2 || (argv[1] !== undefined && argv[1] !== "--simple"))
+      throw new Error("Usage: orch explain [--simple]");
+    const project = await discoverProject(cwd, "1", execute);
+    const loaded = await loadWorkflow(
+      options.workflowPath ?? globalWorkflowPath(),
+      join(project.main, ".orchestration/workflow.yaml"),
+    );
+    if (argv[1] === "--simple") output(explainText(loaded));
+    else {
+      const file = join(project.root, ".agents/orchestration/explain.html");
+      await mkdir(join(project.root, ".agents/orchestration"), {
+        recursive: true,
+      });
+      await writeFile(file, explainHtml(loaded));
+      output(file);
+      await checked(execute, {
+        cwd,
+        argv: [process.platform === "darwin" ? "open" : "xdg-open", file],
+      });
+    }
     return 0;
   }
   const retry = argv.includes("--retry");
@@ -85,11 +116,7 @@ export async function runCli(
   }
   const load = () =>
     loadWorkflow(
-      options.workflowPath ??
-        join(
-          process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"),
-          "orchestration/workflow.yaml",
-        ),
+      options.workflowPath ?? globalWorkflowPath(),
       join(project.main, ".orchestration/workflow.yaml"),
     );
   const defaults = createModels();
@@ -139,6 +166,11 @@ export async function runCli(
           control && saved
             ? { workflow: saved, registrations: undefined }
             : await load();
+        if (!saved && "globalSource" in loaded)
+          await writeFile(
+            join(project.runs, `${project.ticket}.explain.html`),
+            explainHtml(loaded),
+          );
         project.forge = selectForge(project, loaded.workflow.settings.forge);
         return {
           ...loaded,

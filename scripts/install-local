@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+script=$(node -e 'console.log(require("node:fs").realpathSync(process.argv[1]))' "$0")
+cd "$(dirname "$script")/.."
+source scripts/stable-checkout.sh
+orch_require_stable_checkout
+pnpm install --frozen-lockfile
+pnpm link --global
+config="${XDG_CONFIG_HOME:-$HOME/.config}/orchestration/workflow.yaml"
+mkdir -p "$(dirname "$config")" "$HOME/bin"
+# Exclusive copy preserves files and symlinks, including dangling symlinks.
+node -e 'const fs=require("node:fs"); try { fs.copyFileSync("workflow.default.yaml", process.argv[1], fs.constants.COPYFILE_EXCL); } catch(e) { if(e.code!=="EEXIST") throw e; }' "$config"
+ln -sfn "$PWD/scripts/update-local" "$HOME/bin/orch-update"
+printf 'Installed from %s\nKeep this checkout. Add the pnpm global bin directory and ~/bin to PATH.\n' "$PWD"

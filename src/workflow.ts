@@ -284,6 +284,8 @@ export async function loadWorkflow(globalPath: string, projectPath?: string) {
     return {
       workflow: resolveWorkflow(sources[0], sources[1], { registrations }),
       registrations,
+      globalSource: sources[0],
+      patchSource: sources[1],
     };
   } catch (error) {
     throw new Error(

@@ -254,6 +254,19 @@ patch:
         stderr: "",
       };
     };
+    await runCli(["explain"], {
+      cwd: main,
+      workflowPath: config,
+      output: () => {},
+      execute: (request) =>
+        ["xdg-open", "open"].includes(request.argv[0])
+          ? Promise.resolve({ code: 0, status: "done", stdout: "", stderr: "" })
+          : execute(request),
+    });
+    const explanation = await readFile(
+      join(root, ".agents/orchestration/explain.html"),
+      "utf8",
+    );
     const output: string[] = [];
     expect(
       await runCli(["run", "139"], {
@@ -266,6 +279,12 @@ patch:
       output.join("\n"),
     ).toBe(0);
     expect(output.at(-1)).toBe("merged");
+    expect(
+      await readFile(
+        join(root, ".agents/orchestration/runs/139.explain.html"),
+        "utf8",
+      ),
+    ).toBe(explanation);
     expect(output).not.toContain("intermediate transcript");
     const statusOutput: string[] = [];
     await runCli(["show", "139"], {

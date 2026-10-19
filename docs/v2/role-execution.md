@@ -69,6 +69,8 @@ Unavailable commands, syntax/import/collection failures, missing reports, green
 tests and unrelated assertions cannot pass red. A framework reporter or a project
 test wrapper must classify errors faithfully; do not generate static evidence.
 The test-writer configures that reporter as part of the test changes when needed.
+The shipped `pnpm test` alone does not produce this report. See
+[runner and reporter setup](usage.md) before starting standard-lane work.
 There is no framework-independent way to infer the intent of a nonzero exit.
 
 Tests-green reruns the full configured command and requires a normal zero exit.
@@ -91,8 +93,7 @@ than creating a new one. Shell rejects session continuation.
 
 Pi resumes its owned conversation after a process crash. Shell reruns on the
 existing dirty worktree. Cancellation and timeout stop the Pi conversation or
-shell process group, including surviving descendants. Repair and findings recovery is described in [repairs](repairs.md). GitLab
-execution remains the next tracker ticket's responsibility.
+shell process group, including surviving descendants. Repair and findings recovery is described in [repairs](repairs.md). GitHub and GitLab execution use the same tracker contract.
 
 ## Validation evidence and test changes
 
