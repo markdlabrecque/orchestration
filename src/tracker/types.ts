@@ -23,8 +23,12 @@ export interface Tracker {
     options?: { draft?: boolean },
   ): Promise<Identity>;
   readPullRequest(id: string): Promise<PullRequest>;
+  // Only success for this exact head may pass. Missing or ambiguous evidence
+  // throws; a concurrent head change invalidates the observation.
   ci(id: string, sha: string): Promise<"passed" | "pending" | "failed">;
   // Mark aborted without closing the ticket; repeat calls must be safe.
   abort(ticket: string, marker: string): Promise<void>;
+  // Squash with a server-side SHA precondition; return only after confirmed
+  // merge, including reconciliation of an already-completed merge.
   merge(id: string, sha: string): Promise<void>;
 }

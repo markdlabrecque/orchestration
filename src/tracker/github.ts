@@ -1,4 +1,5 @@
 import { checked, type Exec, exec } from "../command.ts";
+import { remoteIdentity } from "./identity.ts";
 import type { Identity, Tracker } from "./types.ts";
 
 type Remote = {
@@ -11,17 +12,18 @@ type Remote = {
   head: { sha: string };
   merged: boolean;
 };
-const identity = (r: Remote): Identity => ({
-  id: String(r.number ?? r.id),
-  url: r.html_url,
-});
+const identity = (r: Remote): Identity =>
+  remoteIdentity(r?.number ?? r?.id, r?.html_url);
 export function createGitHubTracker(
   repo: string,
   cwd: string,
   execute: Exec = exec,
+  host = "github.com",
 ): Tracker {
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo))
     throw new Error("Invalid GitHub repository");
+  const hostArgs = host === "github.com" ? [] : ["--hostname", host];
+  const cliRepo = host === "github.com" ? repo : `${host}/${repo}`;
   const api = async (path: string, method?: string, data?: unknown) =>
     JSON.parse(
       await checked(execute, {
@@ -30,6 +32,7 @@ export function createGitHubTracker(
           "gh",
           "api",
           `repos/${repo}/${path}`,
+          ...hostArgs,
           ...(method ? ["--method", method, "--input", "-"] : []),
         ],
         ...(method ? { input: JSON.stringify(data) } : {}),
@@ -39,7 +42,14 @@ export function createGitHubTracker(
     const value = JSON.parse(
       await checked(execute, {
         cwd,
-        argv: ["gh", "api", `repos/${repo}/${path}`, "--paginate", "--slurp"],
+        argv: [
+          "gh",
+          "api",
+          `repos/${repo}/${path}`,
+          "--paginate",
+          "--slurp",
+          ...hostArgs,
+        ],
       }),
     );
     if (!Array.isArray(value) || value.some((p) => !Array.isArray(p)))
@@ -91,7 +101,10 @@ export function createGitHubTracker(
     },
     async assign(id) {
       const user = JSON.parse(
-        await checked(execute, { cwd, argv: ["gh", "api", "user"] }),
+        await checked(execute, {
+          cwd,
+          argv: ["gh", "api", "user", ...hostArgs],
+        }),
       );
       await api(`issues/${id}/assignees`, "POST", { assignees: [user.login] });
     },
@@ -120,7 +133,7 @@ export function createGitHubTracker(
         if (!current.draft)
           await checked(execute, {
             cwd,
-            argv: ["gh", "pr", "ready", pr.id, "--undo", "--repo", repo],
+            argv: ["gh", "pr", "ready", pr.id, "--undo", "--repo", cliRepo],
           });
         await api(`pulls/${pr.id}`, "PATCH", {
           title,
@@ -141,7 +154,7 @@ export function createGitHubTracker(
           "checks",
           id,
           "--repo",
-          repo,
+          cliRepo,
           "--required",
           "--json",
           "name,bucket",

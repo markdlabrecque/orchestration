@@ -15,7 +15,7 @@ import {
   prepareRunDirectory,
 } from "./project.ts";
 import type { RunnerEvent } from "./runners/types.ts";
-import { createGitHubTracker } from "./tracker/github.ts";
+import { createTracker, selectForge } from "./tracker/index.ts";
 import { loadWorkflow } from "./workflow.ts";
 
 export type CliOptions = {
@@ -67,6 +67,7 @@ export async function runCli(
       ),
     join(project.main, ".orchestration/workflow.yaml"),
   );
+  project.forge = selectForge(project, workflow.settings.forge);
   const defaults = createModels();
   defaults.setProvider(openaiProvider());
   defaults.setProvider(anthropicProvider());
@@ -78,10 +79,6 @@ export async function runCli(
     output("Workflow valid");
     return 0;
   }
-  if ((workflow.settings.forge ?? project.forge) === "gitlab")
-    throw new Error(
-      "GitLab execution requires the GitLab tracker implementation",
-    );
   const file = await prepareRunDirectory(project);
   const controller = new AbortController();
   const signal = options.signal ?? controller.signal;
@@ -97,7 +94,7 @@ export async function runCli(
       execute,
       project,
       models,
-      tracker: createGitHubTracker(project.repo, cwd, execute),
+      tracker: createTracker(project, project.main, execute),
       storage: await openNodeSqliteStorage(file),
       signal,
       role,

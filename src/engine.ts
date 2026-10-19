@@ -42,6 +42,7 @@ import { matchesWhen, type Workflow } from "./workflow.ts";
 export type Project = {
   root: string;
   repo: string;
+  host?: string;
   forge?: "github" | "gitlab";
   main: string;
   base: string;

@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { checked, type Exec, exec } from "./command.ts";
 import type { Project } from "./engine.ts";
+import { repositoryFromOrigin } from "./tracker/index.ts";
 export const packageRoot = fileURLToPath(new URL("../", import.meta.url));
 export async function discoverProject(
   cwd: string,
@@ -27,16 +28,12 @@ export async function discoverProject(
   const git = (args: string[], dir = main) =>
     checked(execute, { cwd: dir, argv: ["git", ...args] });
   const origin = await git(["config", "--get", "remote.origin.url"]);
-  const match = origin.match(
-    /^(?:git@github\.com:|https:\/\/github\.com\/)([^/]+\/[^/]+?)(?:\.git)?$/,
-  );
-  if (!match) throw new Error("This slice supports GitHub origins only");
+  const repository = repositoryFromOrigin(origin);
   const worktree = resolve(worktrees, ticket),
     runs = join(root, ".agents/orchestration/runs");
   return {
     root,
-    repo: match[1],
-    forge: "github",
+    ...repository,
     main,
     base,
     worktree,
