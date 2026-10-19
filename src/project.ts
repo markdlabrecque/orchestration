@@ -36,6 +36,7 @@ export async function discoverProject(
   return {
     root,
     repo: match[1],
+    forge: "github",
     main,
     base,
     worktree,

@@ -1,5 +1,5 @@
 import { appendFileSync } from "node:fs";
-import { access, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createModels, type Models } from "@earendil-works/pi-ai/models";
@@ -8,6 +8,7 @@ import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { checked, type Exec, exec } from "./command.ts";
 import { runWorkflow } from "./engine.ts";
+import { preflight } from "./preflight.ts";
 import {
   discoverProject,
   packageRoot,
@@ -15,7 +16,7 @@ import {
 } from "./project.ts";
 import type { RunnerEvent } from "./runners/types.ts";
 import { createGitHubTracker } from "./tracker/github.ts";
-import { resolveWorkflow } from "./workflow.ts";
+import { loadWorkflow } from "./workflow.ts";
 
 export type CliOptions = {
   cwd?: string;
@@ -53,46 +54,34 @@ export async function runCli(
     argv.length > (argv[0] === "run" ? 2 : 1)
   )
     throw new Error("Usage: orch run <ticket> | orch validate");
-  const source = await readFile(
-    options.workflowPath ??
-      join(
-        process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"),
-        "orchestration/workflow.yaml",
-      ),
-    "utf8",
-  );
-  const workflow = resolveWorkflow(source);
   const project = await discoverProject(
     cwd,
     argv[0] === "validate" ? "1" : (argv[1] ?? ""),
     execute,
   );
-  try {
-    await access(join(project.main, ".orchestration/workflow.yaml"));
-    throw new Error(
-      "Project workflow patches are not implemented in this slice",
-    );
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-  }
-  for (const step of workflow.steps)
-    if (step.kind === "agent")
-      await access(join(packageRoot, "roles", `${step.role}.md`));
-  await checked(execute, { cwd, argv: ["gh", "--version"] });
-  await checked(execute, {
-    cwd,
-    argv: ["bash", "-n", "-c", workflow.runners.shell.command],
-  });
+  const { workflow, registrations } = await loadWorkflow(
+    options.workflowPath ??
+      join(
+        process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"),
+        "orchestration/workflow.yaml",
+      ),
+    join(project.main, ".orchestration/workflow.yaml"),
+  );
   const defaults = createModels();
   defaults.setProvider(openaiProvider());
   defaults.setProvider(anthropicProvider());
   const models = options.models ?? defaults;
-  if (!models.getModel(workflow.runners.pi.provider, workflow.runners.pi.model))
-    throw new Error("Configured Pi model is unavailable");
+  const role = (name: string) =>
+    readFile(join(packageRoot, "roles", `${name}.md`), "utf8");
+  await preflight({ workflow, registrations, project, models, role, execute });
   if (argv[0] === "validate") {
     output("Workflow valid");
     return 0;
   }
+  if ((workflow.settings.forge ?? project.forge) === "gitlab")
+    throw new Error(
+      "GitLab execution requires the GitLab tracker implementation",
+    );
   const file = await prepareRunDirectory(project);
   const controller = new AbortController();
   const signal = options.signal ?? controller.signal;
@@ -104,13 +93,14 @@ export async function runCli(
   try {
     const state = await runWorkflow({
       workflow,
+      registrations,
+      execute,
       project,
       models,
       tracker: createGitHubTracker(project.repo, cwd, execute),
       storage: await openNodeSqliteStorage(file),
       signal,
-      role: (name) =>
-        readFile(join(packageRoot, "roles", `${name}.md`), "utf8"),
+      role,
       onEvent: (event) => {
         appendFileSync(
           join(project.runs, `${project.ticket}.events.jsonl`),

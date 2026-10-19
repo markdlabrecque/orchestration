@@ -68,8 +68,55 @@ test("[fixture] CLI to real worktree, durable Pi, shell, GitHub adapter, CI, mer
     );
     workflow.runners.pi = { provider: "faux", model: "fixture" };
     workflow.runners.shell.command = `printf implemented > change.txt; printf '{"outcome":"pass","summary":"implementation complete"}' > "$ORCH_RESULT_FILE"; printf handoff`;
+    // Both workflow layers load a module relative to their own file.
+    const registrationsUrl = new URL("../src/registration.ts", import.meta.url)
+      .href;
+    await writeFile(
+      join(dir, "custom-kind.mjs"),
+      `
+      import { defineStepKind } from ${JSON.stringify(registrationsUrl)};
+      export default defineStepKind({ name: 'record', outcomes: ['recorded', 'failed'],
+        run: async (step, helpers) => {
+          const result = await helpers.exec({ cwd: helpers.cwd, argv: ['bash', '-c', step.options.command] });
+          return {outcome: result.code === 0 ? 'recorded' : 'failed'};
+        }
+      });
+    `,
+    );
+    await mkdir(join(main, ".orchestration"));
+    await writeFile(
+      join(main, ".orchestration/custom-runner.mjs"),
+      `
+      import { defineRunner } from ${JSON.stringify(registrationsUrl)};
+      export default defineRunner({ name: 'custom', resumable: false, tools: ['read'],
+        create: (config) => ({ resumable: false, run: async (request) => ({
+          status: 'done', handoff: config.message, result: {outcome: 'pass', summary: request.role},
+          artifacts: [], ranOn: {provider:'fixture', model:'fixture', effort:'medium'}, usage:null
+        }) })
+      });
+    `,
+    );
+    await writeFile(
+      join(main, ".orchestration/workflow.yaml"),
+      `version: 1
+uses: ['./custom-runner.mjs']
+settings: {record: 'printf registered > custom.txt'}
+runners: {custom: {message: 'custom runner handoff'}}
+patch:
+  - insert_before: plan
+    step: {id: custom-agent, kind: agent, runner: custom, tools: [read], options: {role: slice-planner}}
+  - insert_after: implement
+    step: {id: record, kind: record, options: {command: '$settings.record'}}
+`,
+    );
+    await git(["add", ".orchestration"]);
+    await git(["commit", "-m", "fixture project workflow"]);
+    await git(["push", "origin", "main"]);
     const config = join(dir, "workflow.yaml");
-    await writeFile(config, stringify(workflow));
+    await writeFile(
+      config,
+      stringify({ ...workflow, uses: ["./custom-kind.mjs"] }),
+    );
     const models = createModels(),
       faux = fauxProvider({ models: [{ id: "fixture" }] });
     models.setProvider(faux.provider);
@@ -148,6 +195,8 @@ test("[fixture] CLI to real worktree, durable Pi, shell, GitHub adapter, CI, mer
       output.join("\n"),
     ).toBe(0);
     expect(output.at(-1)).toBe("merged");
+    expect(output).toContain("custom runner handoff");
+    expect(await git(["show", "139:custom.txt"])).toBe("registered");
     expect(merges).toHaveLength(1);
     expect(await git(["show", "139:change.txt"])).toBe("implemented");
     await expect(access(join(root, "code/139"))).rejects.toThrow();

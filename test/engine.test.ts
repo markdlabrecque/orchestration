@@ -274,3 +274,216 @@ test("a lost merge response resumes by confirming the existing merge before reti
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("project patches resolve settings and execute a shell step in the ticket worktree", async () => {
+  const f = await fixture();
+  f.workflow = resolveWorkflow(
+    `version: 1
+settings: { command: 'printf global' }
+steps:
+  - { id: check, kind: shell, options: { command: '$settings.command' } }
+`,
+    `version: 1
+settings: { command: 'printf project' }
+patch:
+  - set: check
+    with: { when: 'settings.command != disabled' }
+`,
+  );
+  const commands: unknown[] = [];
+  const result = await runWorkflow({
+    ...f,
+    execute: async (request) => {
+      commands.push({ cwd: request.cwd, argv: request.argv });
+      return { code: 0, status: "done", stdout: "project", stderr: "" };
+    },
+  });
+  expect(result).toMatchObject({
+    status: "completed",
+    outcomes: { check: "pass" },
+  });
+  expect(commands).toEqual([
+    { cwd: f.project.worktree, argv: ["bash", "-c", "printf project"] },
+  ]);
+  expect(f.trace).toEqual(["assigned", "pickup"]);
+});
+
+test("registered kinds call a custom runner through execution helpers and preserve declared success", async () => {
+  const { createRegistrations, defineRunner, defineStepKind } = await import(
+    "../src/registration.ts"
+  );
+  const f = await fixture();
+  const registrations = createRegistrations([
+    defineRunner({
+      name: "fixture",
+      resumable: true,
+      tools: ["read"],
+      create: (config) => ({
+        resumable: true,
+        run: async (request) => ({
+          status: "done",
+          handoff: `${config.prefix}:${request.prompt}`,
+          artifacts: [],
+          ranOn: { provider: "fixture", model: "fixture", effort: "medium" },
+          usage: null,
+        }),
+      }),
+    }),
+    defineStepKind({
+      name: "check",
+      runners: ["fixture"],
+      outcomes: ["checked", "broken"],
+      run: async (step, helpers) => {
+        const result = await helpers.runAgent("fixture", {
+          prompt: String(step.options?.prompt),
+          role: "check",
+          cwd: helpers.cwd,
+          model: { tier: "standard", effort: "medium" },
+          tools: ["read"],
+          timeoutMs: 1000,
+          resultSchema: (await import("../src/runners/types.ts")).resultSchema,
+          signal: helpers.signal,
+          onEvent: helpers.onEvent,
+        });
+        return { outcome: "checked", handoff: result.handoff };
+      },
+    }),
+  ]);
+  const workflow = resolveWorkflow(
+    `version: 1
+settings: { message: resolved }
+runners: { fixture: { prefix: custom } }
+steps:
+  - { id: check, kind: check, options: { prompt: '$settings.message' } }
+`,
+    undefined,
+    { registrations },
+  );
+  expect(await runWorkflow({ ...f, workflow, registrations })).toMatchObject({
+    status: "completed",
+    outcomes: { check: "checked" },
+    handoffs: { check: "custom:resolved" },
+  });
+});
+
+test("a custom kind's declared runner is preflighted before pickup", async () => {
+  const { createRegistrations, defineRunner, defineStepKind } = await import(
+    "../src/registration.ts"
+  );
+  const f = await fixture();
+  const registrations = createRegistrations([
+    defineRunner({
+      name: "unavailable",
+      resumable: false,
+      tools: ["read"],
+      preflight: async () => {
+        throw new Error("fixture runner unavailable");
+      },
+      create: () => {
+        throw new Error("must not construct");
+      },
+    }),
+    defineStepKind({
+      name: "uses-agent",
+      runners: ["unavailable"],
+      outcomes: ["pass"],
+      run: async () => ({ outcome: "pass" }),
+    }),
+  ]);
+  const workflow = resolveWorkflow(
+    `version: 1\nsteps: [{id: check, kind: uses-agent}]\n`,
+    undefined,
+    { registrations },
+  );
+  await expect(runWorkflow({ ...f, workflow, registrations })).rejects.toThrow(
+    /fixture runner unavailable/,
+  );
+  expect(f.trace).toEqual([]);
+});
+
+test("skipping merge never retires a worktree or reports a merge", async () => {
+  const f = await fixture();
+  f.workflow.steps[f.workflow.steps.length - 1].when = "lane == no-code";
+  expect(await runWorkflow(f)).toMatchObject({
+    status: "completed",
+    outcomes: { merge: "skipped" },
+  });
+  expect(f.trace).not.toContain("retire");
+});
+
+test.each([
+  [
+    "human",
+    {
+      id: "approval",
+      kind: "human",
+      options: { ask: "Approve?", choices: ["yes", "no"] },
+    },
+  ],
+  [
+    "test gate",
+    {
+      id: "check",
+      kind: "shell",
+      options: { command: "echo" },
+      gate: "tests-green",
+    },
+  ],
+])("deferred %s behavior blocks explicitly instead of advancing or merging", async (_label, step) => {
+  const f = await fixture();
+  f.workflow.settings.tests = "echo";
+  f.workflow.steps.splice(-1, 0, step);
+  expect(await runWorkflow(f)).toMatchObject({
+    status: "blocked",
+    reason: expect.stringMatching(/not implemented/),
+  });
+  expect(f.trace).not.toContain("merge");
+  expect(f.trace).not.toContain("retire");
+});
+
+test("resume preflights the durable workflow before a removed custom kind can execute", async () => {
+  const { createRegistrations, defineStepKind } = await import(
+    "../src/registration.ts"
+  );
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const { openNodeSqliteStorage } = await import(
+    "@earendil-works/pi-durable/storage/sqlite/node"
+  );
+  const dir = await mkdtemp(join(tmpdir(), "orch-preflight-resume-"));
+  try {
+    const f = await fixture();
+    const registrations = createRegistrations([
+      defineStepKind({
+        name: "custom",
+        outcomes: ["pass", "failed"],
+        run: async () => ({ outcome: "failed" }),
+      }),
+    ]);
+    const workflow = resolveWorkflow(
+      `version: 1\nsteps: [{id: check, kind: custom}]\n`,
+      undefined,
+      { registrations },
+    );
+    const file = join(dir, "run.sqlite");
+    expect(
+      await runWorkflow({
+        ...f,
+        workflow,
+        registrations,
+        storage: await openNodeSqliteStorage(file),
+      }),
+    ).toMatchObject({ status: "blocked" });
+    f.trace.length = 0;
+    expect(
+      await runWorkflow({ ...f, storage: await openNodeSqliteStorage(file) }),
+    ).toMatchObject({
+      status: "blocked",
+      reason: expect.stringMatching(/unknown kind custom/),
+    });
+    expect(f.trace).toEqual([]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

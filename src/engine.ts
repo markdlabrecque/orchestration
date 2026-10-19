@@ -11,6 +11,9 @@ import {
   type TaskId,
 } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
+import { type Exec, exec } from "./command.ts";
+import { preflight } from "./preflight.ts";
+import { createRegistrations, type Registrations } from "./registration.ts";
 import { createPiRunner, PiResults } from "./runners/pi.ts";
 import { createShellRunner } from "./runners/shell.ts";
 import {
@@ -19,11 +22,12 @@ import {
   resultSchema,
 } from "./runners/types.ts";
 import type { Identity, Ticket, Tracker } from "./tracker/types.ts";
-import type { Workflow } from "./workflow.ts";
+import { matchesWhen, type Workflow } from "./workflow.ts";
 
 export type Project = {
   root: string;
   repo: string;
+  forge?: "github" | "gitlab";
   main: string;
   base: string;
   worktree: string;
@@ -34,7 +38,7 @@ export type Project = {
   retire(): Promise<void>;
 };
 export type RunState = {
-  status: "running" | "paused" | "blocked" | "merged";
+  status: "running" | "paused" | "blocked" | "merged" | "completed";
   reason: string;
   index: number;
   handoffs: Record<string, string>;
@@ -77,7 +81,9 @@ export type RunOptions = {
   role: (name: string) => Promise<string>;
   signal?: AbortSignal;
   onEvent?: (event: RunnerEvent) => void;
-  runner?: (name: "pi" | "shell") => Runner;
+  runner?: (name: string) => Runner;
+  execute?: Exec;
+  registrations?: Registrations;
   clock?: {
     now(): number;
     sleep(ms: number, signal: AbortSignal): Promise<void>;
@@ -87,6 +93,9 @@ export type RunOptions = {
 // Pi Durable documents and tasks are the only authoritative run state.
 export async function runWorkflow(options: RunOptions): Promise<RunState> {
   const { tracker, project } = options;
+  const registrations = options.registrations ?? createRegistrations();
+  await preflight(options);
+  let checkedWorkflow = JSON.stringify(options.workflow);
   let harness: Harness;
   let observed: RunState | undefined;
   const notify = (data: unknown) => options.onEvent?.({ type: "status", data });
@@ -109,20 +118,28 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
           "assign",
           "pickup",
           ...workflow.steps.map((s) => s.id),
-          "retire",
+          ...(workflow.steps.some((s) => s.kind === "merge") ? ["retire"] : []),
         ];
         const name = stages[state.index];
         notify({ step: name, status: "running" });
-        const advance = async (change: Partial<RunState> = {}) =>
+        const advance = async (
+          change: Partial<RunState> = {},
+          outcome?: string,
+        ) =>
           runtime.commit(async (tx, current) => {
             const doc = await tx.doc(Run);
             Object.assign(doc, change);
             doc.index++;
             const kind = workflow.steps[state.index - 3]?.kind;
             doc.outcomes[name] =
-              kind === "merge" ? "merged" : kind === "ci" ? "passed" : "pass";
+              outcome ??
+              (kind === "merge" ? "merged" : kind === "ci" ? "passed" : "pass");
             if (doc.index === stages.length) {
-              doc.status = "merged";
+              doc.status = workflow.steps.some(
+                (s) => s.kind === "merge" && doc.outcomes[s.id] === "merged",
+              )
+                ? "merged"
+                : "completed";
               return {
                 status: "terminal",
                 outcome: { status: "completed", result: null },
@@ -137,6 +154,11 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
             };
           }, context);
         try {
+          const savedWorkflow = JSON.stringify(workflow);
+          if (savedWorkflow !== checkedWorkflow) {
+            await preflight({ ...options, workflow });
+            checkedWorkflow = savedWorkflow;
+          }
           if (name === "ticket") {
             await advance({ ticket: await tracker.readTicket(project.ticket) });
             return;
@@ -152,26 +174,104 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
             return;
           }
           if (name === "retire") {
-            await project.retire();
+            if (
+              workflow.steps.some(
+                (s) => s.kind === "merge" && state.outcomes[s.id] === "merged",
+              )
+            )
+              await project.retire();
             await advance();
             return;
           }
           const step = workflow.steps[state.index - 3];
           if (!state.ticket) throw new Error("Missing ticket");
+          if (!matchesWhen(step.when, workflow.settings)) {
+            await advance({}, "skipped");
+            return;
+          }
+          if (
+            step.kind === "human" ||
+            step.session ||
+            step.gate?.startsWith("tests-")
+          )
+            throw new Error(
+              `${step.id}: human/session/test gate execution is not implemented yet`,
+            );
+          if (
+            step.gate === "ci-green-on-head" &&
+            step.kind !== "ci" &&
+            step.kind !== "merge"
+          )
+            throw new Error(
+              `${step.id}: ci-green-on-head gate on this kind is not implemented yet`,
+            );
+          if (step.kind === "shell") {
+            const result = await (options.execute ?? exec)({
+              cwd: project.worktree,
+              argv: ["bash", "-c", String(step.options?.command)],
+              signal: runtime.signal,
+            });
+            if (result.code !== 0 || result.status !== "done")
+              throw new Error(`${step.id}: shell failed: ${result.stderr}`);
+            await advance();
+            return;
+          }
+          const getRunner = (name: string): Runner => {
+            const injected = options.runner?.(name);
+            if (injected) return injected;
+            if (name === "pi")
+              return createPiRunner(harness, task.id, step.id, {
+                provider: String(workflow.runners.pi.provider),
+                model: String(workflow.runners.pi.model),
+              });
+            if (name === "shell")
+              return createShellRunner(String(workflow.runners.shell.command));
+            const definition = registrations.runners.get(name);
+            if (!definition) throw new Error(`Unknown runner ${name}`);
+            return definition.create(workflow.runners[name] ?? {});
+          };
+          const custom = registrations.kinds.get(step.kind);
+          if (custom) {
+            const result = await custom.run(step, {
+              cwd: project.worktree,
+              signal: runtime.signal,
+              exec: options.execute ?? exec,
+              onEvent: (event) => options.onEvent?.(event),
+              runAgent: (name, request) => {
+                if (!custom.runners?.includes(name))
+                  throw new Error(`${step.id}: undeclared runner ${name}`);
+                return getRunner(name).run(request);
+              },
+            });
+            if (!custom.outcomes.includes(result.outcome))
+              throw new Error(
+                `${step.id}: undeclared outcome ${result.outcome}`,
+              );
+            if (result.outcome !== custom.outcomes[0])
+              throw new Error(`${step.id}: ${result.outcome}`);
+            await advance(
+              result.handoff === undefined
+                ? {}
+                : {
+                    handoffs: { ...state.handoffs, [step.id]: result.handoff },
+                  },
+              result.outcome,
+            );
+            return;
+          }
           if (step.kind === "agent") {
-            const runner =
-              options.runner?.(step.runner) ??
-              (step.runner === "pi"
-                ? createPiRunner(harness, task.id, step.id, workflow.runners.pi)
-                : createShellRunner(workflow.runners.shell.command));
+            const runner = getRunner(step.runner ?? "");
             const result = await runner.run({
               prompt: `${state.ticket.title}\n${state.ticket.body}\n\nPrevious handoffs:\n${JSON.stringify(state.handoffs)}`,
-              role: await options.role(step.role),
+              role: await options.role(step.role ?? String(step.options?.role)),
               cwd: project.worktree,
-              model: { tier: "standard", effort: "medium" },
+              model: step.model ?? { tier: "standard", effort: "medium" },
               tools:
-                step.runner === "pi" ? ["read"] : ["read", "edit", "shell"],
-              timeoutMs: 60 * 60 * 1000,
+                step.tools ??
+                (step.runner === "shell"
+                  ? ["read", "edit", "shell"]
+                  : ["read"]),
+              timeoutMs: step.timeoutMs ?? 60 * 60 * 1000,
               resultSchema,
               signal: runtime.signal,
               onEvent: (event) => options.onEvent?.(event),
@@ -207,6 +307,8 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
             await advance({ head, pr, ciHead: "" });
             return;
           }
+          if (step.kind !== "ci" && step.kind !== "merge")
+            throw new Error(`${step.id}: unknown kind ${step.kind}`);
           if (!state.pr) throw new Error("Missing PR");
           if (step.kind === "ci") {
             const now = () => options.clock?.now() ?? runtime.now();
@@ -282,7 +384,7 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
     const root = await harness.root(ctx);
     const id = await root.commit(async (tx) => {
       const doc = await tx.doc(Run);
-      if (doc.status === "merged") return null;
+      if (doc.status === "merged" || doc.status === "completed") return null;
       if (!doc.workflow) {
         doc.workflow = options.workflow;
         doc.runId = randomUUID();
