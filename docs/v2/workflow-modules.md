@@ -40,14 +40,15 @@ executable without executing the command. Arbitrary shell programs can still fai
 at runtime, including commands selected inside conditionals.
 
 The retained Pi/shell agent, GitHub, CI and pinned merge path remains executable.
-Custom kinds, custom agent runners, shell steps and conditions now execute through
+Custom kinds, custom agent runners, shell steps and conditions execute through
 the same engine. A workflow without a successful merge completes without retirement.
-Role routing, human interaction, sessions, test gates and repair execution remain
-for the later build tickets. Human/session/test-gate steps currently block explicitly;
-failed outcomes block rather than silently advancing through an unimplemented repair.
-GitLab execution still requires its planned tracker adapter.
+The role workflow now executes lanes, model routing, human questions, sessions and
+test gates. Unsuccessful outcomes block; repair execution and GitLab remain later
+tickets. See [role execution](role-execution.md) for the shipped workflow and
+runner/report contracts.
 
-No behavior tests were retired or simplified for this change. The CLI fixture now
-loads modules from both workflow layers and exercises them before its existing
-Pi/shell, exact-head CI, merge and retirement checks. The full `pnpm check` passed
-with 65 TypeScript tests, the retained bash suites and 15 Python tests.
+No behavior tests were simplified. The old explicit-unsupported human/test-gate
+checks were replaced by positive execution and failure tests. The original slice
+workflow lives in test/fixtures/slice-workflow.yaml for crash and compatibility
+coverage. The CLI fixture also executes all three shipped lanes with both real
+runners, real local worktrees, a real test command, and fake model/forge boundaries.

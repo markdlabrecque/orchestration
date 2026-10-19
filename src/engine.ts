@@ -12,14 +12,19 @@ import {
 } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { type Exec, exec } from "./command.ts";
+import { testGate } from "./gates.ts";
+import { type Ask, askHuman } from "./human.ts";
 import { preflight } from "./preflight.ts";
 import { createRegistrations, type Registrations } from "./registration.ts";
-import { createPiRunner, PiResults } from "./runners/pi.ts";
+import { piModel } from "./runners/model.ts";
+import { createPiRunner, PiResults, piResultExtension } from "./runners/pi.ts";
 import { createShellRunner } from "./runners/shell.ts";
 import {
+  type AgentResult,
   type Runner,
   type RunnerEvent,
-  resultSchema,
+  roleResultSchema,
+  validateResult,
 } from "./runners/types.ts";
 import type { Identity, Ticket, Tracker } from "./tracker/types.ts";
 import { matchesWhen, type Workflow } from "./workflow.ts";
@@ -42,6 +47,10 @@ export type RunState = {
   reason: string;
   index: number;
   handoffs: Record<string, string>;
+  lane: string;
+  implementationTier: string;
+  results: Record<string, AgentResult>;
+  sessions: Record<string, string>;
   outcomes: Record<string, string>;
   workflow: Workflow | null;
   ticket: Ticket | null;
@@ -61,6 +70,10 @@ const Run = defineDoc<RunState>({
     reason: "",
     index: 0,
     handoffs: {},
+    lane: "standard",
+    implementationTier: "standard",
+    results: {},
+    sessions: {},
     outcomes: {},
     workflow: null,
     ticket: null,
@@ -80,6 +93,7 @@ export type RunOptions = {
   project: Project;
   role: (name: string) => Promise<string>;
   signal?: AbortSignal;
+  ask?: Ask;
   onEvent?: (event: RunnerEvent) => void;
   runner?: (name: string) => Runner;
   execute?: Exec;
@@ -125,8 +139,30 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
         const advance = async (
           change: Partial<RunState> = {},
           outcome?: string,
-        ) =>
-          runtime.commit(async (tx, current) => {
+        ) => {
+          const gated = workflow.steps[state.index - 3];
+          if (outcome !== "skipped" && gated?.gate?.startsWith("tests-"))
+            await testGate(
+              gated.gate,
+              String(workflow.settings.tests),
+              project.worktree,
+              options.execute ?? exec,
+              runtime.signal,
+              change.results?.[gated.id],
+            );
+          if (outcome !== "skipped" && gated?.gate === "ci-green-on-head") {
+            const head = change.ciHead ?? state.ciHead;
+            if (
+              !state.pr ||
+              !head ||
+              head !== state.head ||
+              (await tracker.readPullRequest(state.pr.id)).head !== head
+            )
+              throw new Error(
+                "ci-green-on-head: no CI evidence for current PR head",
+              );
+          }
+          return runtime.commit(async (tx, current) => {
             const doc = await tx.doc(Run);
             Object.assign(doc, change);
             doc.index++;
@@ -153,6 +189,8 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
               },
             };
           }, context);
+        };
+        let failureOutcome = "failed";
         try {
           const savedWorkflow = JSON.stringify(workflow);
           if (savedWorkflow !== checkedWorkflow) {
@@ -160,7 +198,25 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
             checkedWorkflow = savedWorkflow;
           }
           if (name === "ticket") {
-            await advance({ ticket: await tracker.readTicket(project.ticket) });
+            const ticket = await tracker.readTicket(project.ticket);
+            const forced = [
+              ...new Set(
+                (ticket.labels ?? [])
+                  .filter((l) => l.startsWith("lane:"))
+                  .map((l) => l.slice(5)),
+              ),
+            ];
+            if (
+              forced.length > 1 ||
+              forced.some(
+                (l) => !["standard", "trivial", "no-code"].includes(l),
+              )
+            )
+              throw new Error("Conflicting or invalid lane labels");
+            await advance({
+              ticket,
+              ...(forced[0] ? { lane: forced[0] } : {}),
+            });
             return;
           }
           if (name === "assign") {
@@ -185,26 +241,25 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
           }
           const step = workflow.steps[state.index - 3];
           if (!state.ticket) throw new Error("Missing ticket");
-          if (!matchesWhen(step.when, workflow.settings)) {
+          if (!matchesWhen(step.when, workflow.settings, state.lane)) {
             await advance({}, "skipped");
             return;
           }
-          if (
-            step.kind === "human" ||
-            step.session ||
-            step.gate?.startsWith("tests-")
-          )
-            throw new Error(
-              `${step.id}: human/session/test gate execution is not implemented yet`,
+          if (step.kind === "human") {
+            const choices = step.options?.choices as string[];
+            const answer = await (options.ask ?? askHuman)(
+              String(step.options?.ask),
+              choices,
+              runtime.signal,
             );
-          if (
-            step.gate === "ci-green-on-head" &&
-            step.kind !== "ci" &&
-            step.kind !== "merge"
-          )
-            throw new Error(
-              `${step.id}: ci-green-on-head gate on this kind is not implemented yet`,
-            );
+            if (runtime.signal.aborted) return;
+            if (!choices.includes(answer))
+              throw new Error(`${step.id}: invalid human choice`);
+            if (answer !== choices[0]) failureOutcome = answer;
+            if (answer !== choices[0]) throw new Error(`${step.id}: ${answer}`);
+            await advance();
+            return;
+          }
           if (step.kind === "shell") {
             const result = await (options.execute ?? exec)({
               cwd: project.worktree,
@@ -220,12 +275,17 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
             const injected = options.runner?.(name);
             if (injected) return injected;
             if (name === "pi")
-              return createPiRunner(harness, task.id, step.id, {
-                provider: String(workflow.runners.pi.provider),
-                model: String(workflow.runners.pi.model),
-              });
+              return createPiRunner(harness, task.id, step.id, (tier) =>
+                piModel(workflow.runners.pi, tier),
+              );
             if (name === "shell")
-              return createShellRunner(String(workflow.runners.shell.command));
+              return createShellRunner(
+                String(workflow.runners.shell.command),
+                options.execute ?? exec,
+                workflow.runners.shell.models as
+                  | Record<string, string>
+                  | undefined,
+              );
             const definition = registrations.runners.get(name);
             if (!definition) throw new Error(`Unknown runner ${name}`);
             return definition.create(workflow.runners[name] ?? {});
@@ -260,23 +320,60 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
             return;
           }
           if (step.kind === "agent") {
+            const role = step.role ?? String(step.options?.role);
+            const schema = roleResultSchema(role);
             const runner = getRunner(step.runner ?? "");
+            const session = step.session
+              ? state.sessions?.[step.session]
+              : undefined;
+            if (step.session && (!session || !runner.resumable))
+              throw new Error(`${step.id}: missing session ${step.session}`);
             const result = await runner.run({
-              prompt: `${state.ticket.title}\n${state.ticket.body}\n\nPrevious handoffs:\n${JSON.stringify(state.handoffs)}`,
-              role: await options.role(step.role ?? String(step.options?.role)),
+              ...(session ? { session } : {}),
+              prompt: `${state.ticket.title}\n${state.ticket.body}\n\nResolved options:\n${JSON.stringify(step.options ?? {})}\nLane: ${state.lane}\nPrevious results:\n${JSON.stringify(state.results)}\nPrevious handoffs:\n${JSON.stringify(state.handoffs)}`,
+              role: `${await options.role(role)}\n\nThe engine owns order, state and tracker writes. Return this JSON schema through submit_result on Pi or ORCH_RESULT_FILE on shell:\n${JSON.stringify(schema)}`,
               cwd: project.worktree,
-              model: step.model ?? { tier: "standard", effort: "medium" },
+              model: {
+                tier:
+                  role === "implementor"
+                    ? state.implementationTier
+                    : (step.model?.tier ?? "standard"),
+                effort: step.model?.effort ?? "medium",
+              },
               tools:
                 step.tools ??
                 (step.runner === "shell"
                   ? ["read", "edit", "shell"]
                   : ["read"]),
               timeoutMs: step.timeoutMs ?? 60 * 60 * 1000,
-              resultSchema,
+              resultSchema: schema,
               signal: runtime.signal,
               onEvent: (event) => options.onEvent?.(event),
             });
             if (runtime.signal.aborted) return;
+            if (result.status === "done") validateResult(schema, result.result);
+            failureOutcome =
+              result.result?.outcome === "findings" ? "findings" : "failed";
+            options.onEvent?.({
+              type: "status",
+              data: { step: step.id, runnerResult: result },
+            });
+            await runtime.commit(async (tx) => {
+              const doc = await tx.doc(Run);
+              if (result.result)
+                doc.results = { ...doc.results, [step.id]: result.result };
+              doc.handoffs[step.id] = result.handoff;
+              if (result.session)
+                doc.sessions = { ...doc.sessions, [step.id]: result.session };
+              return undefined;
+            }, context);
+            if (
+              result.result?.outcome === "pass" &&
+              result.result.findings?.some(
+                (f) => f.classification === "must-fix",
+              )
+            )
+              throw new Error(`${step.id}: must-fix findings cannot pass`);
             if (result.status !== "done" || result.result?.outcome !== "pass")
               throw new Error(
                 `${step.id}: agent ${result.status}: ${result.result?.summary ?? "missing passing result"}`,
@@ -284,6 +381,21 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
             options.onEvent?.({ type: "text", data: result.handoff });
             await advance({
               handoffs: { ...state.handoffs, [step.id]: result.handoff },
+              results: { ...state.results, [step.id]: result.result },
+              sessions: {
+                ...state.sessions,
+                ...(result.session ? { [step.id]: result.session } : {}),
+              },
+              ...(role === "spec-writer"
+                ? {
+                    lane: state.ticket.labels?.some((l) =>
+                      l.startsWith("lane:"),
+                    )
+                      ? state.lane
+                      : result.result.lane,
+                    implementationTier: result.result.implementationTier,
+                  }
+                : {}),
             });
             return;
           }
@@ -329,6 +441,8 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
                 await options.clock.sleep(60_000, runtime.signal);
               else await runtime.sleep(runtime.now() + 60_000, context);
             }
+            failureOutcome = "timeout";
+            failureOutcome = "timeout";
             throw new Error("Required CI timed out");
           }
           if (!state.ciHead || state.ciHead !== state.head)
@@ -347,6 +461,7 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
             const doc = await tx.doc(Run);
             doc.status = "blocked";
             doc.reason = String(error);
+            doc.outcomes[name] = failureOutcome;
             return {
               status: "terminal",
               outcome: { status: "failed", error: { message: String(error) } },
@@ -364,6 +479,15 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
   });
   const registry = createRegistry();
   registry.install(PiResults);
+  for (const role of [
+    "spec-writer",
+    "test-writer",
+    "implementor",
+    "reviewer",
+    "verifier",
+    "reporter",
+  ])
+    registry.install(piResultExtension(roleResultSchema(role)));
   registry.install(defineExtension({ name: "orch.engine", tasks: [Task] }));
   harness = await Harness.open(
     options.storage,

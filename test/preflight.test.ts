@@ -154,8 +154,14 @@ test("the shipped workflow validates in a configured plain project with no overr
   );
   const f = await project(source);
   f.models.setProvider(
-    fauxProvider({ provider: "openai", models: [{ id: "gpt-6-sol" }] })
-      .provider,
+    fauxProvider({
+      provider: "openai",
+      models: [
+        { id: "gpt-6-luna" },
+        { id: "gpt-6.1-sol" },
+        { id: "gpt-6-astra" },
+      ],
+    }).provider,
   );
   try {
     expect(await runCli(["validate"], { ...f, cwd: f.main })).toBe(0);
@@ -174,6 +180,23 @@ test("an unused verification setting does not require DDEV on a plain project", 
   try {
     expect(await runCli(["validate"], { ...f, cwd: f.main })).toBe(0);
     expect(f.commands.some((argv) => argv[0] === "ddev")).toBe(false);
+  } finally {
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
+
+test("shell tier mappings must cover every spec-selectable implementation tier before pickup", async () => {
+  const f = await project(`version: 1
+runners: { shell: { command: cat, models: { standard: only-one } } }
+steps: [{id: implement, kind: agent, runner: shell, options: {role: implementor}}]
+`);
+  try {
+    await expect(runCli(["run", "1"], { ...f, cwd: f.main })).rejects.toThrow(
+      /shell.*tier/,
+    );
+    expect(
+      f.commands.some((argv) => argv.some((s) => s.includes("setup-worktree"))),
+    ).toBe(false);
   } finally {
     await rm(f.root, { recursive: true, force: true });
   }

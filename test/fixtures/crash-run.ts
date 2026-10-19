@@ -15,10 +15,7 @@ import { resolveWorkflow } from "../../src/workflow.ts";
 
 const [dir, mode] = process.argv.slice(2);
 const workflow = resolveWorkflow(
-  await readFile(
-    new URL("../../workflow.default.yaml", import.meta.url),
-    "utf8",
-  ),
+  await readFile(new URL("./slice-workflow.yaml", import.meta.url), "utf8"),
 );
 workflow.runners.pi = { provider: "faux", model: "fixture" };
 workflow.runners.shell.command = `if [ ! -f dirty ]; then printf saved > dirty; printf crash-shell; else test "$(cat dirty)" = saved || exit 1; fi; printf '{"outcome":"pass","summary":"implemented"}' > "$ORCH_RESULT_FILE"`;

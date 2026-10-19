@@ -7,6 +7,7 @@ type Remote = {
   html_url: string;
   body: string;
   title: string;
+  labels?: { name: string }[];
   head: { sha: string };
   merged: boolean;
 };
@@ -67,7 +68,12 @@ export function createGitHubTracker(
   return {
     async readTicket(id) {
       const r: Remote = await api(`issues/${id}`);
-      return { ...identity(r), title: r.title, body: r.body ?? "" };
+      return {
+        ...identity(r),
+        title: r.title,
+        body: r.body ?? "",
+        labels: (r.labels ?? []).map((l) => l.name),
+      };
     },
     async assign(id) {
       const user = JSON.parse(

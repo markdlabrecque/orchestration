@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import {
   BACKGROUND_CONTEXT as ctx,
   withAbortSignal,
 } from "@earendil-works/chord/context";
 import {
+  type ConversationId,
   type Cursor,
   configure,
   defineDoc,
@@ -19,6 +21,7 @@ import {
   createReadTool,
   createWriteTool,
 } from "@earendil-works/pi-durable/tools";
+import type { TSchema } from "typebox";
 import {
   type AgentResult,
   type Runner,
@@ -35,39 +38,55 @@ const Result = defineDoc<{ key: string; result: AgentResult | null }>({
   fork: "initial",
   initial: () => ({ key: "", result: null }),
 });
-const submit = defineTool({
-  name: "submit_result",
-  description: "Submit the final typed result and end this agent step.",
-  parameters: resultSchema,
-  replay: "safe",
-  execute: async (args, api, context) => {
-    await api.commit(async (tx) => {
-      (await tx.doc(Result, api.conversationId)).result = args;
-    }, context);
-    return {
-      output: [{ type: "text", text: args.summary }],
-      control: { terminate: true },
-    };
-  },
-});
+const makeSubmit = (schema: TSchema) =>
+  defineTool({
+    name: "submit_result",
+    description: "Submit the final typed result and end this agent step.",
+    parameters: schema,
+    replay: "safe",
+    execute: async (args, api, context) => {
+      await api.commit(async (tx) => {
+        (await tx.doc(Result, api.conversationId)).result = validateResult(
+          schema,
+          args,
+        );
+      }, context);
+      return {
+        output: [{ type: "text", text: validateResult(schema, args).summary }],
+        control: { terminate: true },
+      };
+    },
+  });
 const read = createReadTool(),
   write = createWriteTool(),
   edit = createEditTool(),
   bash = createBashTool();
-export const PiResults = defineExtension({
-  name: "orch.pi",
-  tools: [submit, read, write, edit, bash],
-});
+export function piResultExtension(schema: TSchema) {
+  return defineExtension({
+    name:
+      JSON.stringify(schema) === JSON.stringify(resultSchema)
+        ? "orch.pi"
+        : `orch.pi.${createHash("sha256").update(JSON.stringify(schema)).digest("hex").slice(0, 16)}`,
+    tools: [makeSubmit(schema), read, write, edit, bash],
+  });
+}
+export const PiResults = piResultExtension(resultSchema);
 
 export function createPiRunner(
   harness: Harness,
   owner: TaskId,
   key: string,
-  model: { provider: string; model: string },
+  selectModel:
+    | { provider: string; model: string }
+    | ((tier: string) => { provider: string; model: string }),
 ): Runner {
   return {
     resumable: true,
     async run(request) {
+      const model =
+        typeof selectModel === "function"
+          ? selectModel(request.model.tier)
+          : selectModel;
       const base: RunnerResult = {
         status: "failed",
         handoff: "",
@@ -82,14 +101,34 @@ export function createPiRunner(
       if (request.signal.aborted) return { ...base, status: "aborted" };
       if (request.tools.some((t) => !["read", "edit", "shell"].includes(t)))
         throw new Error("Pi: unsupported tool permission");
+      const extension = piResultExtension(request.resultSchema);
       const tools = [
-        submit,
+        makeSubmit(request.resultSchema),
         ...(request.tools.includes("read") ? [read] : []),
         ...(request.tools.includes("edit") ? [write, edit] : []),
         ...(request.tools.includes("shell") ? [bash] : []),
       ];
       const root = await harness.root(ctx);
       const id = await root.commit(async (tx) => {
+        if (request.session) {
+          const id = Number(request.session) as ConversationId;
+          if (!(await tx.conversation(id)))
+            throw new Error(`Pi: missing session ${request.session}`);
+          const doc = await tx.doc(Result, id);
+          if (doc.key !== key) {
+            doc.key = key;
+            doc.result = null;
+            await configure(tx, id, {
+              model: { provider: model.provider, modelId: model.model },
+              thinkingLevel: request.model.effort,
+              extensions: [extension],
+              tools,
+              cwd: request.cwd,
+              instructions: `${request.role}\nYou must finish by calling submit_result. Do not perform tracker writes.`,
+            });
+          }
+          return id;
+        }
         let cursor: Cursor | undefined;
         do {
           const page = await tx.scanConversations(
@@ -109,7 +148,7 @@ export function createPiRunner(
         await configure(tx, conversation.id, {
           model: { provider: model.provider, modelId: model.model },
           thinkingLevel: request.model.effort,
-          extensions: [PiResults],
+          extensions: [extension],
           tools,
           cwd: request.cwd,
           instructions: `${request.role}\nYou must finish by calling submit_result. Do not perform tracker writes.`,
@@ -168,6 +207,7 @@ export function createPiRunner(
           await conversation.abort(ctx).catch(() => {});
           return { ...base, status: "aborted" };
         }
+        if (timedOut) return { ...base, status: "timeout" };
         request.onEvent({ type: "status", data: String(error) });
         return base;
       } finally {

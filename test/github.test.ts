@@ -110,3 +110,25 @@ test("no required checks cannot authorize a merge", async () => {
     createGitHubTracker("a/b", "/tmp", execute).ci("4", "abc"),
   ).rejects.toThrow("No required CI");
 });
+
+test("ticket reads retain lane labels for engine selection", async () => {
+  const tracker = createGitHubTracker(
+    "owner/repo",
+    process.cwd(),
+    async () => ({
+      code: 0,
+      status: "done",
+      stderr: "",
+      stdout: JSON.stringify({
+        number: 141,
+        html_url: "ticket",
+        title: "change",
+        body: "",
+        labels: [{ name: "lane:trivial" }, { name: "other" }],
+      }),
+    }),
+  );
+  expect(await tracker.readTicket("141")).toMatchObject({
+    labels: ["lane:trivial", "other"],
+  });
+});

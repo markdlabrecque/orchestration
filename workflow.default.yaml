@@ -1,13 +1,76 @@
 version: 1
+settings:
+  tests: pnpm test
+  verification: local-tests
+  merge-approval: false
 runners:
   pi:
-    provider: openai
-    model: gpt-6-sol
+    models:
+      light: { provider: openai, model: gpt-6-luna }
+      standard: { provider: openai, model: gpt-6.1-sol }
+      heavy: { provider: openai, model: gpt-6-astra }
+      frontier: { provider: openai, model: gpt-6-astra }
   shell:
-    command: codex exec --sandbox workspace-write -
+    command: codex exec --model "$ORCH_MODEL" -c model_reasoning_effort="$ORCH_MODEL_EFFORT" --sandbox workspace-write -
+    models:
+      light: gpt-6-luna
+      standard: gpt-6.1-sol
+      heavy: gpt-6-astra
+      frontier: gpt-6-astra
 steps:
-  - { id: plan, kind: agent, runner: pi, role: slice-planner }
-  - { id: implement, kind: agent, runner: shell, role: slice-implementor }
+  - id: spec
+    kind: agent
+    runner: pi
+    options: { role: spec-writer }
+    model: { tier: standard, effort: high }
+    tools: [read, shell]
+  - id: tests
+    kind: agent
+    runner: pi
+    options: { role: test-writer }
+    model: { tier: standard, effort: high }
+    tools: [read, edit, shell]
+    when: lane == standard
+    gate: tests-red
+  - id: implement
+    kind: agent
+    runner: shell
+    options: { role: implementor }
+    model: { tier: standard, effort: high }
+    tools: [read, edit, shell]
+    when: lane == standard
+    gate: tests-green
+  - id: implement-without-tests
+    kind: agent
+    runner: shell
+    options: { role: implementor }
+    model: { tier: standard, effort: high }
+    tools: [read, edit, shell]
+    when: lane != standard
+  - id: review
+    kind: agent
+    runner: pi
+    options: { role: reviewer }
+    model: { tier: heavy, effort: high }
+    tools: [read, shell]
+    when: lane != trivial
+  - id: verify
+    kind: agent
+    runner: shell
+    options: { role: verifier, verification: $settings.verification }
+    model: { tier: standard, effort: high }
+    tools: [read, shell, web]
+    when: [lane == standard, settings.verification != local-tests]
+  - id: report
+    kind: agent
+    runner: pi
+    options: { role: reporter }
+    model: { tier: light, effort: low }
+    tools: [read]
   - { id: mr, kind: mr }
   - { id: ci, kind: ci }
-  - { id: merge, kind: merge }
+  - id: human
+    kind: human
+    options: { ask: "Merge the CI-passed commit?", choices: [approve, stop] }
+    when: settings.merge-approval == true
+  - { id: merge, kind: merge, gate: ci-green-on-head }

@@ -7,17 +7,28 @@ import { type Runner, type RunnerResult, validateResult } from "./types.ts";
 export function createShellRunner(
   command: string,
   execute: Exec = exec,
+  models?: Record<string, string>,
 ): Runner {
   return {
     resumable: false,
     async run(request) {
+      if (request.session)
+        throw new Error("Shell runner does not support sessions");
+      if (
+        request.tools.some(
+          (tool) => !/^(read|edit|shell|web|mcp:[\w-]+)$/.test(tool),
+        )
+      )
+        throw new Error("Shell: unsupported tool permission");
+      const model = models ? models[request.model.tier] : command;
+      if (!model) throw new Error("Shell: missing model tier mapping");
       const base: RunnerResult = {
         status: "failed",
         handoff: "",
         artifacts: [],
         ranOn: {
           provider: "shell",
-          model: command,
+          model,
           effort: request.model.effort,
         },
         usage: null,
@@ -39,6 +50,7 @@ export function createShellRunner(
             ORCH_RESULT_FILE: resultFile,
             ORCH_RESULT_SCHEMA: JSON.stringify(request.resultSchema),
             ORCH_TOOLS: JSON.stringify(request.tools),
+            ORCH_MODEL: model,
             ORCH_MODEL_TIER: request.model.tier,
             ORCH_MODEL_EFFORT: request.model.effort,
           },

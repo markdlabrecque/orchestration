@@ -1,5 +1,9 @@
 export type Identity = { id: string; url: string };
-export type Ticket = Identity & { title: string; body: string };
+export type Ticket = Identity & {
+  title: string;
+  body: string;
+  labels?: string[];
+};
 export type PullRequest = Identity & { head: string; merged: boolean };
 export interface Tracker {
   readTicket(ticket: string): Promise<Ticket>;

@@ -85,6 +85,24 @@ test("Pi runs an owned conversation and requires a schema-backed submission", as
         },
       },
     });
+    await expect(
+      createPiRunner(harness, id, "lost-session", {
+        provider: "faux",
+        model: "fixture",
+      }).run({
+        session: "999999",
+        prompt: "continue",
+        role: "planner",
+        cwd: process.cwd(),
+        model: { tier: "standard", effort: "medium" },
+        tools: ["read"],
+        timeoutMs: 1000,
+        resultSchema,
+        signal: new AbortController().signal,
+        onEvent: () => {},
+      }),
+    ).rejects.toThrow(/missing session/);
+    expect(faux.state.callCount).toBe(1);
     faux.setResponses([fauxAssistantMessage("I forgot the tool")]);
     const missing = await root.commit(
       (tx) => tx.createTask(Task, {}, { ownership: { kind: "conversation" } }),

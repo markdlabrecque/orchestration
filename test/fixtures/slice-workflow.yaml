@@ -1,0 +1,13 @@
+version: 1
+runners:
+  pi:
+    provider: openai
+    model: gpt-6-sol
+  shell:
+    command: codex exec --sandbox workspace-write -
+steps:
+  - { id: plan, kind: agent, runner: pi, role: slice-planner }
+  - { id: implement, kind: agent, runner: shell, role: slice-implementor }
+  - { id: mr, kind: mr }
+  - { id: ci, kind: ci }
+  - { id: merge, kind: merge }

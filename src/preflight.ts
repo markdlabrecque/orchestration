@@ -4,6 +4,7 @@ import type { Models } from "@earendil-works/pi-ai/models";
 import { checked, type Exec, exec } from "./command.ts";
 import type { Project } from "./engine.ts";
 import { createRegistrations, type Registrations } from "./registration.ts";
+import { piModel, tiers } from "./runners/model.ts";
 import {
   matchesWhen,
   type Step,
@@ -76,16 +77,42 @@ export async function preflight(options: {
   }
   for (const name of runners) {
     const config = workflow.runners[name];
-    if (name === "pi") {
-      if (
-        typeof config?.provider !== "string" ||
-        typeof config.model !== "string" ||
-        !models.getModel(config.provider, config.model)
+    const usedTiers = new Set(
+      steps
+        .filter((s) => s.runner === name)
+        .flatMap((s) =>
+          (s.options?.role ?? s.role) === "implementor"
+            ? tiers
+            : [s.model?.tier ?? "standard"],
+        ),
+    );
+    if (
+      steps.some((s) =>
+        registrations.kinds.get(s.kind)?.runners?.includes(name),
       )
-        throw new Error("runners.pi: configured Pi model is unavailable");
+    )
+      for (const tier of tiers) usedTiers.add(tier);
+    if (name === "pi") {
+      for (const tier of usedTiers) {
+        const model = piModel(config, tier);
+        if (!models.getModel(model.provider, model.model))
+          throw new Error("runners.pi: configured Pi model is unavailable");
+      }
     } else if (name === "shell") {
       if (typeof config?.command !== "string" || !config.command.trim())
         throw new Error("runners.shell: missing command");
+      if (config.models !== undefined) {
+        const mappings = config.models;
+        if (
+          !mappings ||
+          typeof mappings !== "object" ||
+          Array.isArray(mappings)
+        )
+          throw new Error("runners.shell: invalid model tier mappings");
+        for (const tier of usedTiers)
+          if (typeof mappings[tier] !== "string" || !mappings[tier].trim())
+            throw new Error(`runners.shell: missing model tier ${tier}`);
+      }
       await checked(execute, {
         cwd: project.main,
         argv: ["bash", "-n", "-c", config.command],

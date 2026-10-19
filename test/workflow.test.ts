@@ -323,3 +323,32 @@ test("uses loads an import-only npm package from the declaring file's node_modul
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test.each([
+  {
+    id: "verify",
+    kind: "agent",
+    runner: "shell",
+    options: { role: "verifier", verification: "production" },
+  },
+  {
+    id: "approval",
+    kind: "human",
+    options: { ask: "Approve?", choices: ["yes", "yes"] },
+  },
+  {
+    id: "approval",
+    kind: "human",
+    options: { ask: "Approve?", choices: ["yes", "pass"] },
+  },
+])("rejects invalid verification modes and ambiguous human choices", (step) => {
+  expect(() =>
+    resolveWorkflow(
+      JSON.stringify({
+        version: 1,
+        runners: { shell: { command: "cat" } },
+        steps: [step],
+      }),
+    ),
+  ).toThrow();
+});

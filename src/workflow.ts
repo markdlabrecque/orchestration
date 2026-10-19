@@ -411,6 +411,15 @@ export function validateWorkflow(
         if (typeof role !== "string" || !/^[a-z][a-z0-9-]*$/.test(role))
           throw new Error("missing or invalid role");
         if (
+          role === "verifier" &&
+          !["local-tests", "ddev", "docker"].includes(
+            String(step.options?.verification),
+          )
+        )
+          throw new Error(
+            "verifier needs options.verification: local-tests, ddev or docker",
+          );
+        if (
           step.role !== undefined &&
           step.options?.role !== undefined &&
           step.role !== step.options.role
@@ -475,7 +484,9 @@ export function validateWorkflow(
         (typeof step.options?.ask !== "string" ||
           !Array.isArray(step.options.choices) ||
           step.options.choices.length < 1 ||
-          step.options.choices.some((c) => typeof c !== "string" || !c))
+          step.options.choices.some((c) => typeof c !== "string" || !c) ||
+          new Set(step.options.choices).size !== step.options.choices.length ||
+          step.options.choices.slice(1).includes("pass"))
       )
         throw new Error("human needs options.ask and choices");
       if (

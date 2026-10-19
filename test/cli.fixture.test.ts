@@ -18,9 +18,14 @@ import { expect, test } from "vitest";
 import { stringify } from "yaml";
 import { runCli } from "../src/cli.ts";
 import { checked, type Exec, exec } from "../src/command.ts";
-import { resolveWorkflow } from "../src/workflow.ts";
+import { type JsonValue, resolveWorkflow } from "../src/workflow.ts";
 
-test("[fixture] CLI to real worktree, durable Pi, shell, GitHub adapter, CI, merge and retirement", async () => {
+test.each([
+  "slice",
+  "standard",
+  "trivial",
+  "no-code",
+])("[fixture] %s CLI to real worktree, durable Pi, shell, GitHub adapter, CI, merge and retirement", async (lane) => {
   const dir = await mkdtemp(join(tmpdir(), "orch-e2e-"));
   const projects = join(dir, "Projects"),
     root = join(projects, "fixture"),
@@ -62,11 +67,18 @@ test("[fixture] CLI to real worktree, durable Pi, shell, GitHub adapter, CI, mer
     );
     const workflow = resolveWorkflow(
       await readFile(
-        new URL("../workflow.default.yaml", import.meta.url),
+        new URL(
+          lane === "slice"
+            ? "./fixtures/slice-workflow.yaml"
+            : "../workflow.default.yaml",
+          import.meta.url,
+        ),
         "utf8",
       ),
     );
     workflow.runners.pi = { provider: "faux", model: "fixture" };
+    workflow.runners.shell = { command: "" };
+    workflow.settings.tests = `if test -f change.txt && test "$(cat change.txt)" = implemented; then exit 0; else printf '%s' '{"passed":0,"failures":[{"test":"writes change.txt","message":"expected implemented","kind":"assertion"}],"errors":[]}' > "$ORCH_TEST_REPORT_FILE"; exit 1; fi`;
     workflow.runners.shell.command = `printf implemented > change.txt; printf '{"outcome":"pass","summary":"implementation complete"}' > "$ORCH_RESULT_FILE"; printf handoff`;
     // Both workflow layers load a module relative to their own file.
     const registrationsUrl = new URL("../src/registration.ts", import.meta.url)
@@ -103,7 +115,7 @@ uses: ['./custom-runner.mjs']
 settings: {record: 'printf registered > custom.txt'}
 runners: {custom: {message: 'custom runner handoff'}}
 patch:
-  - insert_before: plan
+  - insert_before: ${lane === "slice" ? "plan" : "spec"}
     step: {id: custom-agent, kind: agent, runner: custom, tools: [read], options: {role: slice-planner}}
   - insert_after: implement
     step: {id: record, kind: record, options: {command: '$settings.record'}}
@@ -120,12 +132,42 @@ patch:
     const models = createModels(),
       faux = fauxProvider({ models: [{ id: "fixture" }] });
     models.setProvider(faux.provider);
-    faux.setResponses([
-      fauxAssistantMessage(
-        fauxToolCall("submit_result", { outcome: "pass", summary: "plan" }),
-        { stopReason: "toolUse" },
+    const results: Record<string, JsonValue>[] =
+      lane === "slice"
+        ? [{ outcome: "pass", summary: "plan" }]
+        : [
+            {
+              outcome: "pass",
+              summary: "spec",
+              lane: "standard",
+              implementationTier: "heavy",
+            },
+            ...(lane === "standard"
+              ? [
+                  {
+                    outcome: "pass",
+                    summary: "red",
+                    expectedFailures: [
+                      {
+                        test: "writes change.txt",
+                        message: "expected implemented",
+                      },
+                    ],
+                  },
+                ]
+              : []),
+            ...(lane !== "trivial"
+              ? [{ outcome: "pass", summary: "review", findings: [] }]
+              : []),
+            { outcome: "pass", summary: "report" },
+          ];
+    faux.setResponses(
+      results.map((result) =>
+        fauxAssistantMessage(fauxToolCall("submit_result", result), {
+          stopReason: "toolUse",
+        }),
       ),
-    ]);
+    );
     let merged = false,
       head = "",
       comment: unknown = null,
@@ -147,6 +189,7 @@ patch:
           title: "Change the fixture",
           body: "Implement change.txt",
           html_url: "ticket",
+          labels: lane === "slice" ? [] : [{ name: `lane:${lane}` }],
         };
       else if (path?.includes("/comments")) {
         if (args.includes("POST")) {
