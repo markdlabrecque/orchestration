@@ -24,6 +24,10 @@ _Avoid_: orchestration tool, harness, platform, backend, adapter
 The job a model does in an agent step, given by one of the stage prompts: spec-writer, test-writer, implementor, reviewer, verifier, reporter.
 _Avoid_: agent, persona, runner
 
+**Model tier**:
+A named level used to select a model: light, standard, heavy or frontier. A tier can correspond to different models for different runners.
+_Avoid_: model family, model name
+
 **Brief**:
 The finished prompt an agent step hands its runner: the ticket, the role prompt and the handoffs so far.
 _Avoid_: task, context, instructions
