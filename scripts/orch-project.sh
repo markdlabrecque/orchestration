@@ -74,7 +74,12 @@ orch_get() {
   if [ -n "$val" ]; then
     printf '%s' "$val"
   else
-    orch_read "$root" "$key"
+    val="$(orch_read "$root" "$key")"
+    if [ -z "$val" ] && [ "$key" = BASE_BRANCH ]; then
+      val="$(git -C "$root" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+      val="${val#origin/}"
+    fi
+    printf '%s' "$val"
   fi
 }
 
@@ -115,6 +120,26 @@ orch_find_main_checkout() {
   (cd "$found" && pwd -P)
 }
 
+# _orch_resolve_inplace <dir> -- no .orch: use the git checkout containing
+# <dir> as-is. Worktrees default to a sibling <checkout>-worktrees, state lives
+# in <git-common-dir>/orch, and BASE_BRANCH falls back to origin/HEAD.
+_orch_resolve_inplace() {
+  local common main wt name
+  common="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || {
+    echo "orch: $1 is not inside a git checkout and has no .orch." >&2
+    return 1
+  }
+  main="$(cd "$(dirname "$common")" && pwd -P)"
+  name="$(orch_sanitize "${_ORCH_ENV_PROJECT_NAME:-$(basename "$main")}")"
+  wt="${_ORCH_ENV_WORKTREE_ROOT:-$main-worktrees}"
+  [ -z "${_ORCH_ENV_MAIN_CHECKOUT-}" ] || main="$_ORCH_ENV_MAIN_CHECKOUT"
+  ORCH_ROOT="$main"
+  ORCH_STATE="$common/orch"
+  PROJECT_NAME="$name"
+  WORKTREE_ROOT="$wt"
+  MAIN_CHECKOUT="$main"
+}
+
 # orch_resolve [dir] -- for the engines. Needs <root>/.orch. Sets:
 #   ORCH_ROOT       project root (real path)
 #   PROJECT_NAME    sanitized; default the project root's folder name
@@ -127,12 +152,13 @@ orch_resolve() {
   if ! root="$(orch_project_root "$start" 2>/dev/null)"; then
     common="$(git -C "$start" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" &&
       root="$(orch_project_root "$(dirname "$common")" 2>/dev/null)" ||
-      { orch_project_root "$start" >/dev/null; return 1; }
+      root=""
   fi
-  if [ ! -f "$root/.orch" ]; then
-    echo "orch: $root/.orch not found. Run the orchestration:setup-project skill first." >&2
-    return 1
+  if [ -z "$root" ] || [ ! -f "$root/.orch" ]; then
+    _orch_resolve_inplace "$start"
+    return
   fi
+  ORCH_STATE="$root/.agents/orchestration"
   raw="$(orch_get "$root" PROJECT_NAME)"
   raw="$(orch_sanitize "${raw:-$(basename "$root")}")"
   if [ -z "$raw" ]; then

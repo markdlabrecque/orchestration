@@ -29,7 +29,7 @@ test.each([
     "git@git.affinitybridge.com:team/sub/repo",
     "git.affinitybridge.com",
     "team/sub/repo",
-    undefined,
+    "gitlab",
   ],
   [
     "https://github.enterprise.test/team/repo",

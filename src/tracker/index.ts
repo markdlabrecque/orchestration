@@ -22,11 +22,12 @@ export function repositoryFromOrigin(origin: string): Repository {
     repo.split("/").some((p) => p === "." || p === "..")
   )
     throw new Error("Unsupported repository origin");
-  const forge = /(^|\.)github\./.test(host)
-    ? "github"
-    : /(^|\.)gitlab\./.test(host)
-      ? "gitlab"
-      : undefined;
+  const forge =
+    /(^|\.)github\./.test(host)
+      ? "github"
+      : /(^|\.)gitlab\./.test(host) || host === "git.affinitybridge.com"
+        ? "gitlab"
+        : undefined;
   return { host, repo, forge };
 }
 
