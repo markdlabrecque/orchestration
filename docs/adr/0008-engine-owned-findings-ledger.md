@@ -31,5 +31,5 @@ At the repair budget cap, the terminal offers grant another repair, defer select
 
 - Finding statuses are open, fixed, withdrawn or deferred. A disagreement is a repair response, not a status that clears a must-fix. Follow-up filing remains separately visible as pending or linked.
 - The ledger retains the detecting step, finding details, repair responses, reviewer decisions, and any deferral reason and follow-up link. This supplies the scoped re-check and the open-findings list when parking a run.
-- Follow-up filing is required, but which component performs tracker operations remains the map's separate tracker-work question.
+- ADR 0010 settles tracker-operation ownership, immediate follow-up filing, and recovery after an interrupted filing.
 - This document concerns findings only. Runner session handles and crash counts remain run state, not finding records.
