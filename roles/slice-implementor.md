@@ -1,0 +1,2 @@
+Implement the ticket in this worktree. Follow repository instructions and use the preceding plan. Add meaningful tests and run the applicable suite. Preserve others' changes. Do not push, create PRs, merge, write to trackers, or retire the worktree; the engine owns those operations.
+Write JSON to ORCH_RESULT_FILE with exactly {"outcome":"pass" or "failed","summary":"what changed and test evidence"}. Only pass when the requested change and tests are complete. Print the handoff on stdout. ORCH_RESULT_SCHEMA contains the schema. ORCH_ROLE_FILE contains this role text.

@@ -140,25 +140,30 @@ def run(action, main, tid, expected, force=False):
     if os.path.lexists(path) or any(os.path.realpath(r['worktree']) == path for r in remaining):
         raise RuntimeError('worktree removal did not remove %s' % path)
     if branch and git(main, 'show-ref', '--verify', '--quiet', branch, absent=True) is not None:
-        # Git's ref lock does not exclude a new worktree HEAD claim. Even an
-        # expected-old delete can orphan that checkout. Retain the obligation;
-        # no automated deletion, including with the manual checkout force flag.
-        record['manual_branch'] = True
-        save(journal, record)
-        raise RuntimeError(
-            'MANUAL branch cleanup pending during retirement: main %s, path %s, branch %s. '
-            'Inspect saved identity %s (HEAD %s) and preserve any new commits. '
-            'During controlled quiescence, stop all repository writers, inspect `%s`, '
-            'and ensure no other worktree owns this branch before manually running `%s`. '
-            'Keep the recovery record; resume writers only after removal, then rerun '
-            '%s or retire-worktree.sh %s. '
-            'Absence must be verified before retrying can complete.'
-            % (main, path, branch, journal, record['head'],
-               shlex.join(['git', '-C', main, 'worktree', 'list', '--porcelain']),
-               shlex.join(['git', '-C', main, 'branch', '-d', '--',
-                           branch.removeprefix('refs/heads/')]),
-               shlex.join(['orch', 'reconcile', '--project',
-                           os.environ.get('ORCH_RETIRE_PROJECT', os.path.dirname(main))]), tid))
+        if os.environ.get('ORCH_RETIRE_KEEP_BRANCH') == '1':
+            # v2 retires the checkout while retaining the branch and its identity.
+            # This mode never deletes a ref or claims branch cleanup happened.
+            record['retained_branch'] = branch
+        else:
+            # Git's ref lock does not exclude a new worktree HEAD claim. Even an
+            # expected-old delete can orphan that checkout. Retain the obligation;
+            # no automated deletion, including with the manual checkout force flag.
+            record['manual_branch'] = True
+            save(journal, record)
+            raise RuntimeError(
+                'MANUAL branch cleanup pending during retirement: main %s, path %s, branch %s. '
+                'Inspect saved identity %s (HEAD %s) and preserve any new commits. '
+                'During controlled quiescence, stop all repository writers, inspect `%s`, '
+                'and ensure no other worktree owns this branch before manually running `%s`. '
+                'Keep the recovery record; resume writers only after removal, then rerun '
+                '%s or retire-worktree.sh %s. '
+                'Absence must be verified before retrying can complete.'
+                % (main, path, branch, journal, record['head'],
+                   shlex.join(['git', '-C', main, 'worktree', 'list', '--porcelain']),
+                   shlex.join(['git', '-C', main, 'branch', '-d', '--',
+                               branch.removeprefix('refs/heads/')]),
+                   shlex.join(['orch', 'reconcile', '--project',
+                               os.environ.get('ORCH_RETIRE_PROJECT', os.path.dirname(main))]), tid))
     record.pop('manual_branch', None)
     record['stage'] = 'complete'
     save(journal, record)
