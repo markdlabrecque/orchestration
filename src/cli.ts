@@ -15,7 +15,7 @@ import {
   prepareRunDirectory,
 } from "./project.ts";
 import type { RunnerEvent } from "./runners/types.ts";
-import { createGitHubTracker } from "./tracker/github.ts";
+import { createTracker, selectForge } from "./tracker/index.ts";
 import { loadWorkflow } from "./workflow.ts";
 
 export type CliOptions = {
@@ -100,6 +100,7 @@ export async function runCli(
     readFile(join(packageRoot, "roles", `${name}.md`), "utf8");
   if (argv[0] === "validate") {
     const { workflow, registrations } = await load();
+    project.forge = selectForge(project, workflow.settings.forge);
     await preflight({
       workflow,
       registrations,
@@ -138,19 +139,15 @@ export async function runCli(
           control && saved
             ? { workflow: saved, registrations: undefined }
             : await load();
-        if ((loaded.workflow.settings.forge ?? project.forge) === "gitlab")
-          throw new Error(
-            "GitLab execution requires the GitLab tracker implementation",
-          );
+        project.forge = selectForge(project, loaded.workflow.settings.forge);
         return {
           ...loaded,
-          tracker: createGitHubTracker(project.repo, cwd, execute),
+          tracker: createTracker(project, project.main, execute),
         };
       },
       execute,
       project,
       models,
-      tracker: createGitHubTracker(project.repo, cwd, execute),
       storage: await openNodeSqliteStorage(file),
       signal,
       role,

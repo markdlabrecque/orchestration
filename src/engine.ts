@@ -42,6 +42,7 @@ import { matchesWhen, type Workflow } from "./workflow.ts";
 export type Project = {
   root: string;
   repo: string;
+  host?: string;
   forge?: "github" | "gitlab";
   main: string;
   base: string;
@@ -166,10 +167,16 @@ export type RunOptions = {
   };
 };
 
+type DeferredRunOptions = Omit<RunOptions, "tracker" | "prepare"> & {
+  tracker?: never;
+  prepare: NonNullable<RunOptions["prepare"]>;
+};
+
 // Pi Durable documents and tasks are the only authoritative run state.
-export async function runWorkflow(options: RunOptions): Promise<RunState> {
+export async function runWorkflow(
+  options: RunOptions | DeferredRunOptions,
+): Promise<RunState> {
   const { project } = options;
-  let tracker = options.tracker;
   let registrations = options.registrations ?? createRegistrations();
   let checkedWorkflow = JSON.stringify(options.workflow);
   let harness: Harness;
@@ -213,6 +220,8 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
     initial: () => ({ phase: "execute", revision: 0 }),
     phases: {
       execute: async (task, runtime, context) => {
+        const tracker = options.tracker;
+        if (!tracker) throw new Error("Missing tracker for workflow execution");
         const state = await runtime.snapshot(Run, context);
         if (!state?.workflow) throw new Error("Missing durable workflow");
         const ledger = (await runtime.snapshot(Findings, context)) ?? {
@@ -1096,7 +1105,6 @@ export async function runWorkflow(options: RunOptions): Promise<RunState> {
           Boolean(existing?.control) || options.command === "abort",
         )),
       };
-      tracker = options.tracker;
       registrations = options.registrations ?? createRegistrations();
       checkedWorkflow = JSON.stringify(options.workflow);
     }

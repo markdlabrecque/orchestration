@@ -19,13 +19,21 @@ import { stringify } from "yaml";
 import { runCli } from "../src/cli.ts";
 import { checked, type Exec, exec } from "../src/command.ts";
 import { type JsonValue, resolveWorkflow } from "../src/workflow.ts";
+import { fakeForge } from "./fixtures/forge.ts";
 
 test.each([
   "slice",
+  "gitlab",
+  "gitlab-override",
   "standard",
   "trivial",
   "no-code",
-])("[fixture] %s CLI to real worktree, durable Pi, shell, GitHub adapter, CI, merge and retirement", async (lane) => {
+])("[fixture] %s CLI to real worktree, durable Pi, shell, tracker, CI, merge and retirement", async (scenario) => {
+  const gitlab = scenario.startsWith("gitlab");
+  const lane = gitlab ? "slice" : scenario;
+  const origin = gitlab
+    ? `https://${scenario === "gitlab" ? "gitlab.example.test" : "code.example.test"}/fixture/sub/repo.git`
+    : "https://github.com/fixture/repo.git";
   const dir = await mkdtemp(join(tmpdir(), "orch-e2e-"));
   const projects = join(dir, "Projects"),
     root = join(projects, "fixture"),
@@ -49,17 +57,8 @@ test.each([
     await writeFile(join(main, "README.md"), "fixture");
     await git(["add", "."]);
     await git(["commit", "-m", "fixture"]);
-    await git([
-      "remote",
-      "add",
-      "origin",
-      "https://github.com/fixture/repo.git",
-    ]);
-    await git([
-      "config",
-      `url.${bare}.insteadOf`,
-      "https://github.com/fixture/repo.git",
-    ]);
+    await git(["remote", "add", "origin", origin]);
+    await git(["config", `url.${bare}.insteadOf`, origin]);
     await git(["push", "-u", "origin", "main"]);
     await writeFile(
       join(root, ".orch"),
@@ -114,7 +113,7 @@ test.each([
       join(main, ".orchestration/workflow.yaml"),
       `version: 1
 uses: ['./custom-runner.mjs']
-settings: {record: 'printf registered > custom.txt'}
+settings: {${scenario === "gitlab-override" ? "forge: gitlab," : ""} record: 'printf registered > custom.txt'}
 runners: {custom: {message: 'custom runner handoff'}}
 patch:
   - insert_before: ${lane === "slice" ? "plan" : "spec"}
@@ -175,7 +174,34 @@ patch:
       comment: unknown = null,
       pr: unknown = null;
     const merges: string[] = [];
+    const gitlabFake = fakeForge("gitlab");
     const execute: Exec = async (request) => {
+      if (request.argv[0] === "glab") {
+        if (request.argv[1] === "--version")
+          return {
+            status: "done",
+            code: 0,
+            stdout: "glab fixture",
+            stderr: "",
+          };
+        const path = request.argv[2];
+        if (path?.endsWith("/merge_requests") && request.argv.includes("POST"))
+          gitlabFake.state.head = await git(["rev-parse", "139"]);
+        const result = await gitlabFake.execute({
+          ...request,
+          argv: request.argv.map((arg) =>
+            arg
+              .replace(
+                "projects/fixture%2Fsub%2Frepo/",
+                "projects/team%2Frepo/",
+              )
+              .replace("issues/139", "issues/3"),
+          ),
+        });
+        if (path?.endsWith("/merge")) merges.push(gitlabFake.state.head);
+        return result;
+      }
+
       if (request.argv[0] !== "gh")
         return exec({ ...request, env: { ...env, ...request.env } });
       const args = request.argv,

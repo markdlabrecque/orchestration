@@ -86,3 +86,8 @@ output and final-state behavior after removal of the workflow file. Execution
 tests cover four clean pauses without crash charges, retirement failure and
 retry, and refusal to abort a confirmed merge. No tests were retired or
 weakened. No live forge writes or production access were used.
+
+Final integration validation: `pnpm check` passed type checking, Biome,
+178 TypeScript tests, 412 bash assertions and 15 Python tests after merging
+integration tip `30408b0`. The GitLab factory, forge overrides and tracker tests
+remain intact. The original implementation base was `17c1e02`.
