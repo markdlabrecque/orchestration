@@ -88,6 +88,18 @@ _Avoid_: fix step, bounce step, retry
 A named count of how many times repairs may be taken in one run. Spent when a repair edge is taken; never refilled except by a grant.
 _Avoid_: cap, limit, retries
 
+**Finding**:
+A problem raised by a detecting step, with an identity that stays the same through repair and re-check. A must-fix blocks progress until the reviewer confirms it fixed or withdraws it, or a person defers it.
+
+**Findings ledger**:
+The shared record of a run's findings, which step raised each one, and how each was resolved.
+
+**Follow-up**:
+Work recorded for a later ticket rather than a repair in the current run. It remains pending until a linked tracker ticket exists.
+
+**Deferral**:
+A person's decision to move a must-fix into a linked follow-up ticket, with a recorded reason.
+
 **Grant**:
 A person's answer at a spent budget that adds one more slot.
 _Avoid_: exception, extra repair, override
