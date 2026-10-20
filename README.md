@@ -90,8 +90,10 @@ pnpm check
 pnpm exec vitest run test/cli.fixture.test.ts test/install.test.ts
 ```
 
-`pnpm check` runs TypeScript, Biome, Vitest, retained Bash suites and Python
-project-safety tests. Fixtures use real local Git worktrees, SQLite and runner
+`pnpm check` is the cheap per-branch tier: TypeScript, Biome and Vitest.
+`pnpm check:release` adds the retained Bash suites and Python project-safety
+tests; run it before a release. Orchestration only builds the integration
+branch, so the release tier is run by the human or release CI. Fixtures use real local Git worktrees, SQLite and runner
 adapters with fake model and forge boundaries. The installation fixture uses
 an isolated HOME and pnpm global directory, tests install/update/version and
 runs the installed executable through a standard workflow. It never changes

@@ -18,3 +18,4 @@ git -c 'credential.helper=!gh auth git-credential' push https://github.com/markd
 
 - Run Biome as `node_modules/.bin/biome check .`. `pnpm exec biome` hides real diagnostics behind a misleading "possibly out of memory" message.
 - Run `pnpm exec tsc --noEmit` and `pnpm exec vitest run` before pushing.
+- Per branch, `pnpm check` (tsc, Biome, Vitest) is enough. Run `pnpm check:release` only before a release; it adds the Bash and Python suites.

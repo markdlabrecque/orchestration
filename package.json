@@ -15,7 +15,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "test:bash": "bash scripts/worktree/create-worktree/tests/run-all.sh",
-    "check": "pnpm typecheck && pnpm lint && pnpm test && pnpm test:bash && pnpm test:worktree",
+    "check": "pnpm typecheck && pnpm lint && pnpm test",
+    "check:release": "pnpm check && pnpm test:bash && pnpm test:worktree",
     "test:worktree": "python3 -m unittest discover -s test/worktree -p \"test_*.py\""
   },
   "dependencies": {
