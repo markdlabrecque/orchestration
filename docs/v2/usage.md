@@ -31,6 +31,24 @@ every successful install or update. Edit the bundled source to change the skill.
 No Claude Code configuration is changed. Run `/reload` in Pi to discover the
 skill, then use `/skill:orch <ticket>`.
 
+## Control requests
+
+`orch control --json` reads one JSON request from stdin and prints one response
+with contract `orch.control/1`. It needs no project or state directory.
+
+```sh
+printf '%s\n' '{"contract":"orch.control/1","requestId":"example","op":"capabilities"}' | orch control --json
+```
+
+Requests require a non-empty string `requestId` and `op`. Optional `params` must
+be an object. Only `capabilities` is implemented; other operations return
+`unsupported-op`. Invalid requests and unsupported contract versions also return
+rejected envelopes. Every envelope has `receipt: null` and `snapshot: null`.
+Printing an envelope exits zero, including rejections; a stdin read failure throws.
+
+`--json` is accepted before or after any command. It does not change the existing
+text output of commands such as `show` and `tail`.
+
 ## Two workflow files
 
 The global file is `${XDG_CONFIG_HOME:-$HOME/.config}/orchestration/workflow.yaml`.
