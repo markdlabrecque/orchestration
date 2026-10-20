@@ -6,7 +6,7 @@ import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CONTRACT, capabilitiesResponse } from "./capabilities.ts";
 import { checked, type Exec, exec } from "./command.ts";
-import { controlResponse } from "./control.ts";
+import { type ControlDeps, controlResponse } from "./control.ts";
 import { runWorkflow } from "./engine.ts";
 import { explainHtml, explainText } from "./explain.ts";
 import { observeRun, showRun, tailRun } from "./observability.ts";
@@ -17,6 +17,7 @@ import {
   prepareRunDirectory,
 } from "./project.ts";
 import { openReceipts } from "./receipts.ts";
+import { launchRun, pauseRun } from "./run-control.ts";
 import type { RunnerEvent } from "./runners/types.ts";
 import { publishOwner, snapshotResponse } from "./snapshot.ts";
 import { createTracker, selectForge } from "./tracker/index.ts";
@@ -31,6 +32,7 @@ export type CliOptions = {
   workflowPath?: string;
   // Overrides the run storage directory; discovery is used when absent.
   runsDir?: string;
+  controlDeps?: ControlDeps;
   signal?: AbortSignal;
   output?: (text: string) => void;
   onEvent?: (event: RunnerEvent) => void;
@@ -85,7 +87,15 @@ export async function runCli(
         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       stdin = Buffer.concat(chunks).toString("utf8");
     }
-    output(JSON.stringify(controlResponse(stdin)));
+    const deps: ControlDeps = options.controlDeps ?? {
+      project: async (ticket) => {
+        const found = await discoverProject(cwd, ticket, execute);
+        return options.runsDir ? { ...found, runs: options.runsDir } : found;
+      },
+      launch: launchRun,
+      pause: pauseRun,
+    };
+    output(JSON.stringify(await controlResponse(stdin, deps)));
     return 0;
   }
   if (argv[0] === "request") {

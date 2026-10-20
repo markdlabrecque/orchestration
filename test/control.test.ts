@@ -106,13 +106,9 @@ for (const stdin of [
 
 for (const op of [
   "unknown-operation",
-  "start",
-  "resume",
-  "snapshot",
   "events",
   "request",
   "answer",
-  "pause",
   "abort",
   "retire",
 ]) {
