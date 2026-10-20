@@ -139,7 +139,11 @@ prints prose cannot satisfy the role contract. Missing or invalid JSON blocks.
 
 ## Test commands and reporters
 
-Set `settings.tests` to the project's full suite command. The shipped `pnpm test`
+Set `settings.tests` to the project's per-branch suite command. It runs for
+gates and repair loops, and defaults to the full unit suite. Override it per
+project (for example a narrower command) if it becomes slow. Wider, expensive
+checks (release suites, site verification) belong in release CI, outside the
+orchestration workflow, which stops at the integration branch. The shipped `pnpm test`
 is a starting value, not a universal test adapter. Standard-lane `tests-red`
 requires exit 1 and a fresh JSON report written to `ORCH_TEST_REPORT_FILE` from
 actual framework results. Each assertion's test name and message must exactly
@@ -148,8 +152,8 @@ and setup failures belong in `errors`, never in assertion failures. Do not write
 a static report or infer assertion success from a nonzero process exit.
 
 The test-writer must configure a framework reporter or wrapper when the project
-does not already have one. This repository uses `pnpm check` for all required
-suites; its test-writer must add the appropriate framework reporter for any
+does not already have one. This repository uses `pnpm check` (the cheap tier; `pnpm check:release` is
+run before releases); its test-writer must add the appropriate framework reporter for any
 standard-lane red tests. Type/lint/shell setup failures must still block red.
 `tests-green` reruns the full command and requires exit zero. Reporter JSON and
 role result JSON are separate contracts. See the
