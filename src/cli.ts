@@ -150,7 +150,7 @@ export async function runCli(
   if (!options.signal) {
     process.once("SIGINT", pause);
     process.once("SIGHUP", pause);
-      process.once("SIGTERM", pause);
+    process.once("SIGTERM", pause);
   }
   try {
     const observer = observeRun(project, output, options.onEvent);
