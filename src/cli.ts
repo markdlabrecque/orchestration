@@ -37,7 +37,7 @@ export async function runCli(
     execute = options.execute ?? exec;
   if (argv.length === 0 || argv[0] === "--help") {
     output(
-      "Usage: orch run <ticket> [--retry] | orch show <ticket> | orch tail <ticket> | orch abort <ticket> | orch retire <ticket> | orch validate | orch explain [--simple] | orch workflow diff/reset [--force] | orch --version\nOne terminal per ticket. Ctrl-C or SIGHUP pauses; run the same command to resume. Stop the run before abort or retire; these commands do not check liveness.",
+      "Usage: orch run <ticket> [--retry] | orch show <ticket> | orch tail <ticket> | orch abort <ticket> | orch retire <ticket> | orch validate | orch explain [--simple] | orch workflow diff/reset [--force] | orch --version\nOne terminal per ticket. Ctrl-C, SIGHUP or SIGTERM pauses; run the same command to resume. Stop the run before abort or retire; these commands do not check liveness.",
     );
     return 0;
   }
@@ -105,12 +105,14 @@ export async function runCli(
     if (!options.signal) {
       process.once("SIGINT", stop);
       process.once("SIGHUP", stop);
+      process.once("SIGTERM", stop);
     }
     try {
       await tailRun(project, output, options.signal ?? controller.signal);
     } finally {
       process.removeListener("SIGINT", stop);
       process.removeListener("SIGHUP", stop);
+      process.removeListener("SIGTERM", stop);
     }
     return 0;
   }
@@ -148,6 +150,7 @@ export async function runCli(
   if (!options.signal) {
     process.once("SIGINT", pause);
     process.once("SIGHUP", pause);
+      process.once("SIGTERM", pause);
   }
   try {
     const observer = observeRun(project, output, options.onEvent);
@@ -194,6 +197,7 @@ export async function runCli(
     if (!options.signal) {
       process.removeListener("SIGINT", pause);
       process.removeListener("SIGHUP", pause);
+      process.removeListener("SIGTERM", pause);
     }
   }
 }

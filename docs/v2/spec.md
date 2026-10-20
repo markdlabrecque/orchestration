@@ -30,7 +30,7 @@ Pi Durable owns persistence and continuation. Pin its exact version and contain 
 
 `orch run <ticket>` discovers the project from the current directory, performs preflight, picks up its worktree and executes the workflow. Run files live outside ticket worktrees in the project's `.agents/orchestration/runs/`. Each ticket has its own Pi Durable `<ticket>.sqlite`; one foreground process owns it. The documented rule is one terminal per ticket. There are no locks or daemon, and a second owner can corrupt the running execution.
 
-The same command resumes a paused run. Ctrl-C and SIGHUP request orderly pause. A crash resumes according to the runner's capabilities. After three crashes of the same step, block and require `orch run --retry` for one additional attempt. Crash counts belong to run state, separately from findings and repair budgets.
+The same command resumes a paused run. Ctrl-C, SIGHUP and SIGTERM request orderly pause. A crash resumes according to the runner's capabilities. After three crashes of the same step, block and require `orch run --retry` for one additional attempt. Crash counts belong to run state, separately from findings and repair budgets.
 
 `orch abort <ticket>` ends a run after its process has stopped. `orch run` on a merged or aborted run prints its final status and exits. There is no fresh-run flag. Human steps ask on stdin; an unanswered question is asked again after resume. Run history is retained indefinitely.
 

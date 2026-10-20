@@ -58,7 +58,7 @@ orch tail 145                # read-only event stream
 ```
 
 Use one terminal per ticket. There are no locks or daemon; a second owner can
-corrupt the run. Ctrl-C or SIGHUP pauses; repeat `orch run 145` to resume.
+corrupt the run. Ctrl-C, SIGHUP or SIGTERM pauses; repeat `orch run 145` to resume.
 Stop the process before `orch abort 145` or `orch retire 145`. A hard kill may
 leave shell descendants alive; stop them before resuming. See
 [terminal controls and recovery limits](docs/v2/terminal-controls.md).

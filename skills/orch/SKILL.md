@@ -21,7 +21,7 @@ Use `orch` to execute the configured ticket workflow. Your job is to start or ob
 - Keep one foreground interactive terminal per ticket. Use a tool capable of retaining that terminal and relaying input. If none is available, give the user the exact command and wrapper directory to run themselves; do not launch it through a short-lived shell timeout or an unattended background process.
 - Observe with `orch show <ticket>` or `orch tail <ticket>`. Use bounded observations, not a busy polling loop. Retain the ticket, wrapper path, and terminal handle so later turns can find the same run.
 - Relay human questions and approval requests verbatim enough to preserve their meaning. Wait for the user's answer and submit only that answer. Do not approve on their behalf.
-- Ctrl-C or SIGHUP pauses a run; the same run command resumes it. Before resuming after a crash, check for surviving descendants. Use `--retry` only after investigating the blocker and obtaining explicit user authorization, never as an automatic retry loop.
+- Ctrl-C, SIGHUP or SIGTERM pauses a run; the same run command resumes it. Before resuming after a crash, check for surviving descendants. Use `--retry` only after investigating the blocker and obtaining explicit user authorization, never as an automatic retry loop.
 - Completed or other terminal runs are results to report, not invitations to start a replacement. On failure, report the current step and actionable blocker. Preserve saved state; never edit SQLite or status/event projections to force progress.
 - Run `orch abort <ticket>` or `orch retire <ticket>` only when requested and after confirming the owner has stopped. Neither command checks liveness.
 

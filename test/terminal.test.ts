@@ -174,3 +174,33 @@ steps:
     await rm(dir, { recursive: true, force: true });
   }
 }, 10000);
+
+test("SIGHUP and SIGTERM pause a running step orderly", async () => {
+  for (const sig of ["SIGHUP", "SIGTERM"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), "orch-signal-"));
+    try {
+      await mkdir(join(dir, "code/144"), { recursive: true });
+      await writeFile(
+        join(dir, "workflow.yaml"),
+        `version: 1
+runners:
+  shell:
+    command: 'printf intermediate; sleep 30'
+steps:
+  - {id: implement, kind: agent, runner: shell, role: implementor}
+`,
+      );
+      let sent = false;
+      const paused = await launch(dir, ["run", "144"], (text, child) => {
+        if (!sent && text.includes("Step implement")) {
+          sent = true;
+          child.kill(sig);
+        }
+      });
+      expect(paused, paused.stderr).toMatchObject({ code: 0 });
+      expect(paused.stdout).toContain("paused");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+}, 20_000);

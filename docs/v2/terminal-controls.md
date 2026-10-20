@@ -7,7 +7,7 @@ added. A second owner can still corrupt a live run.
 
 ## Commands
 
-- `orch run <ticket>` starts or resumes the saved workflow. Ctrl-C and SIGHUP
+- `orch run <ticket>` starts or resumes the saved workflow. Ctrl-C, SIGHUP and SIGTERM
   record an orderly pause and close the engine and its owned work.
 - `orch run <ticket> --retry` permits one more attempt after the crash limit.
   The flag also works before the ticket number.
