@@ -153,6 +153,16 @@ The durable record that a particular control request was accepted and of its sub
 **Human request**:
 An identified question belonging to a run that awaits an explicit human answer about a specific action or revision.
 
+**Question subject**:
+The specific action or revision a human request asks a person to authorize. A changed subject is a new human request.
+
+**Answer provenance**:
+The stated origin of a human answer: given directly by the person, or relayed by an agent or platform on their explicit behalf. Recorded as stated, not verified.
+
+**Answer admission**:
+Recording an explicit human answer for a run without advancing the run.
+_Avoid_: resume, offline execution
+
 **Recovery needed**:
 A run condition in which safe continuation cannot yet be established because ownership, surviving workers, or interrupted effects remain uncertain.
 
