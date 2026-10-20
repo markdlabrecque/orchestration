@@ -32,12 +32,28 @@ export type CliOptions = {
   output?: (text: string) => void;
   onEvent?: (event: RunnerEvent) => void;
 };
+function parseJsonFlag(argv: string[]) {
+  let json = false;
+  const commandIndex = argv[0] === "--json" ? 1 : 0;
+  const args = argv.filter((arg, index) => {
+    if (
+      arg !== "--json" ||
+      index === commandIndex ||
+      argv[index - 1] === "--owner-lifetime"
+    )
+      return true;
+    json = true;
+    return false;
+  });
+  return { args, json };
+}
+
 export async function runCli(
   argv: string[],
   options: CliOptions = {},
 ): Promise<number> {
-  const json = argv.includes("--json");
-  argv = argv.filter((arg) => arg !== "--json");
+  const { args, json } = parseJsonFlag(argv);
+  argv = args;
   const output = options.output ?? console.log,
     cwd = options.cwd ?? process.cwd(),
     execute = options.execute ?? exec;

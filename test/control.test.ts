@@ -156,6 +156,29 @@ for (const command of ["capabilities", "control"]) {
   }
 }
 
+for (const args of [
+  ["capabilities", "--json", "--owner-lifetime", "--json"],
+  ["--json", "capabilities", "--owner-lifetime", "--json"],
+  ["capabilities", "--owner-lifetime", "--json", "--json"],
+]) {
+  test(`${args.join(" ")} preserves the literal owner-lifetime value`, async () => {
+    const json = await invoke(args, "");
+    expect(json).toMatchObject({
+      outcome: "rejected",
+      code: "unsupported-capability",
+      detail: "owner-lifetime: --json",
+    });
+  });
+}
+
+test("a literal --json owner-lifetime value does not enable JSON mode", async () => {
+  await expect(
+    runCli(["capabilities", "--owner-lifetime", "--json"], {
+      output: () => {},
+    }),
+  ).rejects.toThrow("Usage: orch capabilities");
+});
+
 for (const command of ["show", "snapshot", "tail", "validate"]) {
   const positional = command === "validate" ? [] : ["167"];
   for (const args of [
