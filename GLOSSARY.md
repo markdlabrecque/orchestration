@@ -166,6 +166,9 @@ _Avoid_: resume, offline execution
 **Recovery needed**:
 A run condition in which safe continuation cannot yet be established because ownership, surviving workers, or interrupted effects remain uncertain.
 
+**Owner lifetime**:
+How long an execution owner lasts relative to its host. `host-bound` (default): the owner is a foreground process that pauses and exits on SIGHUP or SIGTERM, so the run ends with its terminal, pane or server. `detached`: an adapter launches the owner outside the host's process tree and records its PID.
+
 **Pause**:
 Stopping the engine and its owned workers cleanly and saving recovery state so the same run can be resumed.
 _Avoid_: stop, suspend, interrupt
