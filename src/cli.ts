@@ -4,6 +4,7 @@ import { createModels, type Models } from "@earendil-works/pi-ai/models";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
+import { capabilitiesResponse } from "./capabilities.ts";
 import { checked, type Exec, exec } from "./command.ts";
 import { runWorkflow } from "./engine.ts";
 import { explainHtml, explainText } from "./explain.ts";
@@ -37,7 +38,7 @@ export async function runCli(
     execute = options.execute ?? exec;
   if (argv.length === 0 || argv[0] === "--help") {
     output(
-      "Usage: orch run <ticket> [--retry] | orch show <ticket> | orch tail <ticket> | orch abort <ticket> | orch retire <ticket> | orch validate | orch explain [--simple] | orch workflow diff/reset [--force] | orch --version\nOne terminal per ticket. Ctrl-C, SIGHUP or SIGTERM pauses; run the same command to resume. Stop the run before abort or retire; these commands do not check liveness.",
+      "Usage: orch run <ticket> [--retry] | orch show <ticket> | orch tail <ticket> | orch abort <ticket> | orch retire <ticket> | orch validate | orch capabilities --json | orch explain [--simple] | orch workflow diff/reset [--force] | orch --version\nOne terminal per ticket. Ctrl-C, SIGHUP or SIGTERM pauses; run the same command to resume. Stop the run before abort or retire; these commands do not check liveness.",
     );
     return 0;
   }
@@ -48,6 +49,17 @@ export async function runCli(
     output(
       `${pkg.version} ${await checked(execute, { cwd: packageRoot, argv: ["git", "rev-parse", "--short", "HEAD"] })}`,
     );
+    return 0;
+  }
+  if (argv[0] === "capabilities") {
+    const rest = argv.slice(1);
+    const i = rest.indexOf("--owner-lifetime");
+    const wanted = i >= 0 ? rest[i + 1] : undefined;
+    if (!rest.includes("--json") || (i >= 0 && !wanted))
+      throw new Error(
+        "Usage: orch capabilities --json [--owner-lifetime <value>]",
+      );
+    output(JSON.stringify(capabilitiesResponse(wanted)));
     return 0;
   }
   if (argv[0] === "workflow")
