@@ -158,8 +158,48 @@ test("release removes a clean worktree without --force", async () => {
   const adapter = make();
   await adapter.start();
   await adapter.release();
-  expect(fake.exec(["worktree", "list"]).json.worktrees).toEqual([]);
+  expect(fake.exec(["worktree", "list"]).json.result.worktrees).toEqual([]);
   assertNoForce(fake.log());
+});
+
+test("release of a worktree that is not open opens it first, then removes by workspace", async () => {
+  const adapter = make();
+  await adapter.start();
+  fake.close("ticket-7");
+  await adapter.release();
+  expect(fake.exec(["worktree", "list"]).json.result.worktrees).toEqual([]);
+  const verbs = fake.log().map((e) => e.args.slice(0, 2).join(" "));
+  expect(verbs.slice(-4, -1)).toEqual([
+    "worktree list",
+    "worktree open",
+    "worktree remove",
+  ]);
+  assertNoForce(fake.log());
+});
+
+test("session, base and worktree path reach Herdr", async () => {
+  const herdr = createHerdr({
+    bin: fake.bin,
+    env: fake.env,
+    session: "s1",
+    repo: "/repo",
+  });
+  await createAdapter({
+    herdr,
+    orch: orch(),
+    ticket: "7",
+    branch: "ticket-7",
+    base: "trunk",
+    worktreePath: "/wt/seven",
+    requestDir: fake.dir,
+  }).start();
+  const log = fake.log();
+  expect(log.every((e) => e.session === "s1")).toBe(true);
+  const create = log.find((e) => e.args[1] === "create");
+  expect(create?.args).toEqual(
+    expect.arrayContaining(["--base", "trunk", "--path", "/wt/seven"]),
+  );
+  expect(create?.args).toEqual(expect.arrayContaining(["--cwd", "/repo"]));
 });
 
 test("release of a dirty worktree is refused with dirty_worktree_requires_force, never forced", async () => {
@@ -169,6 +209,6 @@ test("release of a dirty worktree is refused with dirty_worktree_requires_force,
   await expect(adapter.release()).rejects.toMatchObject({
     code: "dirty_worktree_requires_force",
   });
-  expect(fake.exec(["worktree", "list"]).json.worktrees).toHaveLength(1);
+  expect(fake.exec(["worktree", "list"]).json.result.worktrees).toHaveLength(1);
   assertNoForce(fake.log());
 });

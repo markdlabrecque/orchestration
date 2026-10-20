@@ -25,21 +25,32 @@ const create = (branch = "172") =>
     "--path",
     `/wt/${branch}`,
   ]);
+const list = () => fake.exec(["worktree", "list"]).json.result.worktrees;
+const paneOf = (made: ReturnType<typeof create>) =>
+  made.json.result.root_pane.pane_id as string;
 
-test("worktree list is empty, create returns workspace id and path, list shows it", () => {
-  expect(fake.exec(["worktree", "list"]).json).toMatchObject({
-    ok: true,
+test("worktree list is empty, create returns the real shape, list shows it without dirty", () => {
+  expect(fake.exec(["worktree", "list"]).json.result).toMatchObject({
+    type: "worktree_list",
     worktrees: [],
   });
   const made = create();
   expect(made.code).toBe(0);
-  expect(made.json).toMatchObject({
-    ok: true,
-    path: "/wt/172",
-    workspace_id: expect.any(String),
-    pane_id: expect.any(String),
+  expect(made.json.id).toEqual(expect.any(String));
+  expect(made.json.result).toMatchObject({
+    type: "worktree_created",
+    root_pane: { pane_id: expect.any(String) },
+    workspace: { workspace_id: expect.any(String) },
+    worktree: { path: "/wt/172" },
   });
-  expect(fake.exec(["worktree", "list"]).json.worktrees).toHaveLength(1);
+  expect(list()).toHaveLength(1);
+  expect(list()[0]).toMatchObject({
+    branch: "172",
+    path: "/wt/172",
+    open_workspace_id: made.json.result.workspace.workspace_id,
+  });
+  expect(list()[0]).not.toHaveProperty("dirty");
+  expect(list()[0]).not.toHaveProperty("workspace_id");
 });
 
 test("a second create is not idempotent: worktree_create_failed", () => {
@@ -49,31 +60,58 @@ test("a second create is not idempotent: worktree_create_failed", () => {
   expect(again.error).toMatchObject({ code: "worktree_create_failed" });
 });
 
-test("open returns the existing workspace; unknown branch fails", () => {
+test("create requires --branch, --base and --path", () => {
+  const r = fake.exec(["worktree", "create", "--branch", "x"]);
+  expect(r.code).not.toBe(0);
+  expect(r.error.message).toMatch(/missing required option/);
+});
+
+test("open returns the existing workspace; a closed one is reopened; unknown branch fails", () => {
   const made = create();
   const opened = fake.exec(["worktree", "open", "--branch", "172"]);
-  expect(opened.json).toMatchObject({
-    ok: true,
-    workspace_id: made.json.workspace_id,
-    path: "/wt/172",
-  });
+  expect(opened.json.result.workspace.workspace_id).toBe(
+    made.json.result.workspace.workspace_id,
+  );
+  fake.close("172");
+  expect(list()[0]).not.toHaveProperty("open_workspace_id");
+  const reopened = fake.exec(["worktree", "open", "--branch", "172"]);
+  expect(reopened.json.result.workspace.workspace_id).toEqual(
+    expect.any(String),
+  );
+  expect(list()[0].open_workspace_id).toBe(
+    reopened.json.result.workspace.workspace_id,
+  );
   const missing = fake.exec(["worktree", "open", "--branch", "nope"]);
   expect(missing.code).not.toBe(0);
   expect(missing.error.code).toBe("worktree_not_found");
 });
 
+test("unknown options are rejected: --cwd and --branch on remove", () => {
+  const made = create();
+  const ws = made.json.result.workspace.workspace_id;
+  for (const extra of [
+    ["--cwd", "/repo"],
+    ["--branch", "172"],
+  ]) {
+    const r = fake.exec(["worktree", "remove", "--workspace", ws, ...extra]);
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toMatch(/unknown option/);
+  }
+  expect(list()).toHaveLength(1);
+});
+
 test("remove refuses a dirty tree without --force, and flags --force as a violation", () => {
-  create();
+  const ws = create().json.result.workspace.workspace_id;
   fake.markDirty("172");
-  const refused = fake.exec(["worktree", "remove", "--branch", "172"]);
+  const refused = fake.exec(["worktree", "remove", "--workspace", ws]);
   expect(refused.code).not.toBe(0);
   expect(refused.error.code).toBe("dirty_worktree_requires_force");
-  expect(fake.exec(["worktree", "list"]).json.worktrees).toHaveLength(1);
+  expect(list()).toHaveLength(1);
   const forced = fake.exec([
     "worktree",
     "remove",
-    "--branch",
-    "172",
+    "--workspace",
+    ws,
     "--force",
   ]);
   expect(forced.code).toBe(0);
@@ -81,20 +119,26 @@ test("remove refuses a dirty tree without --force, and flags --force as a violat
 });
 
 test("remove of a clean tree succeeds", () => {
-  create();
-  expect(fake.exec(["worktree", "remove", "--branch", "172"]).code).toBe(0);
-  expect(fake.exec(["worktree", "list"]).json.worktrees).toEqual([]);
+  const ws = create().json.result.workspace.workspace_id;
+  expect(fake.exec(["worktree", "remove", "--workspace", ws]).code).toBe(0);
+  expect(list()).toEqual([]);
+});
+
+test("--session is accepted before the command and logged", () => {
+  const r = fake.exec(["--session", "s1", "worktree", "list"]);
+  expect(r.code).toBe(0);
+  expect(fake.log()[0]).toMatchObject({
+    args: ["worktree", "list"],
+    session: "s1",
+  });
 });
 
 test("pane run records the command; pane read answers from the script", () => {
-  const pane = create().json.pane_id;
+  const pane = paneOf(create());
   expect(fake.exec(["pane", "run", pane, "orch", "run", "172"]).code).toBe(0);
   expect(fake.ran(pane)).toEqual(["orch run 172"]);
   fake.setOutput(pane, "hello\n");
-  expect(fake.exec(["pane", "read", pane]).json).toMatchObject({
-    ok: true,
-    text: "hello\n",
-  });
+  expect(fake.exec(["pane", "read", pane]).json.result.text).toBe("hello\n");
   expect(fake.exec(["pane", "run", "p-missing", "x"]).error.code).toBe(
     "pane_not_found",
   );
@@ -115,30 +159,29 @@ const report = (pane: string, state: string, seq: number) =>
     String(seq),
   ]);
 const status = (pane: string) =>
-  fake.exec(["pane", "get", pane]).json.agent_status;
+  fake.exec(["pane", "get", pane]).json.result.pane.agent_status;
 
 test("report-agent ignores stale seq", () => {
-  const pane = create().json.pane_id;
+  const pane = paneOf(create());
   expect(status(pane)).toBe("unknown");
   report(pane, "blocked", 3);
   const stale = report(pane, "working", 2);
   expect(stale.code).toBe(0);
-  expect(stale.json.ignored).toBe(true);
+  expect(stale.json.result.ignored).toBe(true);
   expect(status(pane)).toBe("blocked");
   report(pane, "working", 4);
   expect(status(pane)).toBe("working");
 });
 
 test("release-agent and server restart reset state to unknown", () => {
-  const pane = create().json.pane_id;
+  const pane = paneOf(create());
   report(pane, "working", 5);
   fake.exec(["pane", "release-agent", pane]);
   expect(status(pane)).toBe("unknown");
   report(pane, "idle", 6);
   fake.restart();
   expect(status(pane)).toBe("unknown");
-  // Workspaces survive the restart; the seq counter does not.
-  expect(fake.exec(["worktree", "list"]).json.worktrees).toHaveLength(1);
+  expect(list()).toHaveLength(1);
   report(pane, "working", 1);
   expect(status(pane)).toBe("working");
 });
@@ -170,12 +213,12 @@ test("list then create satisfies list-before-create", () => {
 });
 
 test("assertNoForce throws when --force was passed", () => {
-  fake.exec(["worktree", "remove", "--branch", "x", "--force"]);
+  fake.exec(["worktree", "remove", "--workspace", "w-1", "--force"]);
   expect(() => assertNoForce(fake.log())).toThrow(/--force/);
 });
 
 test("a repeated pane run needs a receipt query in between", () => {
-  const pane = create().json.pane_id;
+  const pane = paneOf(create());
   fake.exec(["pane", "run", pane, "orch", "run", "172"]);
   fake.exec(["pane", "run", pane, "orch", "run", "172"]);
   expect(() => assertReceiptsQueriedBeforeResend(fake.log())).toThrow(
@@ -183,12 +226,11 @@ test("a repeated pane run needs a receipt query in between", () => {
   );
 
   fake.reset();
-  const p2 = create().json.pane_id;
+  const p2 = paneOf(create());
   fake.exec(["pane", "run", p2, "orch", "run", "172"]);
   fake.note("receipt-query", "req-1");
   fake.exec(["pane", "run", p2, "orch", "run", "172"]);
   assertReceiptsQueriedBeforeResend(fake.log());
-  // A different command is not a re-send.
   fake.exec(["pane", "run", p2, "orch", "snapshot", "172"]);
   assertReceiptsQueriedBeforeResend(fake.log());
 });
@@ -199,11 +241,12 @@ test("the executable shares state and log with the helper", () => {
       env: { ...process.env, ...fake.env },
       encoding: "utf8",
     });
-  const made = run("worktree", "create", "--branch", "9", "--base", "main");
+  const a = ["worktree", "create", "--branch", "9", "--base", "main"];
+  const made = run(...a, "--path", "/wt/9");
   expect(made.status).toBe(0);
-  const again = run("worktree", "create", "--branch", "9", "--base", "main");
+  const again = run(...a, "--path", "/wt/9");
   expect(again.status).toBe(1);
   expect(JSON.parse(again.stderr).error.code).toBe("worktree_create_failed");
-  expect(fake.exec(["worktree", "list"]).json.worktrees).toHaveLength(1);
+  expect(list()).toHaveLength(1);
   expect(fake.log().length).toBe(3);
 });

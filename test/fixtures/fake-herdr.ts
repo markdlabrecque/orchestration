@@ -5,28 +5,34 @@
 // test/fixtures/fake-herdr-cli.ts. Point an adapter at `bin` and pass `env` to its child
 // processes, or call `exec(args)` directly. Every invocation (including failures) is logged.
 //
-// Commands answered (JSON on stdout, exit 0; failures print {ok:false,error:{code,message}}
-// on stderr and exit 1):
-//   worktree list                              -> {ok, worktrees:[{branch,path,workspace_id,dirty}]}
-//   worktree create --branch B [--base X] [--path P]
-//                                              -> {ok, workspace_id, pane_id, path}
-//                                                 NOT idempotent: repeat fails worktree_create_failed
-//   worktree open --branch B                   -> same shape as create; worktree_not_found if absent
-//   worktree remove --branch B [--force]       -> dirty tree without --force fails
-//                                                 dirty_worktree_requires_force
-//   pane run <pane> <cmd...>                   -> {ok}; recorded (see ran()); pane_not_found if absent
-//   pane read <pane>                           -> {ok, text}
-//   pane get <pane>                            -> {ok, pane_id, agent_status}
+// Modelled on the real Herdr 0.9.1 CLI. Optional global `--session <name>` comes first (logged
+// as `session` on the entry). Success prints {id,result:{type,...}} on stdout, exit 0. Failure
+// prints {error:{code,message},id} on stderr, exit 1; unknown or missing options exit 2 with
+// code invalid_args and a message containing "unknown option" / "missing required option".
+//   worktree list [--workspace ID] [--cwd P] [--trust-repository]
+//        -> result.worktrees:[{branch,path,label,is_linked_worktree,open_workspace_id?}]
+//           (no dirty field; open_workspace_id absent when the worktree is not open)
+//   worktree create --branch B --base X --path P [--workspace] [--cwd] [--label]
+//                   [--focus|--no-focus] [--trust-repository]
+//        -> result.{root_pane.pane_id, workspace.workspace_id, worktree.path}
+//           NOT idempotent: repeat fails worktree_create_failed
+//   worktree open [--workspace] [--cwd] [--path] [--branch] [--label] [--focus|--no-focus]
+//        -> same shape as create; opens the workspace if closed; worktree_not_found if absent
+//   worktree remove --workspace ID [--force] [--trust-repository]   (no --branch, no --cwd)
+//        -> dirty tree without --force fails dirty_worktree_requires_force
+//   pane run <pane> <cmd...>   -> recorded (see ran()); pane_not_found if absent
+//   pane read <pane>           -> result.text
+//   pane get <pane>            -> result.pane.agent_status
 //   pane report-agent <pane> --source S --agent A --state ST --seq N
-//                                              -> {ok, ignored}; seq <= last seq is ignored
-//   pane release-agent <pane>                  -> {ok}; agent_status back to "unknown"
-//   server restart                             -> workspaces survive; agent_status resets to
-//                                                 "unknown" and the seq counter resets
+//        -> result.ignored; seq <= last seq is ignored
+//   pane release-agent <pane>  -> agent_status back to "unknown"
+//   server restart             -> workspaces survive; agent_status and seq counter reset
 //
 // Helper API (FakeHerdr):
 //   bin, env                 executable path and env ({FAKE_HERDR_DIR}) for child processes
 //   exec(args)               run one command -> {code, stdout, stderr, json, error}
 //   markDirty(branch)        make a worktree dirty (not logged)
+//   close(branch)            close the workspace but keep the worktree (not logged)
 //   setOutput(pane, text)    script what `pane read` returns (not logged)
 //   ran(pane)                commands sent with `pane run`
 //   restart()                simulate a server restart
@@ -53,7 +59,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export type LogEntry = { args: string[]; code: number; note?: boolean };
+export type LogEntry = {
+  args: string[];
+  code: number;
+  note?: boolean;
+  session?: string;
+};
 
 export type ExecResult = {
   code: number;
@@ -117,6 +128,16 @@ export function createFakeHerdr() {
     markDirty(branch: string) {
       editState((s) => {
         for (const w of s.worktrees) if (w.branch === branch) w.dirty = true;
+      });
+    },
+    close(branch: string) {
+      editState((s) => {
+        for (const w of s.worktrees)
+          if (w.branch === branch) {
+            if (w.paneId) delete s.panes[w.paneId];
+            w.workspaceId = undefined;
+            w.paneId = undefined;
+          }
       });
     },
     setOutput(pane: string, text: string) {

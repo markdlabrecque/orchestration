@@ -29,7 +29,7 @@ const make = () =>
     branch: "ticket-7",
   });
 const status = (pane: string) =>
-  fake.exec(["pane", "get", pane]).json.agent_status;
+  fake.exec(["pane", "get", pane]).json.result.pane.agent_status;
 
 test("orch snapshot states map to idle, working, blocked or unknown", () => {
   const cases: [Snapshot | null, string][] = [

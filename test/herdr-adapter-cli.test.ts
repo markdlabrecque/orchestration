@@ -88,3 +88,50 @@ test("ORCH_BIN is used for the contract check and snapshot polling; the run is s
     new RegExp(`^${orchBin} control --json < .*${r.out[0].requestId}\\.json$`),
   );
 });
+
+const release = async (
+  argv: string[],
+  extraEnv: Record<string, string> = {},
+) => {
+  const out: string[] = [];
+  const code = await main(["release", "7", ...argv], {
+    env: {
+      ORCH_BIN: orchBin,
+      HERDR_BIN: fake.bin,
+      ...fake.env,
+      ...extraEnv,
+      PATH: process.env.PATH,
+    },
+    cwd: dir,
+    output: (t) => out.push(t),
+  });
+  return { code, out };
+};
+
+test("--session is passed to herdr, and HERDR_SESSION is the fallback", async () => {
+  await release(["--session", "flagged"], { HERDR_SESSION: "from-env" });
+  await release([], { HERDR_SESSION: "from-env" });
+  expect(fake.log().map((e) => e.session)).toEqual(["flagged", "from-env"]);
+});
+
+test("--base and --worktree-path reach worktree create", async () => {
+  const abort = new AbortController();
+  setTimeout(() => abort.abort(), 300);
+  await run(
+    [
+      "run",
+      "7",
+      "--base",
+      "trunk",
+      "--worktree-path",
+      "/wt/x",
+      "--interval",
+      "20",
+    ],
+    abort.signal,
+  );
+  const create = fake.log().find((e) => e.args[1] === "create");
+  expect(create?.args).toEqual(
+    expect.arrayContaining(["--base", "trunk", "--path", "/wt/x"]),
+  );
+});

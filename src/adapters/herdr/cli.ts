@@ -4,9 +4,26 @@ import { resolveBin } from "./discovery.ts";
 import { AdapterError } from "./errors.ts";
 import { createHerdr } from "./herdr.ts";
 import { checkContract, createOrch } from "./orch.ts";
+import { run } from "./process.ts";
 
 const USAGE =
-  "Usage: orch-herdr run <ticket> [--branch <branch>] [--interval <ms>] [--owner-lifetime host-bound] | orch-herdr release <ticket> [--branch <branch>]";
+  "Usage: orch-herdr run <ticket> [--branch <branch>] [--base <ref>] [--worktree-path <path>] [--session <name>] [--interval <ms>] [--owner-lifetime host-bound] | orch-herdr release <ticket> [--branch <branch>] [--session <name>] (HERDR_SESSION is the --session fallback)";
+
+// The project's main branch: origin's HEAD when known, else main.
+async function mainBranch(
+  cwd: string,
+  env: Record<string, string>,
+): Promise<string> {
+  try {
+    const r = await run(
+      "git",
+      ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+      { cwd, env },
+    );
+    if (r.code === 0) return r.stdout.trim().replace(/^origin\//, "") || "main";
+  } catch {}
+  return "main";
+}
 
 // Entry point behind bin/orch-herdr. Returns the process exit code.
 export async function main(
@@ -44,11 +61,17 @@ export async function main(
     );
     const orch = createOrch({ bin: orchBin, cwd, env: childEnv });
     await checkContract(orch);
+    const session = flag("--session") ?? env.HERDR_SESSION ?? undefined;
     const adapter = createAdapter({
       herdr: createHerdr({
         bin: resolveBin("herdr", "HERDR_BIN", env),
         env: childEnv,
+        session: session || undefined,
+        repo: cwd,
       }),
+      repo: cwd,
+      base: flag("--base") ?? (await mainBranch(cwd, childEnv)),
+      worktreePath: flag("--worktree-path"),
       orch,
       orchBin,
       ticket,

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { AdapterError } from "./errors.ts";
 import type { Herdr } from "./herdr.ts";
 import type { Orch } from "./orch.ts";
@@ -12,6 +12,12 @@ export type AdapterOptions = {
   orch: Orch;
   ticket: string;
   branch: string;
+  // The repository; the default worktree path sits next to it.
+  repo?: string;
+  // Ref a new worktree branches from; defaults to main.
+  base?: string;
+  // Where a new worktree is created; defaults to <repo>-<branch> beside the repo.
+  worktreePath?: string;
   // The resolved orch binary to run in the pane; defaults to `orch` on the pane's PATH.
   orchBin?: string;
   // Test hook: called with the requestId whenever a receipt is queried before a re-send.
@@ -39,9 +45,16 @@ export function createAdapter(options: AdapterOptions) {
       const existing = (await herdr.worktreeList()).find(
         (w) => w.branch === branch,
       );
+      const repo = options.repo ?? process.cwd();
       const placement = existing
         ? await herdr.worktreeOpen(branch)
-        : await herdr.worktreeCreate(branch);
+        : await herdr.worktreeCreate({
+            branch,
+            base: options.base ?? "main",
+            path:
+              options.worktreePath ??
+              join(dirname(repo), `${basename(repo)}-${branch}`),
+          });
       paneId = placement.pane_id;
       requestId = `herdr-${ticket}-${randomUUID()}`;
       // A foreground start through the control op, so orch records a receipt. The request
@@ -93,9 +106,17 @@ export function createAdapter(options: AdapterOptions) {
       return { state, reported: true };
     },
 
-    // Never forces: a dirty worktree surfaces dirty_worktree_requires_force.
+    // Never forces: a dirty worktree surfaces dirty_worktree_requires_force. Remove goes by
+    // workspace id, so a worktree that is not open is opened first.
     async release(): Promise<void> {
-      await herdr.worktreeRemove(branch);
+      const existing = (await herdr.worktreeList()).find(
+        (w) => w.branch === branch,
+      );
+      if (!existing) return;
+      const workspaceId =
+        existing.open_workspace_id ??
+        (await herdr.worktreeOpen(branch)).workspace_id;
+      await herdr.worktreeRemove(workspaceId);
     },
   };
 }
