@@ -7,6 +7,7 @@ Run from the plugin dir:  python3 -m unittest discover -s tests -v
 """
 
 import json
+import sqlite3
 import os
 import shlex
 import subprocess
@@ -312,6 +313,41 @@ class RouteTests(RoutingTestCase):
         self.assertEqual((r["tier"], r["effort"], r["thinking"]),
                          ("frontier", "low", "low"))
         self.assertEqual(r["model"], "venice/big")
+
+    def write_machine_pi_models(self, models):
+        cfg_dir = os.path.join(self.env["XDG_CONFIG_HOME"], "orchestration")
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "config.json"), "w") as f:
+            json.dump({"pi_models": models}, f)
+
+    def test_pi_project_models_beat_machine_beat_default(self):
+        self.write_machine_pi_models({"light": "venice/machine-small",
+                                      "standard": "venice/machine-mid"})
+        self.write_config({"pi_models": {"standard": "anthropic/project-mid"}})
+        self.add("t1")
+        self.set_harness("t1", "pi")
+        # project > machine
+        self.assertEqual(self.route("t1", "test-writer")["model"], "anthropic/project-mid")
+        # machine > default
+        self.assertEqual(self.route("t1", "reviewer")["model"], "venice/machine-small")
+        # default
+        self.assertEqual(self.route("t1", "test-writer", "--ambiguous")["model"], PI["heavy"])
+
+    def test_pi_project_override_does_not_leak_to_another_project(self):
+        self.write_config({"pi_models": {"standard": "anthropic/project-mid"}})
+        self.add("t1")
+        self.set_harness("t1", "pi")
+        self.assertEqual(self.route("t1", "test-writer")["model"], "anthropic/project-mid")
+        other = os.path.join(self.tmp, "other-state")
+        env = {"ORCH_HOME": other}
+        self.ok("init", env=env)
+        self.ok("add", "t1", "--title", "Other", env=env)
+        con = sqlite3.connect(os.path.join(other, "state.db"))
+        con.execute("UPDATE tickets SET harness='pi' WHERE id='t1'")
+        con.commit()
+        con.close()
+        r = self.j("route", "t1", "--role", "test-writer", env=env)
+        self.assertEqual(r["model"], PI["standard"])
 
     def test_pi_models_override(self):
         cfg_dir = os.path.join(self.env["XDG_CONFIG_HOME"], "orchestration")

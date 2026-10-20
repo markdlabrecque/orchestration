@@ -111,6 +111,30 @@ test("explicit pi_models preserves provider and model overrides for all tiers", 
   });
 });
 
+test("a project config's pi_models beats the machine config, and another project is unaffected", () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), "orch-home-"));
+  const saved = process.env.ORCH_HOME;
+  try {
+    writeFileSync(path.join(home, "config.json"), JSON.stringify({ pi_models: { standard: "anthropic/project-mid" } }));
+    withXdg({ pi_models: { light: "venice/small", standard: "venice/mid" } }, () => {
+      process.env.ORCH_HOME = home;
+      const m = ext.piModels();
+      assert.equal(m.standard, "anthropic/project-mid");
+      assert.equal(m.sonnet, "anthropic/project-mid");
+      assert.equal(m.light, "venice/small");
+      assert.equal(m.heavy, "openai/gpt-6-astra");
+      const other = mkdtempSync(path.join(os.tmpdir(), "orch-home-"));
+      process.env.ORCH_HOME = other;
+      assert.equal(ext.piModels().standard, "venice/mid");
+      rmSync(other, { recursive: true, force: true });
+    });
+  } finally {
+    if (saved === undefined) delete process.env.ORCH_HOME;
+    else process.env.ORCH_HOME = saved;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("PI_THINKING maps each effort rung to a thinking level", () => {
   assert.deepEqual(ext.PI_THINKING, { low: "low", high: "high" });
 });

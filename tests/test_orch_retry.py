@@ -297,6 +297,15 @@ class RetryTests(RoutingTestCase):
         self.change_model_mapping()
         self.refuse(source, r"model|mapping|dispatch")
 
+    def test_project_override_replays_and_a_changed_project_mapping_refuses(self):
+        self.write_config({"pi_models": {"standard": "anthropic/project-mid"}})
+        source = self.repair()
+        self.assertEqual(source["model_requested"], "anthropic/project-mid")
+        replay = self.retry(source)
+        self.assert_replay(source, replay)
+        self.write_config({"pi_models": {"standard": "anthropic/other-mid"}})
+        self.refuse(self.runs("t1")[-1], r"model|mapping|dispatch")
+
     def test_codex_replay_returns_invocable_agent_and_clears_resolution(self):
         self.to_review("t1")
         self.set_harness("t1", "codex")

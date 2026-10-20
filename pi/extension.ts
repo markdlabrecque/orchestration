@@ -132,20 +132,30 @@ export const PI_THINKING: Record<string, string> = { low: "low", high: "high" };
 // opus sets heavy and frontier: both run on the same model.
 const TIER_ALIASES: Record<string, string[]> = { haiku: ["light"], sonnet: ["standard"], opus: ["heavy", "frontier"] };
 
-/** The tier -> model map, overridden by the machine config's `pi_models`
- * (a tier key wins over an old alias), plus the old names as aliases. */
-export function piModels(): Record<string, string> {
+/** The tier -> model map: defaults, then the machine config's `pi_models`, then
+ * the project config's (`<project>/.agents/orchestration/config.json`, or
+ * $ORCH_HOME/config.json) for `cwd`. Within one config a tier key wins over an
+ * old alias. Also carries the old names as aliases. */
+export function piModels(cwd: string = process.cwd()): Record<string, string> {
 	const out: Record<string, string> = { ...PI_MODELS };
-	const base = process.env.XDG_CONFIG_HOME || path.join(process.env.HOME || "", ".config");
-	try {
-		const cfg = JSON.parse(fs.readFileSync(path.join(base, "orchestration", "config.json"), "utf8"));
-		const own = cfg?.pi_models;
-		if (own && typeof own === "object" && !Array.isArray(own)) {
-			const valid = (v: unknown): v is string => typeof v === "string" && !!v;
+	const valid = (v: unknown): v is string => typeof v === "string" && !!v;
+	const apply = (file: string) => {
+		try {
+			const own = JSON.parse(fs.readFileSync(file, "utf8"))?.pi_models;
+			if (!own || typeof own !== "object" || Array.isArray(own)) return;
 			for (const [k, v] of Object.entries(own)) if (valid(v) && TIER_ALIASES[k]) for (const t of TIER_ALIASES[k]) out[t] = v;
 			for (const [k, v] of Object.entries(own)) if (valid(v) && k in PI_MODELS) out[k] = v;
-		}
-	} catch {}
+		} catch {}
+	};
+	const base = process.env.XDG_CONFIG_HOME || path.join(process.env.HOME || "", ".config");
+	apply(path.join(base, "orchestration", "config.json"));
+	const state = process.env.ORCH_HOME
+		? path.resolve(process.env.ORCH_HOME)
+		: (() => {
+				const root = projectRoot(cwd);
+				return root ? path.join(root, ".agents", "orchestration") : null;
+			})();
+	if (state) apply(path.join(state, "config.json"));
 	for (const [alias, tiers] of Object.entries(TIER_ALIASES)) out[alias] = out[tiers[0]];
 	return out;
 }
