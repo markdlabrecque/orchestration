@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, test } from "vitest";
@@ -7,7 +7,13 @@ import { runCli } from "../src/cli.ts";
 let runs: string;
 let launched: number;
 let paused: number;
+let foregrounded: number;
+let duringReceipt: unknown;
+let endWith: "completed" | "failed" | "superseded" | "throw";
 beforeEach(async () => {
+  foregrounded = 0;
+  duringReceipt = undefined;
+  endWith = "completed";
   runs = await mkdtemp(join(tmpdir(), "orch-control-run-"));
   launched = 0;
   paused = 0;
@@ -23,6 +29,14 @@ const deps = () => ({
   },
   pause: async () => {
     paused++;
+  },
+  foreground: async () => {
+    foregrounded++;
+    duringReceipt = JSON.parse(
+      await readFile(join(runs, "7.requests", "fg.json"), "utf8"),
+    ).state;
+    if (endWith === "throw") throw new Error("boom");
+    return { runId: "run-1", outcome: endWith };
   },
 });
 
@@ -55,6 +69,64 @@ test("start launches once and returns the runId with a completed receipt", async
     receipt: { requestId: "a", op: "start", state: "completed" },
   });
   expect(launched).toBe(1);
+});
+
+const fg = { ticket: "7", foreground: true };
+
+test("foreground start records the receipt, runs the owner in-process, then completes", async () => {
+  const r = await control({ requestId: "fg", op: "start", params: fg });
+  expect(duringReceipt).toBe("in-progress");
+  expect(foregrounded).toBe(1);
+  expect(launched).toBe(0);
+  expect(r).toMatchObject({
+    outcome: "accepted",
+    runId: "run-1",
+    receipt: { requestId: "fg", state: "completed" },
+  });
+});
+
+test("foreground start replay is already-recorded and does not run a second owner", async () => {
+  await control({ requestId: "fg", op: "start", params: fg });
+  const r = await control({ requestId: "fg", op: "start", params: fg });
+  expect(r.outcome).toBe("already-recorded");
+  expect(foregrounded).toBe(1);
+  expect(launched).toBe(0);
+});
+
+test("foreground start ending failed or superseded is recorded as such", async () => {
+  endWith = "failed";
+  const f = await control({ requestId: "fg", op: "start", params: fg });
+  expect(f).toMatchObject({
+    outcome: "rejected",
+    receipt: { state: "failed" },
+  });
+  endWith = "superseded";
+  const s = await control({ requestId: "fg", op: "start", params: { ...fg } });
+  expect(s.outcome).toBe("already-recorded");
+});
+
+test("foreground start superseded outcome is recorded", async () => {
+  endWith = "superseded";
+  const s = await control({ requestId: "fg", op: "start", params: fg });
+  expect(s.receipt.state).toBe("superseded");
+});
+
+test("foreground owner throwing fails the receipt", async () => {
+  endWith = "throw";
+  const r = await control({ requestId: "fg", op: "start", params: fg });
+  expect(r).toMatchObject({
+    outcome: "rejected",
+    code: "internal-error",
+    receipt: { state: "failed" },
+  });
+});
+
+test("foreground start with a live owner is already-running and runs nothing", async () => {
+  await writeStatus("running");
+  await owner(process.pid);
+  const r = await control({ requestId: "fg", op: "start", params: fg });
+  expect(r).toMatchObject({ outcome: "rejected", code: "already-running" });
+  expect(foregrounded).toBe(0);
 });
 
 test("start replay is already-recorded and does not launch again", async () => {

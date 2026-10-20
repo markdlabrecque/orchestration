@@ -17,6 +17,11 @@ export type ControlDeps = {
   ): Promise<{ runId: string }>;
   // Asks the live owner to pause.
   pause(project: Project): Promise<void>;
+  // Runs the owner in the calling process until it ends (host-bound, no detach).
+  foreground?(project: Project): Promise<{
+    runId?: string;
+    outcome: "completed" | "failed" | "superseded";
+  }>;
 };
 
 type Snapshot = Record<string, unknown> & { runId?: string; owner?: string };
@@ -161,6 +166,30 @@ export async function controlResponse(stdin: string, deps?: ControlDeps) {
     }
     if (live)
       return refuse("already-running", `Ticket ${ticket} already has an owner`);
+    if (op === "start" && params.foreground === true) {
+      if (!deps.foreground)
+        return refuse("unsupported-op", "Foreground start is not available");
+      await receipts.transition(requestId, "in-progress");
+      const ended = await deps.foreground(project);
+      if (ended.outcome === "completed") return finish(ended.runId);
+      const receipt = await receipts.transition(requestId, ended.outcome, {
+        runId: ended.runId,
+        ...(ended.outcome === "failed" ? { code: "run-failed" } : {}),
+      });
+      if (ended.outcome === "failed")
+        return {
+          ...reject("run-failed", `Owner for ticket ${ticket} failed`),
+          receipt,
+          snapshot,
+        };
+      return {
+        ...base,
+        outcome: "accepted" as const,
+        code: null,
+        receipt,
+        runId: ended.runId,
+      };
+    }
     const launched = await deps.launch(project, op as "start" | "resume");
     return finish(launched.runId);
   } catch (error) {

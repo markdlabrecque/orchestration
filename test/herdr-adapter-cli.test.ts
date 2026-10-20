@@ -82,5 +82,9 @@ test("ORCH_BIN is used for the contract check and snapshot polling; the run is s
   const calls = readFileSync(`${orchBin}.log`, "utf8");
   expect(calls).toContain("capabilities --json");
   expect(calls).toContain("control --json");
-  expect(fake.ran(r.out[0].paneId)).toEqual([`${orchBin} run 7`]);
+  const ran = fake.ran(r.out[0].paneId);
+  expect(ran).toHaveLength(1);
+  expect(ran[0]).toMatch(
+    new RegExp(`^${orchBin} control --json < .*${r.out[0].requestId}\\.json$`),
+  );
 });

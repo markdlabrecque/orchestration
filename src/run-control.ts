@@ -30,6 +30,38 @@ export const launchRun: ControlDeps["launch"] = async (project) => {
   throw new Error("Run owner did not become live");
 };
 
+// Foreground start: `orch run` runs in the calling pane with inherited stdio, not detached and
+// not unref'd, so it stays host-bound (#164). Pause signals reach the owner, not this wrapper.
+export const foregroundRun: NonNullable<ControlDeps["foreground"]> = async (
+  project,
+) => {
+  const child = spawn(join(packageRoot, "bin/orch"), ["run", project.ticket], {
+    cwd: project.root,
+    stdio: "inherit",
+  });
+  const signals = ["SIGINT", "SIGHUP", "SIGTERM"] as const;
+  const forward = (signal: NodeJS.Signals) => () => {
+    if (signal !== "SIGINT") child.kill(signal);
+  };
+  const handlers = signals.map((s) => [s, forward(s)] as const);
+  for (const [s, h] of handlers) process.on(s, h);
+  try {
+    const code = await new Promise<number>((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", (c) => resolve(c ?? -1));
+    });
+    const snap = (await snapshotResponse(project)).snapshot as
+      | { runId?: string }
+      | undefined;
+    return {
+      runId: snap?.runId,
+      outcome: code === 0 ? ("completed" as const) : ("failed" as const),
+    };
+  } finally {
+    for (const [s, h] of handlers) process.removeListener(s, h);
+  }
+};
+
 // SIGTERM is the existing pause signal for a foreground owner.
 export const pauseRun: ControlDeps["pause"] = async (project) => {
   const pid = await ownerPid(project);

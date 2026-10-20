@@ -17,10 +17,16 @@ export type Herdr = ReturnType<typeof createHerdr>;
 export function createHerdr(options: {
   bin: string;
   env?: Record<string, string>;
+  paneRunTimeoutMs?: number;
 }) {
   // biome-ignore lint/suspicious/noExplicitAny: Herdr JSON shapes vary per command
-  const call = async (args: string[]): Promise<any> => {
-    const r = await run(options.bin, args, { env: options.env });
+  const call = async (args: string[], timeoutMs?: number): Promise<any> => {
+    const r = await run(options.bin, args, { env: options.env, timeoutMs });
+    if (r.timedOut)
+      throw new AdapterError(
+        "timeout",
+        `herdr ${args[0]} ${args[1]} timed out`,
+      );
     if (r.code === 0) {
       try {
         return JSON.parse(r.stdout);
@@ -48,7 +54,10 @@ export function createHerdr(options: {
     worktreeRemove: (branch: string) =>
       call(["worktree", "remove", "--branch", branch]),
     paneRun: (pane: string, command: string[]) =>
-      call(["pane", "run", pane, ...command]),
+      call(
+        ["pane", "run", pane, ...command],
+        options.paneRunTimeoutMs ?? 30_000,
+      ),
     async paneAgentStatus(pane: string): Promise<string> {
       return (await call(["pane", "get", pane])).agent_status;
     },

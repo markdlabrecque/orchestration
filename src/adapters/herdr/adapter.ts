@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { AdapterError } from "./errors.ts";
 import type { Herdr } from "./herdr.ts";
 import type { Orch } from "./orch.ts";
 import { mapState } from "./state.ts";
@@ -12,13 +16,18 @@ export type AdapterOptions = {
   orchBin?: string;
   // Test hook: called with the requestId whenever a receipt is queried before a re-send.
   onReceiptQuery?: (requestId: string) => void;
+  // Where the request file the pane feeds to `orch control` is written.
+  requestDir?: string;
+  // Wait after an uncertain pane run before querying the receipt, so orch can record it.
+  settleMs?: number;
 };
 
 // Host-bound adapter: `orch run` is a foreground process in a Herdr pane. Herdr state is
 // display only; orch snapshots are the source of truth and the owner never calls Herdr.
 export function createAdapter(options: AdapterOptions) {
   const { herdr, orch, ticket, branch } = options;
-  const command = [options.orchBin ?? "orch", "run", ticket];
+  const requestDir = options.requestDir ?? join(tmpdir(), "orch-herdr");
+  let command: string[] = [];
   let paneId: string | undefined;
   let requestId: string | undefined;
   // The adapter's own monotonic seq; it never resets, even if Herdr restarts.
@@ -35,7 +44,29 @@ export function createAdapter(options: AdapterOptions) {
         : await herdr.worktreeCreate(branch);
       paneId = placement.pane_id;
       requestId = `herdr-${ticket}-${randomUUID()}`;
-      await herdr.paneRun(paneId, command);
+      // A foreground start through the control op, so orch records a receipt. The request
+      // goes via a file redirect, which works in any pane shell.
+      mkdirSync(requestDir, { recursive: true });
+      const file = join(requestDir, `${requestId}.json`);
+      writeFileSync(
+        file,
+        `${JSON.stringify({
+          contract: "orch.control/1",
+          requestId,
+          op: "start",
+          params: { ticket, foreground: true },
+        })}\n`,
+      );
+      // One shell-string argument, so herdr never parses `--json` as its own flag.
+      command = [`${options.orchBin ?? "orch"} control --json < ${file}`];
+      try {
+        await herdr.paneRun(paneId, command);
+      } catch (error) {
+        // Delivery is uncertain after a timeout: resend() checks the receipt first.
+        if ((error as AdapterError).code !== "timeout") throw error;
+        await new Promise((r) => setTimeout(r, options.settleMs ?? 1000));
+        await this.resend();
+      }
       return { paneId, requestId };
     },
 

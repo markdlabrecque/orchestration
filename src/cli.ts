@@ -17,7 +17,7 @@ import {
   prepareRunDirectory,
 } from "./project.ts";
 import { openReceipts } from "./receipts.ts";
-import { launchRun, pauseRun } from "./run-control.ts";
+import { foregroundRun, launchRun, pauseRun } from "./run-control.ts";
 import type { RunnerEvent } from "./runners/types.ts";
 import { publishOwner, snapshotResponse } from "./snapshot.ts";
 import { createTracker, selectForge } from "./tracker/index.ts";
@@ -94,6 +94,7 @@ export async function runCli(
       },
       launch: launchRun,
       pause: pauseRun,
+      foreground: foregroundRun,
     };
     output(JSON.stringify(await controlResponse(stdin, deps)));
     return 0;
