@@ -6,6 +6,7 @@ import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { capabilitiesResponse } from "./capabilities.ts";
 import { checked, type Exec, exec } from "./command.ts";
+import { controlResponse } from "./control.ts";
 import { runWorkflow } from "./engine.ts";
 import { explainHtml, explainText } from "./explain.ts";
 import { observeRun, showRun, tailRun } from "./observability.ts";
@@ -23,6 +24,7 @@ import { globalWorkflowPath, workflowConfig } from "./workflow-config.ts";
 
 export type CliOptions = {
   cwd?: string;
+  stdin?: string | (() => Promise<string>);
   execute?: Exec;
   models?: Models;
   workflowPath?: string;
@@ -34,12 +36,14 @@ export async function runCli(
   argv: string[],
   options: CliOptions = {},
 ): Promise<number> {
+  const json = argv.includes("--json");
+  argv = argv.filter((arg) => arg !== "--json");
   const output = options.output ?? console.log,
     cwd = options.cwd ?? process.cwd(),
     execute = options.execute ?? exec;
   if (argv.length === 0 || argv[0] === "--help") {
     output(
-      "Usage: orch run <ticket> [--retry] | orch show <ticket> | orch tail <ticket> | orch abort <ticket> | orch retire <ticket> | orch validate | orch capabilities --json | orch snapshot <ticket> | orch explain [--simple] | orch workflow diff/reset [--force] | orch --version\nOne terminal per ticket. Ctrl-C, SIGHUP or SIGTERM pauses; run the same command to resume. Stop the run before abort or retire; these commands do not check liveness.",
+      "Usage: orch run <ticket> [--retry] | orch show <ticket> | orch tail <ticket> | orch abort <ticket> | orch retire <ticket> | orch validate | orch capabilities --json | orch control --json | orch snapshot <ticket> | orch explain [--simple] | orch workflow diff/reset [--force] | orch --version\nOne terminal per ticket. Ctrl-C, SIGHUP or SIGTERM pauses; run the same command to resume. Stop the run before abort or retire; these commands do not check liveness.",
     );
     return 0;
   }
@@ -52,11 +56,24 @@ export async function runCli(
     );
     return 0;
   }
+  if (argv[0] === "control") {
+    let stdin: string;
+    if (typeof options.stdin === "string") stdin = options.stdin;
+    else if (options.stdin) stdin = await options.stdin();
+    else {
+      const chunks: Buffer[] = [];
+      for await (const chunk of process.stdin)
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      stdin = Buffer.concat(chunks).toString("utf8");
+    }
+    output(JSON.stringify(controlResponse(stdin)));
+    return 0;
+  }
   if (argv[0] === "capabilities") {
     const rest = argv.slice(1);
     const i = rest.indexOf("--owner-lifetime");
     const wanted = i >= 0 ? rest[i + 1] : undefined;
-    if (!rest.includes("--json") || (i >= 0 && !wanted))
+    if (!json || (i >= 0 && !wanted))
       throw new Error(
         "Usage: orch capabilities --json [--owner-lifetime <value>]",
       );
