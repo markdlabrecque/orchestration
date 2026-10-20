@@ -4,9 +4,9 @@ import { createModels, type Models } from "@earendil-works/pi-ai/models";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { capabilitiesResponse } from "./capabilities.ts";
+import { CONTRACT, capabilitiesResponse } from "./capabilities.ts";
 import { checked, type Exec, exec } from "./command.ts";
-import { controlResponse } from "./control.ts";
+import { type ControlDeps, controlResponse } from "./control.ts";
 import { runWorkflow } from "./engine.ts";
 import { explainHtml, explainText } from "./explain.ts";
 import { observeRun, showRun, tailRun } from "./observability.ts";
@@ -16,6 +16,8 @@ import {
   packageRoot,
   prepareRunDirectory,
 } from "./project.ts";
+import { openReceipts } from "./receipts.ts";
+import { foregroundRun, launchRun, pauseRun } from "./run-control.ts";
 import type { RunnerEvent } from "./runners/types.ts";
 import { publishOwner, snapshotResponse } from "./snapshot.ts";
 import { createTracker, selectForge } from "./tracker/index.ts";
@@ -28,6 +30,9 @@ export type CliOptions = {
   execute?: Exec;
   models?: Models;
   workflowPath?: string;
+  // Overrides the run storage directory; discovery is used when absent.
+  runsDir?: string;
+  controlDeps?: ControlDeps;
   signal?: AbortSignal;
   output?: (text: string) => void;
   onEvent?: (event: RunnerEvent) => void;
@@ -59,7 +64,7 @@ export async function runCli(
     execute = options.execute ?? exec;
   if (argv.length === 0 || argv[0] === "--help") {
     output(
-      "Usage: orch run <ticket> [--retry] | orch show <ticket> | orch tail <ticket> | orch abort <ticket> | orch retire <ticket> | orch validate | orch capabilities --json | orch control --json | orch snapshot <ticket> | orch explain [--simple] | orch workflow diff/reset [--force] | orch --version\nOne terminal per ticket. Ctrl-C, SIGHUP or SIGTERM pauses; run the same command to resume. Stop the run before abort or retire; these commands do not check liveness.",
+      "Usage: orch run <ticket> [--retry] | orch show <ticket> | orch tail <ticket> | orch abort <ticket> | orch retire <ticket> | orch validate | orch capabilities --json | orch control --json | orch request <requestId> --run <ticket> --json | orch snapshot <ticket> | orch explain [--simple] | orch workflow diff/reset [--force] | orch --version\nOne terminal per ticket. Ctrl-C, SIGHUP or SIGTERM pauses; run the same command to resume. Stop the run before abort or retire; these commands do not check liveness.",
     );
     return 0;
   }
@@ -82,7 +87,47 @@ export async function runCli(
         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       stdin = Buffer.concat(chunks).toString("utf8");
     }
-    output(JSON.stringify(controlResponse(stdin)));
+    const deps: ControlDeps = options.controlDeps ?? {
+      project: async (ticket) => {
+        const found = await discoverProject(cwd, ticket, execute);
+        return options.runsDir ? { ...found, runs: options.runsDir } : found;
+      },
+      launch: launchRun,
+      pause: pauseRun,
+      foreground: foregroundRun,
+    };
+    output(JSON.stringify(await controlResponse(stdin, deps)));
+    return 0;
+  }
+  if (argv[0] === "request") {
+    const run = argv.indexOf("--run");
+    const requestId = argv[1];
+    if (!json || !requestId || run !== 2 || !argv[3] || argv.length !== 4)
+      throw new Error("Usage: orch request <requestId> --run <ticket> --json");
+    const ticket = argv[3];
+    const runs =
+      options.runsDir ?? (await discoverProject(cwd, ticket, execute)).runs;
+    const receipt = await openReceipts({ runs, ticket }).get(requestId);
+    output(
+      JSON.stringify(
+        receipt
+          ? {
+              contract: CONTRACT,
+              outcome: "answered",
+              code: null,
+              receipt,
+              snapshot: null,
+            }
+          : {
+              contract: CONTRACT,
+              outcome: "rejected",
+              code: "request-not-found",
+              message: `No receipt for requestId ${requestId}`,
+              receipt: null,
+              snapshot: null,
+            },
+      ),
+    );
     return 0;
   }
   if (argv[0] === "capabilities") {

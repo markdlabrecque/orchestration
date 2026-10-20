@@ -17,6 +17,15 @@ export async function publishOwner(project: Project) {
   return () => rm(ownerFile(project), { force: true });
 }
 
+export async function ownerPid(project: Project): Promise<number | undefined> {
+  try {
+    const pid = JSON.parse(await readFile(ownerFile(project), "utf8")).pid;
+    return typeof pid === "number" ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function probeOwner(project: Project): Promise<OwnerState> {
   let pid: unknown;
   try {
