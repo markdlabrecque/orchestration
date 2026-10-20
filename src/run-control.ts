@@ -4,14 +4,20 @@ import type { ControlDeps } from "./control.ts";
 import { packageRoot } from "./project.ts";
 import { ownerPid, snapshotResponse } from "./snapshot.ts";
 
+// The owner is host-bound (#164): it stays in the host's process group so it dies with the host.
+// A detached owner (setsid) would outlive its host and contradict the declared capability.
+export const ownerSpawnOptions = (cwd: string) => ({
+  cwd,
+  stdio: "ignore" as const,
+});
+
 // Default launch reuses `orch run`, the single run owner entry point; no second harness is opened.
 export const launchRun: ControlDeps["launch"] = async (project) => {
-  const child = spawn(join(packageRoot, "bin/orch"), ["run", project.ticket], {
-    cwd: project.root,
-    detached: true,
-    stdio: "ignore",
-  });
-  child.unref();
+  const child = spawn(
+    join(packageRoot, "bin/orch"),
+    ["run", project.ticket],
+    ownerSpawnOptions(project.root),
+  );
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
     const r = await snapshotResponse(project);

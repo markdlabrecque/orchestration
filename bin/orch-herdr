@@ -1,0 +1,2 @@
+#!/usr/bin/env node
+import('../src/adapters/herdr/cli.ts').then(({main})=>main(process.argv.slice(2))).then(code=>{process.exitCode=code;}).catch(error=>{console.error(String(error));process.exitCode=1;});
