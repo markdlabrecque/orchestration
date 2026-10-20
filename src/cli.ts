@@ -16,6 +16,7 @@ import {
   prepareRunDirectory,
 } from "./project.ts";
 import type { RunnerEvent } from "./runners/types.ts";
+import { publishOwner, snapshotResponse } from "./snapshot.ts";
 import { createTracker, selectForge } from "./tracker/index.ts";
 import { loadWorkflow } from "./workflow.ts";
 import { globalWorkflowPath, workflowConfig } from "./workflow-config.ts";
@@ -38,7 +39,7 @@ export async function runCli(
     execute = options.execute ?? exec;
   if (argv.length === 0 || argv[0] === "--help") {
     output(
-      "Usage: orch run <ticket> [--retry] | orch show <ticket> | orch tail <ticket> | orch abort <ticket> | orch retire <ticket> | orch validate | orch capabilities --json | orch explain [--simple] | orch workflow diff/reset [--force] | orch --version\nOne terminal per ticket. Ctrl-C, SIGHUP or SIGTERM pauses; run the same command to resume. Stop the run before abort or retire; these commands do not check liveness.",
+      "Usage: orch run <ticket> [--retry] | orch show <ticket> | orch tail <ticket> | orch abort <ticket> | orch retire <ticket> | orch validate | orch capabilities --json | orch snapshot <ticket> | orch explain [--simple] | orch workflow diff/reset [--force] | orch --version\nOne terminal per ticket. Ctrl-C, SIGHUP or SIGTERM pauses; run the same command to resume. Stop the run before abort or retire; these commands do not check liveness.",
     );
     return 0;
   }
@@ -95,7 +96,15 @@ export async function runCli(
   const retry = argv.includes("--retry");
   if (retry) argv = argv.filter((a) => a !== "--retry");
   if (
-    !["run", "validate", "show", "tail", "abort", "retire"].includes(argv[0]) ||
+    ![
+      "run",
+      "validate",
+      "show",
+      "snapshot",
+      "tail",
+      "abort",
+      "retire",
+    ].includes(argv[0]) ||
     (retry && argv[0] !== "run") ||
     argv.length !== (argv[0] === "validate" ? 1 : 2)
   )
@@ -107,6 +116,10 @@ export async function runCli(
     argv[0] === "validate" ? "1" : (argv[1] ?? ""),
     execute,
   );
+  if (argv[0] === "snapshot") {
+    output(JSON.stringify(await snapshotResponse(project)));
+    return 0;
+  }
   if (argv[0] === "show") {
     await showRun(project, output);
     return 0;
@@ -164,6 +177,7 @@ export async function runCli(
     process.once("SIGHUP", pause);
     process.once("SIGTERM", pause);
   }
+  const releaseOwner = options.signal ? undefined : await publishOwner(project);
   try {
     const observer = observeRun(project, output, options.onEvent);
     const state = await runWorkflow({
@@ -206,6 +220,7 @@ export async function runCli(
     output(`${state.status}${state.reason ? `: ${state.reason}` : ""}`);
     return state.status === "blocked" ? 1 : 0;
   } finally {
+    await releaseOwner?.();
     if (!options.signal) {
       process.removeListener("SIGINT", pause);
       process.removeListener("SIGHUP", pause);
