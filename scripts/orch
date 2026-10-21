@@ -4051,20 +4051,37 @@ def machine_config():
     return data if isinstance(data, dict) else {}
 
 
+def project_config():
+    """The project config (<state dir>/config.json, i.e.
+    .agents/orchestration/config.json), or {}."""
+    try:
+        with open(os.path.join(state_dir(), "config.json")) as f:
+            data = json.load(f)
+    except (OSError, ValueError, Refusal):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _apply_pi_models(out, own):
+    """Apply one `pi_models` override to `out`, keyed by tier or by an old
+    alias (a tier key wins; `opus` sets heavy and frontier)."""
+    if not isinstance(own, dict):
+        return
+    keyed = [(t, v) for k, v in own.items() if k in PI_MODEL_ALIASES
+             for t in PI_MODEL_ALIASES[k]]
+    keyed += [(k, v) for k, v in own.items() if k in TIERS]
+    for tier, model in keyed:
+        if isinstance(model, str) and model:
+            out[tier] = model
+
+
 def pi_models():
-    """tier -> model: PI_MODELS with the machine config's
-    `pi_models` override, keyed by tier or by an old alias (a tier key wins;
-    `opus` sets heavy and frontier, which share a model).
+    """tier -> model: PI_MODELS, then the machine config's `pi_models`, then the
+    project config's `pi_models` (project over machine over default, per tier).
     The same map as pi/extension.ts piModels()."""
     out = dict(PI_MODELS)
-    own = machine_config().get("pi_models")
-    if isinstance(own, dict):
-        keyed = [(t, v) for k, v in own.items() if k in PI_MODEL_ALIASES
-                 for t in PI_MODEL_ALIASES[k]]
-        keyed += [(k, v) for k, v in own.items() if k in TIERS]
-        for tier, model in keyed:
-            if isinstance(model, str) and model:
-                out[tier] = model
+    _apply_pi_models(out, machine_config().get("pi_models"))
+    _apply_pi_models(out, project_config().get("pi_models"))
     return out
 
 
