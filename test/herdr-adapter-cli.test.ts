@@ -85,8 +85,34 @@ test("ORCH_BIN is used for the contract check and snapshot polling; the run is s
   const ran = fake.ran(r.out[0].paneId);
   expect(ran).toHaveLength(1);
   expect(ran[0]).toMatch(
-    new RegExp(`^${orchBin} control --json < .*${r.out[0].requestId}\\.json$`),
+    new RegExp(
+      `^env 'ORCH_BIN=${orchBin}' ${orchBin} control --json < .*${r.out[0].requestId}\\.json$`,
+    ),
   );
+});
+
+// The pane shell does not inherit the adapter's environment, so a run started from a
+// projects folder outside ~/Projects must carry ORCH_PROJECTS_DIR and ORCH_BIN with it (#174).
+test("ORCH_PROJECTS_DIR and ORCH_BIN are forwarded into the pane command, quoted", async () => {
+  const abort = new AbortController();
+  setTimeout(() => abort.abort(), 300);
+  const out: string[] = [];
+  await main(["run", "7", "--interval", "20"], {
+    env: {
+      ORCH_BIN: orchBin,
+      ORCH_PROJECTS_DIR: "/tmp/it's projects",
+      HERDR_BIN: fake.bin,
+      ...fake.env,
+      PATH: process.env.PATH,
+    },
+    cwd: dir,
+    output: (t) => out.push(t),
+    signal: abort.signal,
+  });
+  const started = JSON.parse(out[0]);
+  expect(fake.ran(started.paneId)).toEqual([
+    `env 'ORCH_PROJECTS_DIR=/tmp/it'\\''s projects' 'ORCH_BIN=${orchBin}' ${orchBin} control --json < ${join("/tmp/orch-herdr", `${started.requestId}.json`)}`,
+  ]);
 });
 
 const release = async (

@@ -20,6 +20,8 @@ export type AdapterOptions = {
   worktreePath?: string;
   // The resolved orch binary to run in the pane; defaults to `orch` on the pane's PATH.
   orchBin?: string;
+  // Variables set on the pane command: the pane shell does not inherit the adapter's env (#174).
+  paneEnv?: Record<string, string>;
   // Test hook: called with the requestId whenever a receipt is queried before a re-send.
   onReceiptQuery?: (requestId: string) => void;
   // Where the request file the pane feeds to `orch control` is written.
@@ -71,7 +73,14 @@ export function createAdapter(options: AdapterOptions) {
         })}\n`,
       );
       // One shell-string argument, so herdr never parses `--json` as its own flag.
-      command = [`${options.orchBin ?? "orch"} control --json < ${file}`];
+      const quote = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+      const vars = Object.entries(options.paneEnv ?? {}).map(([k, v]) =>
+        quote(`${k}=${v}`),
+      );
+      const prefix = vars.length ? `env ${vars.join(" ")} ` : "";
+      command = [
+        `${prefix}${options.orchBin ?? "orch"} control --json < ${file}`,
+      ];
       try {
         await herdr.paneRun(paneId, command);
       } catch (error) {

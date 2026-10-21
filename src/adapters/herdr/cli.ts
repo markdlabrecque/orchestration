@@ -74,6 +74,12 @@ export async function main(
       worktreePath: flag("--worktree-path"),
       orch,
       orchBin,
+      paneEnv: Object.fromEntries(
+        ["ORCH_PROJECTS_DIR", "ORCH_BIN"].flatMap((k) => {
+          const v = env[k];
+          return v ? [[k, v]] : [];
+        }),
+      ),
       ticket,
       branch: flag("--branch") ?? `ticket-${ticket}`,
     });
